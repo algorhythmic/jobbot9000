@@ -1,0 +1,14 @@
+{
+  "mode": "job_intrinsic",
+  "rubric": "Grade a job from its posting, independent of any user. Seniority on the ladder; market signal A (AI-native: startup, ownership, ships-on-taste) through B (traditional: enterprise, rigid requirements); required vs preferred skills as the posting frames them.",
+  "output_schema": {
+    "seniority": "one of the ladder",
+    "market_signal": "A | A-ish | B-ish | B",
+    "skills": "[{ skill, kind: required | preferred }]"
+  },
+  "constraints": {
+    "seniority_must_be_one_of": ["intern", "junior", "mid", "senior", "staff", "principal"],
+    "market_signal_must_be_one_of": ["A", "A-ish", "B-ish", "B"],
+    "skills_kind_must_be_one_of": ["required", "preferred"]
+  }
+}

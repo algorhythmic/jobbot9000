@@ -1,0 +1,13 @@
+{
+  "name": "jobbot9000",
+  "version": "0.1.0",
+  "description": "A local, market-aware job-search and portfolio-readiness coach for your AI agent. Bundles an MCP server that reads the live job market and coaches against it, plus the skills that drive it.",
+  "keywords": ["job-search", "career", "coaching", "mcp"],
+  "author": { "name": "jbuck0403", "url": "https://github.com/jbuck0403" },
+  "contributors": [
+    { "name": "jbuck0403", "url": "https://github.com/jbuck0403" },
+    { "name": "algorhythmic", "url": "https://github.com/algorhythmic" }
+  ],
+  "homepage": "https://github.com/algorhythmic/jobbot9000",
+  "repository": "https://github.com/algorhythmic/jobbot9000"
+}

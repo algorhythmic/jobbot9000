@@ -1,0 +1,12 @@
+{
+  "mode": "cover_letter",
+  "rubric": "Write a tailored cover letter for one role: why this candidate, why this company. Lead with a real angle grounded in the packet (job grade, master resume, fit, portfolio). No generic filler — if there is no credible angle, flag the role as low-conviction instead of writing one.",
+  "output_schema": {
+    "content": "string — the cover letter",
+    "talking_points": "string[] — points to raise, keyed to the user's evidence"
+  },
+  "constraints": {
+    "content_required": true,
+    "no_invented_experience": true
+  }
+}
