@@ -1,0 +1,13 @@
+{
+  "mode": "user_fit",
+  "rubric": "Judge the user's fit on a specific job relative to their assessed level and portfolio. Band: over (overqualified), exact, under (underqualified). Name the concrete gaps. This is personal and is never shared.",
+  "output_schema": {
+    "band": "over | exact | under",
+    "gaps": "string[] — specific missing skills/evidence",
+    "rationale": "string — must reference the assessed level"
+  },
+  "constraints": {
+    "band_must_be_one_of": ["over", "exact", "under"],
+    "must_reference_assessed_level": true
+  }
+}
