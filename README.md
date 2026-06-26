@@ -89,9 +89,22 @@ Company discovery (`gather find_companies`) is **live and free by default** — 
 
 ## Install (Claude Code)
 
+Claude Code installs plugins from a **marketplace**, not a bare path (there is no `/plugin install <path>`). Two ways:
+
+**Quick / development — `--plugin-dir`** (no marketplace needed, session-scoped):
+
 ```
-/plugin install <path>
+claude --plugin-dir /path/to/jobbot9000
 ```
+
+**Persistent — via a local marketplace.** This repo ships a `.claude-plugin/marketplace.json`, so point Claude Code at the repo (or its parent) and install:
+
+```
+/plugin marketplace add /path/to/jobbot9000
+/plugin install jobbot9000@jobbot9000
+```
+
+Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 9 tools`.
 
 On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir (so plugin updates don't reinstall them) and builds it; it no-ops on every session after. First-run setup compiles a native dependency, so it takes a moment; if the tools aren't available on that very first session, reload the plugin or start a new session. (Requires `node` and a build toolchain on `PATH`.)
 
@@ -107,6 +120,8 @@ npm test           # run the discovery test suite (tsx against src/, mocked HTTP
 ```
 
 The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/state`) and opens `jobbot.db` there; if `STATE_DIR` is unset it falls back to `~/.jobbot/state`.
+
+**Heads-up when running Claude Code *inside* this repo:** Claude Code auto-discovers the root `.mcp.json` as a **project** server and tries to start it — but `${CLAUDE_PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_DATA}` only expand in *plugin* context, so that project-scoped copy fails with `MCP error -32000` (`Cannot find module '.../${CLAUDE_PLUGIN_ROOT}/dist/index.js'`). This is harmless and unrelated to the installed plugin — `.mcp.json` lives at the repo root only because the plugin bundle needs it there. To avoid the noise, run `claude --plugin-dir` from **outside** the repo, or decline/disable the project `jobbot` server in `/mcp`. The real plugin shows up as `plugin:jobbot9000:jobbot`.
 
 **Discovery env (all optional — discovery is free without any of it):** `find_companies` defaults to the free curated roster and the on-demand `companies` path; ATS-slug resolution is keyless. `JOBBOT_SEEDS_FILE` points the curated roster at a file of your own (outside the plugin dir, so it survives updates); unset, the bundled `seeds/companies.json` is used. Only the opt-in TheirStack accelerator reads the rest: `THEIRSTACK_API_KEY` (a data-source key — the *model* key never enters the server) and `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`, the per-run spend ceiling — a run estimates cost for free first and won't exceed it without an explicit `confirm`). Auto-recharge is never enabled. `ingest_portfolio` reads public GitHub keylessly; `GITHUB_TOKEN`, if set, only raises the rate limit. `sync_catalog` is the one egress path — it's off unless `JOBBOT_POOL_URL` (+ optional `JOBBOT_POOL_TOKEN`) names a shared pool, and even then only **public catalog data** (companies + jobs + grades) is sent; the personal plane is structurally excluded from the snapshot. No hosted pool ships with this build, so the wire contract is provisional.
 

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "jobbot9000",
+  "version": "0.1.0",
+  "description": "Local marketplace for the jobbot9000 plugin (this repo is the plugin).",
+  "owner": { "name": "algorhythmic", "url": "https://github.com/algorhythmic" },
+  "plugins": [
+    {
+      "name": "jobbot9000",
+      "description": "A local, market-aware job-search and portfolio-readiness coach for your AI agent.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
