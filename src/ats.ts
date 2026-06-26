@@ -81,6 +81,19 @@ export interface RawJob {
 
 const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v : null);
 
+// Ashby (with includeCompensation=true) exposes structured salary: compensation.
+// compensationTiers[].components[] where compensationType==="Salary" carries numeric
+// min/maxValue. A posting can have several tiers (e.g. "SF/NY" vs "Nationwide"); take the
+// overall advertised range — min of mins, max of maxes — ignoring equity/null components.
+function ashbySalary(comp: any): { min: number | null; max: number | null } {
+  const sal = (Array.isArray(comp?.compensationTiers) ? comp.compensationTiers : [])
+    .flatMap((t: any) => (Array.isArray(t?.components) ? t.components : []))
+    .filter((c: any) => c?.compensationType === "Salary");
+  const mins = sal.map((c: any) => c?.minValue).filter((v: any) => typeof v === "number");
+  const maxs = sal.map((c: any) => c?.maxValue).filter((v: any) => typeof v === "number");
+  return { min: mins.length ? Math.min(...mins) : null, max: maxs.length ? Math.max(...maxs) : null };
+}
+
 // Per-platform normalizers. Return null when the payload isn't a valid board of that
 // platform (wrong shape) — that's a resolution miss. Return [] for a valid EMPTY board.
 // Extraction is tolerant (defensive field reads) since the live shapes can't be pinned
@@ -93,7 +106,7 @@ const NORMALIZERS: Record<AtsPlatform, (j: any) => RawJob[] | null> = {
     ? j.map((p: any): RawJob => ({ source_url: str(p?.hostedUrl) ?? str(p?.applyUrl) ?? "", title: str(p?.text), location: str(p?.categories?.location), remote: (p?.workplaceType ?? "").toLowerCase() === "remote" ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
     : null,
   ashby: (j) => Array.isArray(j?.jobs)
-    ? j.jobs.map((p: any): RawJob => ({ source_url: str(p?.jobUrl) ?? str(p?.applyUrl) ?? "", title: str(p?.title), location: str(p?.location) ?? str(p?.locationName), remote: p?.isRemote ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
+    ? j.jobs.map((p: any): RawJob => { const sal = ashbySalary(p?.compensation); return { source_url: str(p?.jobUrl) ?? str(p?.applyUrl) ?? "", title: str(p?.title), location: str(p?.location) ?? str(p?.locationName), remote: p?.isRemote ? 1 : null, comp_min: sal.min, comp_max: sal.max, raw: p }; }).filter((x: RawJob) => x.source_url)
     : null,
   // Workable widget job: city/state/country and telecommuting are TOP-LEVEL (verified
   // against live boards mcfarlane-aviation / walter-careers), not nested under `location`.
