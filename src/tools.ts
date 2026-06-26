@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import * as DB from "./db.js";
 import { readJourneyState } from "./state.js";
 import { resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
+import { fetchUserRepos, type RepoFacts } from "./github.js";
 import { PROVIDERS, type DiscoverQuery, type DiscoveredCompany, type ProviderContext } from "./providers.js";
 
 type State = ReturnType<typeof readJourneyState>;
@@ -36,7 +37,7 @@ const providerContext = (): ProviderContext => ({ apiKey: process.env.THEIRSTACK
 // fetch_jobs (keyless per-slug ATS pull) lands next. They flip independently.
 const FIND_COMPANIES_AVAILABLE = true;    // gather: find_companies — lead-gen + ATS-slug resolution
 const FETCH_JOBS_AVAILABLE = true;        // gather: fetch_jobs — live ATS board → raw jobs
-const PORTFOLIO_INGEST_AVAILABLE = false; // gather: ingest_portfolio
+const PORTFOLIO_INGEST_AVAILABLE = true;  // gather: ingest_portfolio — public GitHub repos
 const SYNC_AVAILABLE = false;             // gather: sync_catalog
 const pendingSteps = (): string[] => [
   ...(!FIND_COMPANIES_AVAILABLE ? ["find_companies"] : []),
@@ -203,7 +204,9 @@ export function registerTools(server: McpServer): void {
         if (s.profile?.no_github) return json({ opted_out: true, note: "The user opted out of GitHub — coach from projects they describe in chat." });
         return json({ note: PORTFOLIO_INGEST_AVAILABLE ? "no portfolio yet — run gather({ step: 'ingest_portfolio' })" : "no portfolio captured yet, and GitHub ingestion isn't available in this build yet — ask the user to describe their projects and coach from that." });
       }
-      return json({ portfolio: repos, coverage_gaps: marketOverlay(s) });
+      // Surface the stored facts blob as structured fields (parsed) rather than raw JSON.
+      const portfolio = repos.map((r) => ({ ...(r.facts_json ? JSON.parse(r.facts_json) : { repo: r.repo }), fetched_at: r.fetched_at }));
+      return json({ portfolio, coverage_gaps: marketOverlay(s) });
     }
 
     if (a.at === "packet") {
@@ -355,7 +358,7 @@ export function registerTools(server: McpServer): void {
     "The one door to the outside world — reach out and persist new data, then return it. step selects the integration: " +
     "'find_companies' (lead-gen → ATS-slug resolution; FREE by default. Lightest: pass companies:[{name,domain}] to resolve specific companies on demand, no key. Or build a query from the resume — titles/technologies/seniority/locations — for the free curated roster; pass provider:'theirstack' (+ THEIRSTACK_API_KEY) for paid targeted discovery, count-first and credit-ceiling-gated), " +
     "'fetch_jobs' (pull live ATS boards → raw, ungraded jobs; keyless. Target one board with ats_platform+ats_slug or company_id, or pass none to refresh all resolved companies (stalest first, bounded by limit). A liveness pass closes postings that vanished; grade the new jobs next), " +
-    "'ingest_portfolio' (the user's public GitHub repos; needs github_handle), " +
+    "'ingest_portfolio' (the user's public GitHub repos → portfolio facts for coaching; keyless. Uses the profile's github_handle, or pass one; forks skipped unless include_forks), " +
     "'sync_catalog' (bidirectional, catalog-only sync; uses dry_run to show the diff first). " +
     "Persistence is a side effect of gathering — the agent still never writes the DB itself.";
   server.registerTool("gather", {
@@ -379,6 +382,7 @@ export function registerTools(server: McpServer): void {
       ats_slug: z.string().optional(),
       company_id: z.number().int().optional(),
       github_handle: z.string().optional(),
+      include_forks: z.boolean().optional(), // ingest_portfolio: keep forked repos (default: skip)
       dry_run: z.boolean().optional(),     // free count-first only — never spends
       limit: z.number().int().positive().optional(),
     },
@@ -388,7 +392,8 @@ export function registerTools(server: McpServer): void {
         return FIND_COMPANIES_AVAILABLE ? findCompanies(a) : planned("lead-gen + ATS-slug resolution");
       case "fetch_jobs":
         return FETCH_JOBS_AVAILABLE ? fetchJobs(a) : planned("fetch + normalize a live ATS board");
-      case "ingest_portfolio": return planned("fetch the user's public GitHub repos");
+      case "ingest_portfolio":
+        return PORTFOLIO_INGEST_AVAILABLE ? ingestPortfolio(a) : planned("fetch the user's public GitHub repos");
       case "sync_catalog": return planned("bidirectional catalog sync with an external pool");
       default: return json({ ok: false, error: `unknown gather step '${a.step}'` });
     }
@@ -571,5 +576,46 @@ export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
     next: totals.inserted + totals.updated > 0
       ? "grade the new jobs — look({ at: 'jobs', scope: 'worklist' }) for the queue, then grade_job + grade_job_fit."
       : "no live postings found on these boards (or all unreachable). Try other companies, or coach from the resume.",
+  });
+}
+
+// ── ingest_portfolio orchestration (gather step 'ingest_portfolio') ──────────
+// Keyless: fetch the user's public GitHub repos as structured facts and store a fresh
+// snapshot via db.ts (the sole writer). A SENSE only — the agent reads the facts via
+// look({ at: 'portfolio' }) and does the judging (which to feature, architecture read).
+// Honors the no_github opt-out; persists a passed handle to the profile. `deps` is
+// injectable so the path is testable offline against a mocked fetch.
+interface IngestArgs { github_handle?: string; include_forks?: boolean }
+interface IngestDeps { fetchReposFn?: typeof fetchUserRepos; token?: string }
+
+export async function ingestPortfolio(a: IngestArgs, deps: IngestDeps = {}) {
+  const s = readJourneyState();
+  if (s.profile?.no_github)
+    return json({ ok: false, error: "the user opted out of GitHub (no_github) — clear it via capture_onboarding_profile to ingest, or coach from projects they describe in chat." });
+  const handle = a.github_handle ?? s.profile?.github_handle ?? undefined;
+  if (!handle)
+    return json({ ok: false, error: "no github_handle — pass one, or capture it via capture_onboarding_profile first." });
+
+  const fetchReposFn = deps.fetchReposFn ?? fetchUserRepos;
+  let repos: RepoFacts[];
+  try { repos = await fetchReposFn(handle, { token: deps.token ?? process.env.GITHUB_TOKEN }); }
+  catch (e) { return json({ ok: false, error: `GitHub fetch failed: ${errMsg(e)}` }); }
+
+  const kept = a.include_forks ? repos : repos.filter((r) => !r.is_fork);
+  DB.replacePortfolio(kept.map((r) => ({ repo: r.repo, facts: r })));
+  // Persist a freshly-supplied handle so later calls (and orient) know it.
+  if (a.github_handle && a.github_handle !== s.profile?.github_handle) DB.upsertProfile({ github_handle: a.github_handle });
+
+  return json({
+    ok: true,
+    github_handle: handle,
+    fetched: repos.length,
+    kept: kept.length,
+    forks_skipped: a.include_forks ? 0 : repos.length - kept.length,
+    top_by_recent: kept.slice(0, 5).map((r) => ({ repo: r.repo, language: r.language, stars: r.stars, pushed_at: r.pushed_at })),
+    portfolio_count: DB.counts().portfolio,
+    next: kept.length === 0
+      ? "no public repos found (or all forks). Coach from projects the user describes in chat instead."
+      : "coach the portfolio against demand — look({ at: 'portfolio', with_market_overlay: true }); you pick which projects to feature.",
   });
 }

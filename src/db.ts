@@ -173,7 +173,21 @@ export const getAssessment = (): { level: string; rationale: string | null; evid
 
 export interface PortfolioProject { repo: string; facts_json: string | null; fetched_at: string }
 export const getPortfolio = (): PortfolioProject[] =>
-  db.prepare("SELECT repo, facts_json, fetched_at FROM portfolio_projects").all() as PortfolioProject[];
+  db.prepare("SELECT repo, facts_json, fetched_at FROM portfolio_projects ORDER BY fetched_at DESC, repo").all() as PortfolioProject[];
+
+// Replace the portfolio with a fresh snapshot (gather('ingest_portfolio') calls this —
+// db.ts is the sole writer). A full replace, not an upsert: the ingest reflects the user's
+// CURRENT public repos, so repos they deleted/renamed since the last pull drop out. Each
+// project's facts are stored as a JSON blob (facts_json) for the agent to read and judge.
+export function replacePortfolio(projects: { repo: string; facts: unknown }[]): number {
+  const tx = db.transaction((): number => {
+    db.prepare("DELETE FROM portfolio_projects").run();
+    const ins = db.prepare("INSERT INTO portfolio_projects (repo, facts_json) VALUES (?, ?)");
+    for (const p of projects) ins.run(p.repo, JSON.stringify(p.facts ?? null));
+    return projects.length;
+  });
+  return tx();
+}
 
 export interface CoverLetter { content: string; talking_points: unknown[]; created_at: string }
 export const getCoverLetter = (jobId: number): CoverLetter | null => {

@@ -166,6 +166,47 @@ eq([fc.ok, fc.jobs.updated], [true, 2], "fetchJobs: by company_id refetches (ide
 const fb = jres(await tools.fetchJobs({}, fd));
 eq([fb.ok, fb.boards_fetched >= 1], [true, true], "fetchJobs: batch-all refreshes resolved companies");
 
+// ════════════════════ ingest_portfolio ════════════════════
+const githubMod = await import(src("github.ts"));
+
+// ── L. fetchUserRepos (real, mocked HTTP) ─────────────────────────────────────
+const ghRepos = [
+  { full_name: "u/alpha", name: "alpha", description: "a cli", language: "TypeScript", stargazers_count: 10, forks_count: 2, topics: ["cli"], fork: false, archived: false, pushed_at: "2026-01-01T00:00:00Z", html_url: "https://github.com/u/alpha", homepage: "https://alpha.dev" },
+  { full_name: "u/forked", name: "forked", language: "Go", stargazers_count: 0, forks_count: 0, fork: true, pushed_at: "2025-01-01T00:00:00Z", html_url: "https://github.com/u/forked" },
+];
+const ghFetch = async (url) => (url.includes("/users/u/repos") ? ok(ghRepos) : notFound());
+const facts = await githubMod.fetchUserRepos("u", { fetchFn: ghFetch });
+eq([facts.length, facts[0].repo, facts[0].language, facts[0].stars, facts[0].is_fork], [2, "u/alpha", "TypeScript", 10, false], "fetchUserRepos: normalize facts");
+eq([facts[1].is_fork, facts[0].topics.join(",")], [true, "cli"], "fetchUserRepos: fork flag + topics");
+let threw = false; try { await githubMod.fetchUserRepos("nobody", { fetchFn: async () => notFound() }); } catch (e) { threw = /no public GitHub user/.test(e.message); }
+eq(threw, true, "fetchUserRepos: 404 -> throws unknown-user");
+
+// injectable mock returning RepoFacts directly (orchestration deps)
+const mkFacts = (o) => ({ repo: "u/x", name: "x", description: null, language: "TS", stars: 0, forks: 0, topics: [], is_fork: false, is_archived: false, pushed_at: "2026-01-01", url: "u", homepage: null, ...o });
+const fr = async () => [mkFacts({ repo: "u/alpha", language: "TypeScript", stars: 10 }), mkFacts({ repo: "u/forked", is_fork: true })];
+
+// ── M. no handle (profile has none) -> honest error ───────────────────────────
+eq(jres(await tools.ingestPortfolio({}, { fetchReposFn: fr })).ok, false, "ingest: no handle -> ok:false");
+
+// ── N. no_github opt-out -> honest error, then clear ──────────────────────────
+DB.upsertProfile({ no_github: 1 });
+eq(jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: fr })).ok, false, "ingest: no_github opt-out -> ok:false");
+DB.upsertProfile({ no_github: 0 });
+
+// ── O. happy path: forks skipped, snapshot stored, handle persisted ───────────
+const ing = jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: fr }));
+eq([ing.ok, ing.fetched, ing.kept, ing.forks_skipped, ing.portfolio_count], [true, 2, 1, 1, 1], "ingest: fork skipped, 1 kept");
+eq(DB.getPortfolio()[0].repo, "u/alpha", "ingest: stored the non-fork repo");
+eq(DB.getProfile()?.github_handle, "u", "ingest: persisted the handle to the profile");
+
+// ── P. include_forks keeps forks ─────────────────────────────────────────────
+const ing2 = jres(await tools.ingestPortfolio({ github_handle: "u", include_forks: true }, { fetchReposFn: fr }));
+eq([ing2.kept, ing2.portfolio_count], [2, 2], "ingest: include_forks keeps the fork");
+
+// ── Q. replace semantics: re-ingest is a fresh snapshot (dropped repo leaves) ──
+const ing3 = jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/alpha" })] }));
+eq([ing3.portfolio_count, DB.getPortfolio().length], [1, 1], "ingest: snapshot replaces prior (fork dropped)");
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
 try { rmSync(TMP, { recursive: true, force: true }); } catch {}

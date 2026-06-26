@@ -107,7 +107,7 @@ npm test           # run the discovery test suite (tsx against src/, mocked HTTP
 
 The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/state`) and opens `jobbot.db` there; if `STATE_DIR` is unset it falls back to `~/.jobbot/state`.
 
-**Discovery env (all optional — discovery is free without any of it):** `find_companies` defaults to the free curated roster and the on-demand `companies` path; ATS-slug resolution is keyless. `JOBBOT_SEEDS_FILE` points the curated roster at a file of your own (outside the plugin dir, so it survives updates); unset, the bundled `seeds/companies.json` is used. Only the opt-in TheirStack accelerator reads the rest: `THEIRSTACK_API_KEY` (a data-source key — the *model* key never enters the server) and `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`, the per-run spend ceiling — a run estimates cost for free first and won't exceed it without an explicit `confirm`). Auto-recharge is never enabled.
+**Discovery env (all optional — discovery is free without any of it):** `find_companies` defaults to the free curated roster and the on-demand `companies` path; ATS-slug resolution is keyless. `JOBBOT_SEEDS_FILE` points the curated roster at a file of your own (outside the plugin dir, so it survives updates); unset, the bundled `seeds/companies.json` is used. Only the opt-in TheirStack accelerator reads the rest: `THEIRSTACK_API_KEY` (a data-source key — the *model* key never enters the server) and `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`, the per-run spend ceiling — a run estimates cost for free first and won't exceed it without an explicit `confirm`). Auto-recharge is never enabled. `ingest_portfolio` reads public GitHub keylessly; `GITHUB_TOKEN`, if set, only raises the rate limit.
 
 ## Layout
 
@@ -121,6 +121,7 @@ src/
   tools.ts                   the 9-tool surface (incl. the find_companies orchestration)
   providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in); CC is a drop-in
   ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
+  github.ts                  keyless GitHub sense — public repos → portfolio facts (ingest_portfolio)
 seeds/                       curated company roster (free default for find_companies); ships empty
 skills/                      bundled skills: coach / job-search / application
 modes/                       grading modes (rubric + output schema) for the judgment writes
