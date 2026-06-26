@@ -112,6 +112,25 @@ const json = (o: unknown) => ({ content: [{ type: "text" as const, text: JSON.st
 const planned = (note: string) => json({ status: "planned", note: `${note} (external integration — implemented in a later pass).` });
 const noJob = (id: number) => json({ ok: false, error: `no job ${id} — find a valid job_id via look({ at: 'jobs' })` });
 
+// Shared job filters for look(at:'jobs'), applied across all three scopes so the agent can
+// triage a large pull (thousands of postings) down to its lanes in one call: titles_any
+// OR-matches keywords against the title, location is a substring match, remote keeps only
+// remote-flagged rows, query matches title-or-company. Returns parameterized clauses (no
+// string interpolation of user input → injection-safe). Assumes the query joins jobs j and
+// companies c. Exported for direct testing.
+export interface JobFilterArgs { query?: string; titles_any?: string[]; location?: string; remote?: boolean }
+export function jobFilters(a: JobFilterArgs): { where: string[]; args: (string | number)[] } {
+  const where: string[] = []; const args: (string | number)[] = [];
+  if (a.query) { where.push("(j.title LIKE ? OR c.name LIKE ?)"); args.push(`%${a.query}%`, `%${a.query}%`); }
+  if (a.titles_any?.length) {
+    where.push("(" + a.titles_any.map(() => "j.title LIKE ?").join(" OR ") + ")");
+    for (const t of a.titles_any) args.push(`%${t}%`);
+  }
+  if (a.location) { where.push("j.location LIKE ?"); args.push(`%${a.location}%`); }
+  if (a.remote === true) where.push("j.remote = 1");
+  return { where, args };
+}
+
 export function registerTools(server: McpServer): void {
   // ── orient: the one state door ────────────────────────────────────────────
   server.registerTool("orient", {
@@ -164,11 +183,14 @@ export function registerTools(server: McpServer): void {
   // ── look: the one read door (never fetches, never writes) ─────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog; supports query + grading_status), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). 'relevant' vs 'market' is a deliberate pair: the gap between them is the job-search signal (run both and contrast; for a precomputed gap use orient detail:'dashboard'). grading_status filters only the 'market' scope. at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials; with_market_overlay adds the live-demand delta to coach against. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + portfolio + any saved letter for one role. Returns JSON for you to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). All three scopes accept the same filters — use them to TRIAGE a big pull down to your lanes in ONE call instead of many: titles_any (string[], OR-match any keyword against the job title), location (substring, e.g. 'US' or 'Remote'), remote (true = only remote-flagged), query (title OR company substring); grading_status filters market/worklist. e.g. look({at:'jobs',scope:'worklist',titles_any:['Applied AI','Forward Deployed','Data Engineer'],remote:true}) → the gradeable shortlist. Results carry location/remote/comp so you can geo-filter without opening a packet. 'relevant' vs 'market' is a deliberate pair — the gap is the signal (for a precomputed gap use orient detail:'dashboard'). at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials; with_market_overlay adds the live-demand delta. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + portfolio + any saved letter. Returns JSON for you to interpret.`,
     inputSchema: {
       at: enumOf(["jobs", "companies", "resume", "portfolio", "packet"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
       query: z.string().optional(),
+      titles_any: z.array(z.string()).optional(),
+      location: z.string().optional(),
+      remote: z.boolean().optional(),
       grading_status: enumOf(["ungraded", "graded", "any"]).optional(),
       job_id: z.number().int().optional(),
       with_market_overlay: z.boolean().optional(),
@@ -245,40 +267,44 @@ export function registerTools(server: McpServer): void {
         const rows = DB.db.prepare("SELECT j.id, c.name AS company, j.title, j.grade_seniority FROM jobs j JOIN companies c ON c.id=j.company_id WHERE j.still_live=1 ORDER BY j.last_seen_at DESC LIMIT ?").all(limit);
         return json({ band: null, low_confidence: true, jobs: rows, note: "level not assessed yet — returning a recent slice (low confidence). Assess via record_level_assessment for an accurate band." });
       }
+      const flt = jobFilters(a);
       const rows = DB.db.prepare(
-        `SELECT j.id, c.name AS company, j.title, j.location, j.grade_seniority, j.grade_market_signal,
+        `SELECT j.id, c.name AS company, j.title, j.location, j.remote, j.comp_min, j.comp_max, j.grade_seniority, j.grade_market_signal,
                 f.band AS fit, f.gaps_json AS fit_gaps_json, f.rationale AS fit_rationale
          FROM jobs j JOIN companies c ON c.id=j.company_id
          LEFT JOIN job_fit f ON f.job_id=j.id
-         WHERE j.still_live=1 AND j.grade_seniority IN (${band.map(() => "?").join(",")})
+         WHERE j.still_live=1 AND j.grade_seniority IN (${band.map(() => "?").join(",")})${flt.where.length ? " AND " + flt.where.join(" AND ") : ""}
          ORDER BY j.last_seen_at DESC LIMIT ?`,
-      ).all(...band, limit) as any[];
+      ).all(...band, ...flt.args, limit) as any[];
       const jobs = rows.map(({ fit_gaps_json, ...rest }) => ({ ...rest, fit_gaps: fit_gaps_json ? JSON.parse(fit_gaps_json) : null }));
       return json({ band, jobs });
     }
 
     if (scope === "worklist") {
+      const flt = jobFilters(a);
+      const where = ["j.still_live=1", "(j.grade_seniority IS NULL OR j.graded_at < j.fetched_at)", ...flt.where];
       const rows = DB.db.prepare(
-        `SELECT id, title, location, raw_json, fetched_at, graded_at,
-                CASE WHEN grade_seniority IS NULL THEN 'never_graded' ELSE 'stale' END AS reason
-         FROM jobs WHERE still_live=1 AND (grade_seniority IS NULL OR graded_at < fetched_at)
-         ORDER BY fetched_at ASC LIMIT ?`,
-      ).all(a.limit ?? 25);
+        `SELECT j.id, c.name AS company, j.title, j.location, j.remote, j.raw_json, j.fetched_at, j.graded_at,
+                CASE WHEN j.grade_seniority IS NULL THEN 'never_graded' ELSE 'stale' END AS reason
+         FROM jobs j JOIN companies c ON c.id=j.company_id
+         WHERE ${where.join(" AND ")} ORDER BY j.fetched_at ASC LIMIT ?`,
+      ).all(...flt.args, a.limit ?? 25);
       const out: Record<string, unknown> = { count: rows.length, jobs: rows };
-      if (rows.length === 0) out.note = s.catalog.jobs === 0 ? emptyCatalogNote(s) : "all jobs are graded.";
+      if (rows.length === 0) out.note = s.catalog.jobs === 0 ? emptyCatalogNote(s) : "no ungraded jobs match (all graded, or the filter is too narrow).";
       return json(out);
     }
 
     // scope === "market" — whole-market view + general catalog search
     const limit = a.limit ?? 50;
-    const where: string[] = ["j.still_live=1"]; const args: string[] = [];
-    if (a.query) { where.push("(j.title LIKE ? OR c.name LIKE ?)"); args.push(`%${a.query}%`, `%${a.query}%`); }
+    const flt = jobFilters(a);
+    const where = ["j.still_live=1", ...flt.where];
     if (a.grading_status === "ungraded") where.push("j.grade_seniority IS NULL");
     if (a.grading_status === "graded") where.push("j.grade_seniority IS NOT NULL");
     const rows = DB.db.prepare(
-      `SELECT j.id, c.name AS company, j.title, j.grade_seniority FROM jobs j JOIN companies c ON c.id=j.company_id
+      `SELECT j.id, c.name AS company, j.title, j.location, j.remote, j.comp_min, j.comp_max, j.grade_seniority
+       FROM jobs j JOIN companies c ON c.id=j.company_id
        WHERE ${where.join(" AND ")} ORDER BY j.last_seen_at DESC LIMIT ?`,
-    ).all(...args, limit);
+    ).all(...flt.args, limit);
     const out: Record<string, unknown> = { count: rows.length, jobs: rows };
     if (s.catalog.jobs === 0) out.note = emptyCatalogNote(s);
     return json(out);

@@ -154,6 +154,17 @@ eq((await ats.fetchBoard("ashby", "empty", boardFetch("job-board/empty", { jobs:
 eq(await ats.fetchBoard("greenhouse", "nope", boardFetch("never", {})), null, "fetchBoard: 404 -> null");
 eq((await ats.fetchBoard("greenhouse", "d", boardFetch("boards/d/", { jobs: [{ title: "NoUrl" }, { absolute_url: "https://d/1", title: "Ok" }] }))).length, 1, "fetchBoard: postings without source_url dropped");
 
+// Ashby structured-comp extraction (multi-tier: overall min-of-mins, max-of-maxes; equity/null ignored)
+const acomp = await ats.fetchBoard("ashby", "compco", boardFetch("job-board/compco", { jobs: [
+  { jobUrl: "https://a/1", title: "Eng", location: "NYC", isRemote: true, compensation: { compensationTiers: [
+    { components: [{ compensationType: "Salary", minValue: 212000, maxValue: 291000 }, { compensationType: "EquityCashValue", minValue: null, maxValue: null }] },
+    { components: [{ compensationType: "Salary", minValue: 191000, maxValue: 262000 }] },
+  ] } },
+  { jobUrl: "https://a/2", title: "PM", location: "SF" }, // no compensation
+] }));
+eq([acomp[0].comp_min, acomp[0].comp_max], [191000, 291000], "ashby: extracts overall salary range across tiers");
+eq([acomp[1].comp_min, acomp[1].comp_max], [null, null], "ashby: no comp -> nulls");
+
 // ── J. upsertJobs liveness (direct) ───────────────────────────────────────────
 const cid = DB.upsertCompany({ name: "LiveCo", domain: "liveco.com", ats_platform: "greenhouse", ats_slug: "liveco" }).id;
 eq(DB.upsertJobs(cid, [{ source_url: "u1", title: "A" }, { source_url: "u2", title: "B" }]), { inserted: 2, updated: 0, closed: 0, seen: 2 }, "upsertJobs: initial insert");
@@ -279,6 +290,30 @@ eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ last_seen_at: "2000-
 eq(DB.db.prepare("SELECT grade_seniority FROM jobs WHERE company_id=? AND source_url='m1'").get(mid).grade_seniority, "staff", "merge: grade applied to ungraded local");
 eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ source_url: "m2", title: "Fresh" })] }).jobs_added, 1, "merge: brand-new job added");
 eq(DB.applyCatalogSnapshot({ companies: [], jobs: [sj({ ats_slug: "ghostco", source_url: "x" })] }).jobs_skipped, 1, "merge: job for unknown company skipped");
+
+// ════════════════════ look(jobs) filters (triage + location/remote) ════════════════════
+// clause/param building (injection-safe — values go through params, not interpolation)
+const jf = tools.jobFilters({ titles_any: ["Applied AI", "Data Engineer"], location: "US", remote: true });
+eq(jf.args, ["%Applied AI%", "%Data Engineer%", "%US%"], "jobFilters: OR-title + location params (remote is paramless)");
+eq(jf.where[0], "(j.title LIKE ? OR j.title LIKE ?)", "jobFilters: titles_any OR-matched");
+eq(jf.where.includes("j.remote = 1"), true, "jobFilters: remote -> j.remote = 1");
+eq(tools.jobFilters({}).where.length, 0, "jobFilters: no filters -> empty");
+
+// end-to-end against real SQLite
+const fcid = DB.upsertCompany({ name: "FilterCo", ats_platform: "greenhouse", ats_slug: "filterco" }).id;
+DB.upsertJobs(fcid, [
+  { source_url: "fj1", title: "Applied AI Engineer", location: "Remote, US", remote: 1 },
+  { source_url: "fj2", title: "Sales Director", location: "New York, NY", remote: null },
+  { source_url: "fj3", title: "Data Engineer", location: "London, UK", remote: null },
+]);
+const runFilter = (a) => {
+  const f = tools.jobFilters(a);
+  return DB.db.prepare(`SELECT j.title FROM jobs j JOIN companies c ON c.id=j.company_id WHERE j.company_id=${fcid}${f.where.length ? " AND " + f.where.join(" AND ") : ""} ORDER BY j.title`).all(...f.args).map((r) => r.title);
+};
+eq(runFilter({ titles_any: ["Applied AI", "Data Engineer"] }), ["Applied AI Engineer", "Data Engineer"], "jobFilters e2e: titles_any OR-matches (excludes Sales)");
+eq(runFilter({ remote: true }), ["Applied AI Engineer"], "jobFilters e2e: remote keeps only remote-flagged");
+eq(runFilter({ location: "US" }), ["Applied AI Engineer"], "jobFilters e2e: location substring");
+eq(runFilter({ titles_any: ["Engineer"], location: "London" }), ["Data Engineer"], "jobFilters e2e: title + location combined");
 
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
