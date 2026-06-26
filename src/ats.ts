@@ -9,12 +9,13 @@
 // VERIFICATION STATUS (checked against live boards):
 //   • Greenhouse, Ashby, Lever — VERIFIED live (real boards: stripe/gitlab/figma,
 //     ramp/linear, ro). Field paths below match real responses.
-//   • Workable — PERMISSIVE / best-effort. The widget endpoint returns 200 + { name, jobs:[] }
-//     for slugs that are NOT real active accounts (`deel`, `bolt`, `scale`, `together`, `hex`
-//     all resolve empty), so an empty Workable board is a FALSE POSITIVE. resolveAts therefore
-//     refuses to resolve on an empty Workable board (see its WORKABLE CAVEAT) — Workable only
-//     counts when it actually returns postings. Fetching a known Workable slug still works;
-//     the correct/most-complete Workable jobs endpoint is still unconfirmed.
+//   • Workable — VERIFIED live. The widget endpoint is correct and returns ALL postings in
+//     one call (mcfarlane-aviation→8, walter-careers→74, workable's own→7); it beats the
+//     paginated v3 jobs API. Field paths fixed against those boards (city/state/country +
+//     telecommuting are top-level). CAVEAT: the widget returns 200 + { jobs:[] } for DORMANT/
+//     parked accounts (`deel`, `bolt`, `scale`, … — registered but 0 active jobs), so an empty
+//     Workable board is treated as a false positive — resolveAts won't resolve on it (see its
+//     WORKABLE CAVEAT). Workable only counts when it actually returns postings.
 
 export type AtsPlatform = "ashby" | "greenhouse" | "lever" | "workable";
 
@@ -94,8 +95,10 @@ const NORMALIZERS: Record<AtsPlatform, (j: any) => RawJob[] | null> = {
   ashby: (j) => Array.isArray(j?.jobs)
     ? j.jobs.map((p: any): RawJob => ({ source_url: str(p?.jobUrl) ?? str(p?.applyUrl) ?? "", title: str(p?.title), location: str(p?.location) ?? str(p?.locationName), remote: p?.isRemote ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
     : null,
+  // Workable widget job: city/state/country and telecommuting are TOP-LEVEL (verified
+  // against live boards mcfarlane-aviation / walter-careers), not nested under `location`.
   workable: (j) => Array.isArray(j?.jobs)
-    ? j.jobs.map((p: any): RawJob => ({ source_url: str(p?.url) ?? str(p?.shortlink) ?? str(p?.application_url) ?? "", title: str(p?.title), location: [p?.location?.city, p?.location?.country].filter(Boolean).join(", ") || null, remote: p?.remote ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
+    ? j.jobs.map((p: any): RawJob => ({ source_url: str(p?.url) ?? str(p?.shortlink) ?? str(p?.application_url) ?? "", title: str(p?.title), location: [p?.city, p?.state, p?.country].filter(Boolean).join(", ") || null, remote: p?.telecommuting ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
     : null,
 };
 
