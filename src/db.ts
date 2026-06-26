@@ -78,18 +78,23 @@ CREATE TABLE IF NOT EXISTS meta (
 
 -- ── catalog plane — public market data; the only plane sync touches ───────
 CREATE TABLE IF NOT EXISTS companies (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  name            TEXT NOT NULL,
-  domain          TEXT,
-  tags            TEXT,
-  source          TEXT,
-  ats_platform    TEXT,
-  ats_slug        TEXT,
-  resolved        INTEGER NOT NULL DEFAULT 1,
-  added_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  last_fetched_at TEXT,
+  id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                    TEXT NOT NULL,
+  domain                  TEXT,
+  tags                    TEXT,                              -- delimited namespaced tags, e.g. "funding:series_b,size:51-200"
+  source                  TEXT,                              -- provenance: 'theirstack' | 'common_crawl' | 'manual' | ...
+  ats_platform            TEXT,
+  ats_slug                TEXT,
+  resolved                INTEGER NOT NULL DEFAULT 1,         -- 1 = slug-complete; 0 = discovered, ATS not yet resolved
+  resolve_attempts        INTEGER NOT NULL DEFAULT 0,         -- stage-4 resolution tries (skip/deprioritise repeat failures)
+  last_resolve_attempt_at TEXT,
+  added_at                TEXT NOT NULL DEFAULT (datetime('now')),
+  last_fetched_at         TEXT,
   UNIQUE (ats_platform, ats_slug)
 );
+-- domain is the fallback dedup key for unresolved rows (whose ats_slug is NULL, and SQLite
+-- treats every NULL as distinct, so UNIQUE(ats_platform, ats_slug) can't dedup them).
+CREATE INDEX IF NOT EXISTS idx_companies_domain ON companies(domain);
 CREATE TABLE IF NOT EXISTS jobs (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
   company_id         INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -115,6 +120,16 @@ CREATE TABLE IF NOT EXISTS job_skills (              -- intrinsic, set by grade_
   UNIQUE (job_id, skill, kind)
 );
 `);
+
+// ── guarded migrations — additive columns for databases created before they existed.
+// No-ops on a fresh DB (CREATE TABLE above already has them). ALTER ADD COLUMN is the
+// only safe in-place change: CREATE TABLE IF NOT EXISTS won't alter a table that exists.
+function ensureColumn(table: string, column: string, ddl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+}
+ensureColumn("companies", "resolve_attempts", "resolve_attempts INTEGER NOT NULL DEFAULT 0");
+ensureColumn("companies", "last_resolve_attempt_at", "last_resolve_attempt_at TEXT");
 
 // ── personal accessors ─────────────────────────────────────────────────────
 export interface Profile {
@@ -229,17 +244,173 @@ export const getJobSkills = (jobId: number): JobSkill[] =>
 
 export interface Company {
   id: number; name: string; domain: string | null; tags: string | null; source: string | null;
-  ats_platform: string | null; ats_slug: string | null; resolved: number; added_at: string; last_fetched_at: string | null;
+  ats_platform: string | null; ats_slug: string | null; resolved: number;
+  resolve_attempts: number; last_resolve_attempt_at: string | null;
+  added_at: string; last_fetched_at: string | null;
 }
 export const getCompanies = (limit = 200): Company[] =>
   db.prepare(
-    "SELECT id, name, domain, tags, source, ats_platform, ats_slug, resolved, added_at, last_fetched_at FROM companies ORDER BY added_at DESC LIMIT ?",
+    "SELECT id, name, domain, tags, source, ats_platform, ats_slug, resolved, resolve_attempts, last_resolve_attempt_at, added_at, last_fetched_at FROM companies ORDER BY added_at DESC LIMIT ?",
   ).all(limit) as Company[];
 
+// ── company write path (build-zero: the persisters gather('find_companies') will call) ──
+// Naming reconciliation with tool1_build.md: the doc's "Tool A" is db.ts (this file — the
+// only writer); its add_resolved_company / add_unresolved_candidate both map to upsertCompany
+// (slug-complete → resolved=1; domain-only → resolved=0); its markCompanyResolved is
+// resolveCompany. There is no separate unresolved_candidates table — an unresolved candidate
+// is just a companies row with resolved=0, per the repo's existing schema.
+//
+// Dedup is accessor-level (matching the upsertProfile precedent of putting logic in the
+// accessor): match on the (ats_platform, ats_slug) tuple first, then on normalized domain,
+// coalescing fields on a hit so a later pass can fill blanks without clobbering known data.
+
+const normalizeDomain = (d?: string | null): string | null => {
+  if (!d) return null;
+  const s = d.trim().toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/[/?#].*$/, "");
+  return s || null;
+};
+
+// tags is a plain TEXT column (no _json suffix — the repo reserves that for JSON blobs),
+// so tags serialize as a comma-delimited, de-duplicated, sorted string of namespaced values.
+const parseTags = (s: string | null | undefined): string[] =>
+  s ? s.split(",").map((t) => t.trim()).filter(Boolean) : [];
+const serializeTags = (tags: string[]): string | null => {
+  const u = [...new Set(tags.map((t) => t.trim()).filter(Boolean))].sort();
+  return u.length ? u.join(",") : null;
+};
+
+export interface CompanyInput {
+  name: string;
+  domain?: string | null;
+  source?: string | null;          // provenance, e.g. 'theirstack' | 'common_crawl'
+  tags?: string[];                 // namespaced, e.g. ['funding:series_b', 'size:51-200']
+  ats_platform?: string | null;    // 'ashby' | 'greenhouse' | 'lever' | 'workable'
+  ats_slug?: string | null;
+  resolved?: boolean;              // explicit override; defaults to (ats_platform && ats_slug)
+}
+export interface UpsertResult { id: number; inserted: boolean }
+export interface ResolveResult { id: number; merged: boolean }
+
+const findBySlug = (platform: string, slug: string): Company | undefined =>
+  db.prepare("SELECT * FROM companies WHERE ats_platform = ? AND ats_slug = ?").get(platform, slug) as Company | undefined;
+const findByDomain = (domain: string): Company | undefined =>
+  db.prepare("SELECT * FROM companies WHERE domain = ? ORDER BY id LIMIT 1").get(domain) as Company | undefined;
+
+/**
+ * Idempotent insert-or-merge for a discovered company. Matches an existing row by the
+ * (ats_platform, ats_slug) tuple, then by normalized domain; on a hit it fills missing
+ * fields and unions tags, never overwriting known data. Slug-complete input is stored
+ * resolved=1, domain-only input resolved=0. Returns the row id and whether it was a fresh
+ * insert — so a discovery run can count net-new (credit accounting, dedup-before-fetch).
+ */
+export function upsertCompany(input: CompanyInput): UpsertResult {
+  const platform = input.ats_platform ?? null;
+  const slug = input.ats_slug ?? null;
+  const domain = normalizeDomain(input.domain);
+  const resolved = input.resolved ?? !!(platform && slug);
+
+  // Gather every existing row this input keys into — by slug-tuple and/or by domain. When the
+  // two keys hit two *different* rows, the same company was discovered two ways with no
+  // overlapping key until now; unify them (fold the extras into one) so no duplicate lingers.
+  const bySlug = platform && slug ? findBySlug(platform, slug) : undefined;
+  const byDomain = domain ? findByDomain(domain) : undefined;
+  const matches: Company[] = [];
+  if (bySlug) matches.push(bySlug);
+  if (byDomain && !matches.some((m) => m.id === byDomain.id)) matches.push(byDomain);
+
+  if (matches.length === 0) {
+    const info = db.prepare(
+      `INSERT INTO companies (name, domain, tags, source, ats_platform, ats_slug, resolved)
+       VALUES (@name, @domain, @tags, @source, @ats_platform, @ats_slug, @resolved)`,
+    ).run({
+      name: input.name, domain, tags: serializeTags(input.tags ?? []),
+      source: input.source ?? null, ats_platform: platform, ats_slug: slug, resolved: resolved ? 1 : 0,
+    });
+    return { id: Number(info.lastInsertRowid), inserted: true };
+  }
+
+  const primary = matches[0];
+  // Fold any additional matched rows into the primary, deleting each first so its slug-tuple
+  // is free before we COALESCE the tuple onto the primary (avoids hitting UNIQUE).
+  for (const m of matches.slice(1)) {
+    const folded = { domain: m.domain, source: m.source, tags: parseTags(m.tags),
+                     ats_platform: m.ats_platform, ats_slug: m.ats_slug, resolved: m.resolved === 1 };
+    db.prepare("DELETE FROM companies WHERE id = ?").run(m.id);
+    mergeFields(primary.id, folded);
+  }
+  mergeFields(primary.id, { domain, source: input.source, tags: input.tags, ats_platform: platform, ats_slug: slug, resolved });
+  return { id: primary.id, inserted: false };
+}
+
+// Fill missing columns and union tags onto an existing row (by id, re-read fresh so a prior
+// fold in the same call isn't lost) — never overwrites a known value. Callers guarantee any
+// slug-tuple passed here is free (not owned by another row).
+function mergeFields(
+  id: number,
+  input: { domain?: string | null; source?: string | null; tags?: string[]; ats_platform?: string | null; ats_slug?: string | null; resolved?: boolean },
+): void {
+  const row = db.prepare("SELECT tags, ats_platform, ats_slug, resolved FROM companies WHERE id = ?")
+    .get(id) as { tags: string | null; ats_platform: string | null; ats_slug: string | null; resolved: number } | undefined;
+  if (!row) return;
+  const tags = serializeTags([...parseTags(row.tags), ...(input.tags ?? [])]);
+  const platform = row.ats_platform ?? input.ats_platform ?? null;
+  const slug = row.ats_slug ?? input.ats_slug ?? null;
+  const resolved = row.resolved === 1 || input.resolved === true || (!!platform && !!slug) ? 1 : 0;
+  db.prepare(
+    `UPDATE companies SET
+       domain       = COALESCE(domain, @domain),
+       tags         = @tags,
+       source       = COALESCE(source, @source),
+       ats_platform = COALESCE(ats_platform, @ats_platform),
+       ats_slug     = COALESCE(ats_slug, @ats_slug),
+       resolved     = @resolved
+     WHERE id = @id`,
+  ).run({
+    id,
+    domain: normalizeDomain(input.domain),
+    tags,
+    source: input.source ?? null,
+    ats_platform: input.ats_platform ?? null,
+    ats_slug: input.ats_slug ?? null,
+    resolved,
+  });
+}
+
+/**
+ * Stage-4 success: an unresolved candidate's ATS board was found. Sets the slug-tuple and
+ * flips resolved=1. Collision-safe — if another row already owns this (platform, slug), the
+ * candidate is folded into that owner (domain/tags copied across) and removed, returning the
+ * surviving id (merged=true).
+ */
+export function resolveCompany(id: number, platform: string, slug: string): ResolveResult {
+  const owner = findBySlug(platform, slug);
+  if (owner && owner.id !== id) {
+    const cand = db.prepare("SELECT * FROM companies WHERE id = ?").get(id) as Company | undefined;
+    if (cand) {
+      mergeFields(owner.id, { domain: cand.domain, source: cand.source, tags: parseTags(cand.tags), resolved: true });
+      db.prepare("DELETE FROM companies WHERE id = ?").run(id);
+    }
+    return { id: owner.id, merged: true };
+  }
+  db.prepare("UPDATE companies SET ats_platform = ?, ats_slug = ?, resolved = 1 WHERE id = ?").run(platform, slug, id);
+  return { id, merged: false };
+}
+
+/** Stage-4 failure: record an attempt so a run can skip/deprioritise repeat failures. */
+export const bumpResolveAttempt = (id: number): void => {
+  db.prepare(
+    "UPDATE companies SET resolve_attempts = resolve_attempts + 1, last_resolve_attempt_at = datetime('now') WHERE id = ?",
+  ).run(id);
+};
+
 const countOf = (sql: string, ...args: unknown[]): number => (db.prepare(sql).get(...args) as { c: number }).c;
-export interface Counts { companies: number; jobs: number; ungraded: number; portfolio: number }
+export interface Counts { companies: number; unresolved: number; jobs: number; ungraded: number; portfolio: number }
 export const counts = (): Counts => ({
   companies: countOf("SELECT count(*) c FROM companies"),
+  unresolved: countOf("SELECT count(*) c FROM companies WHERE resolved = 0"),
   jobs: countOf("SELECT count(*) c FROM jobs"),
   ungraded: countOf("SELECT count(*) c FROM jobs WHERE grade_seniority IS NULL"),
   portfolio: countOf("SELECT count(*) c FROM portfolio_projects"),

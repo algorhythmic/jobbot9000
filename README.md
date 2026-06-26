@@ -57,7 +57,7 @@ The surface is union-free and order-independent. Read it as: *orient yourself, l
 
 - **`orient(detail?)`** — where the user is in the journey, which skill fits now, and what isn't built yet. `detail`: `recommend` (default), `raw` (bare state for rehydrate), `dashboard` (the relevant-vs-market gap + notes). Safe as the first call.
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`scope`: `market` / `relevant` / `worklist`), `companies`, `resume`, `portfolio`, `packet` (needs `job_id`). `relevant` vs `market` is a deliberate pair — the gap between them is the job-search signal.
-- **`gather(step, …)`** — the one fetch door; reaches a board, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog`. **All steps are pending stubs in this build** (the tool's description names which).
+- **`gather(step, …)`** — the one fetch door; reaches an external source, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog`. **`find_companies` is live and free by default** (name companies on demand, or a local curated seed roster → free ATS-slug resolution; TheirStack is an opt-in paid accelerator); the other three are still pending stubs (the tool's description and `orient`→`pending_tools` name which).
 
 **Six writes** — two raw intake, four judgment (each governed by a mode):
 
@@ -84,7 +84,7 @@ flowchart LR
 2. **Prep** — coach the master resume and portfolio against what the live market actually asks for (read-only on code: ideas and critique, never writing it).
 3. **Search** — surface roles in the user's level ±1 band, grade them and judge fit, then assemble a packet and a tailored cover letter the user applies with (the master resume goes as-is — there is one resume).
 
-Discovery (`gather` `find_companies` / `fetch_jobs`) is the next piece being built; until it lands, the catalog starts empty and stage 3 coaches from the resume. The three bundled skills — **coach**, **job-search**, **application** — are the playbooks for these stages. Claude invokes them automatically by their `description`, and they're available as the namespaced commands `/jobbot9000:coach`, `/jobbot9000:job-search`, `/jobbot9000:application`.
+Company discovery (`gather find_companies`) is **live and free by default** — name companies on demand (`companies: [{ name, domain }]`) or draw from a local curated seed roster, and their ATS slugs are resolved for free. TheirStack is an **opt-in paid accelerator** for targeted "who's hiring my title now" discovery (set `THEIRSTACK_API_KEY`, pass `provider: 'theirstack'`; count-first and credit-ceiling-gated so a run never overspends). Live **job** fetching (`gather fetch_jobs`) is the next piece being built; until it lands, the catalog can hold target companies but no jobs, so stage 3 still coaches from the resume. The three bundled skills — **coach**, **job-search**, **application** — are the playbooks for these stages. Claude invokes them automatically by their `description`, and they're available as the namespaced commands `/jobbot9000:coach`, `/jobbot9000:job-search`, `/jobbot9000:application`.
 
 ## Install (Claude Code)
 
@@ -102,9 +102,12 @@ State and the local catalog live in an embedded SQLite database under the plugin
 npm install
 npm run build      # compile the MCP server to dist/
 npm run dev        # run the server over stdio (tsx)
+npm test           # run the discovery test suite (tsx against src/, mocked HTTP — no network/key)
 ```
 
 The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/state`) and opens `jobbot.db` there; if `STATE_DIR` is unset it falls back to `~/.jobbot/state`.
+
+**Discovery env (all optional — discovery is free without any of it):** `find_companies` defaults to the free curated roster and the on-demand `companies` path; ATS-slug resolution is keyless. `JOBBOT_SEEDS_FILE` points the curated roster at a file of your own (outside the plugin dir, so it survives updates); unset, the bundled `seeds/companies.json` is used. Only the opt-in TheirStack accelerator reads the rest: `THEIRSTACK_API_KEY` (a data-source key — the *model* key never enters the server) and `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`, the per-run spend ceiling — a run estimates cost for free first and won't exceed it without an explicit `confirm`). Auto-recharge is never enabled.
 
 ## Layout
 
@@ -115,7 +118,10 @@ src/
   index.ts                   stdio entry; registers the tools
   db.ts                      SQLite schema + accessors — the only code that writes the DB
   state.ts                   the journey state machine (state derived from what data exists)
-  tools.ts                   the 9-tool surface
+  tools.ts                   the 9-tool surface (incl. the find_companies orchestration)
+  providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in); CC is a drop-in
+  ats.ts                     free, keyless ATS-slug resolution (Ashby/Greenhouse/Lever/Workable)
+seeds/                       curated company roster (free default for find_companies); ships empty
 skills/                      bundled skills: coach / job-search / application
 modes/                       grading modes (rubric + output schema) for the judgment writes
 hooks/, scripts/             SessionStart bootstrap (install + build on first run)

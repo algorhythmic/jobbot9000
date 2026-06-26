@@ -7,11 +7,17 @@ description: Run jobbot9000 in job-search mode — discover companies and live j
 
 You're the market analyst: gather raw, grade honestly, never inflate demand. The catalog is local and grows over time; discovery writes raw data, **grading is a separate pass you run**, and you never write the database directly — the tools do.
 
-**Availability:** discovery — `gather({ step: 'find_companies' })` and `gather({ step: 'fetch_jobs' })` — is the next piece being built. Until it lands, `orient` → `pending_tools` lists it and there are no jobs to search yet, so switch to coach mode (resume + level prep).
+**Availability:** company discovery — `gather({ step: 'find_companies' })` — is **live and free by default** (no key needed). Live **job** fetching — `gather({ step: 'fetch_jobs' })` — is the next piece being built; until it lands, `orient` → `pending_tools` lists it, so you can build a target-company catalog but there are no jobs to grade yet. Trust `orient` → `pending_tools` over this prose if they ever disagree.
 
-## Discover (populate the catalog)
-- `gather({ step: 'find_companies', niche })` → raw companies for the user's niche.
-- `gather({ step: 'fetch_jobs', ats_platform, ats_slug })` for a company → raw, **ungraded** jobs. Re-run to refresh.
+## Discover companies (populate the catalog)
+The reachable universe is companies on the four ATSes, so the **free path reaches everyone reachable** — start there. Three free-to-paid tiers, escalate only as recall demands:
+
+1. **On-demand (lightest, zero-config):** when the user names targets, resolve them directly — `gather({ step: 'find_companies', companies: [{ name: 'Stripe', domain: 'stripe.com' }] })`. No key, no roster. First value with one call.
+2. **Curated roster (free, default):** with no `companies`/`provider` arg, discovery returns the local seed roster (`seeds/companies.json`) and resolves it. Empty out of the box — the tool's note tells you how to add seeds or name companies. Relevance (does this company want *your* role?) is filtered for free at fetch + grade time, not here.
+3. **TheirStack (opt-in, paid):** for targeted "who's hiring my title now" discovery, set `THEIRSTACK_API_KEY` and pass `provider: 'theirstack'` with a query **you build from the resume** (stages 1–2 are yours — the server brings no model): titles, technologies, seniority (`junior|mid_level|senior|staff|c_level`), locations. **Count-first is free:** add `dry_run: true` to see the match count + projected cost. A paid pull stops and asks for `confirm: true` above the per-run ceiling (`THEIRSTACK_MAX_CREDITS_PER_RUN`, default 150); raise with `max_credits` or narrow the query.
+
+Re-runs dedup on domain — you never re-add (or re-pay for) companies already held. Unresolved companies (no ATS slug found) are kept as candidates; resolved ones are slug-complete and ready for job fetching.
+- `gather({ step: 'fetch_jobs', ats_platform, ats_slug })` for a resolved company → raw, **ungraded** jobs. *(Pending — ships next.)*
 
 ## Grade (a separate pass — your judgment)
 1. `look({ at: 'jobs', scope: 'worklist' })` for the worklist.

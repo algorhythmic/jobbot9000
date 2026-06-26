@@ -11,21 +11,36 @@ import { z } from "zod";
 import { readFileSync } from "node:fs";
 import * as DB from "./db.js";
 import { readJourneyState } from "./state.js";
+import { resolveAts } from "./ats.js";
+import { PROVIDERS, type DiscoverQuery, type DiscoveredCompany, type ProviderContext } from "./providers.js";
 
 type State = ReturnType<typeof readJourneyState>;
+
+// Per-run spend ceiling for paid discovery — the confirmation gate the TheirStack API
+// itself doesn't provide (handoff §6). A run estimates cost (records × rate) for free
+// first; above this it returns the estimate and waits for confirm:true rather than spend.
+const MAX_CREDITS_PER_RUN = Number(process.env.THEIRSTACK_MAX_CREDITS_PER_RUN ?? 150);
+// Discovery providers read their key from the local env (a data-source sense — NOT the
+// model key, which never enters this passive server). Auto-recharge is never touched.
+const providerContext = (): ProviderContext => ({ apiKey: process.env.THEIRSTACK_API_KEY });
 
 // Capability flags — flip these on as the external integrations land, and replace
 // the matching gather() step's planned() with the real persister. They keep every
 // tool honest about what isn't available yet instead of pointing at inert stubs.
-// WHEN YOU ENABLE DISCOVERY (or any flag): also update the "Availability"/"Next"
+// WHEN YOU ENABLE A STEP (any flag): also update the "Availability"/"Next"
 // notes in the three skills (skills/{coach,job-search,application}/SKILL.md). The
 // runtime self-corrects (pending_tools drops the step), but the skill prose — which
-// says discovery is "next/pending" — does not, so refresh it to match.
-const DISCOVERY_AVAILABLE = false;        // gather: find_companies / fetch_jobs
+// says the step is "next/pending" — does not, so refresh it to match.
+// Discovery splits into two steps with opposite cost profiles (see the dev handoff
+// §5): find_companies (lead-gen → ATS-slug resolution) is the priced/built arm;
+// fetch_jobs (keyless per-slug ATS pull) lands next. They flip independently.
+const FIND_COMPANIES_AVAILABLE = true;    // gather: find_companies — lead-gen + ATS-slug resolution
+const FETCH_JOBS_AVAILABLE = false;       // gather: fetch_jobs — live ATS board → raw jobs
 const PORTFOLIO_INGEST_AVAILABLE = false; // gather: ingest_portfolio
 const SYNC_AVAILABLE = false;             // gather: sync_catalog
 const pendingSteps = (): string[] => [
-  ...(!DISCOVERY_AVAILABLE ? ["find_companies", "fetch_jobs"] : []),
+  ...(!FIND_COMPANIES_AVAILABLE ? ["find_companies"] : []),
+  ...(!FETCH_JOBS_AVAILABLE ? ["fetch_jobs"] : []),
   ...(!PORTFOLIO_INGEST_AVAILABLE ? ["ingest_portfolio"] : []),
   ...(!SYNC_AVAILABLE ? ["sync_catalog"] : []),
 ];
@@ -41,11 +56,16 @@ const prepHint = (s: State) => {
   else if (!s.has_resume) steps.push("prep your resume");
   return steps.length ? steps.join(", ") : "sharpen your resume and portfolio against real demand";
 };
+// The job catalog can be empty for two different reasons now that find_companies
+// ships ahead of fetch_jobs: no companies discovered yet, OR companies discovered
+// but their live boards can't be pulled until fetch_jobs lands. Say which honestly.
 const emptyCatalogNote = (s: State) =>
-  `the job catalog is empty, and automated discovery (lead-gen) isn't available in this build yet. You can ${prepHint(s)} now; jobs appear once discovery ships.`;
+  s.catalog.companies === 0
+    ? `no jobs yet — discover target companies with gather({ step: 'find_companies' }), then pull their boards once live job fetching (gather 'fetch_jobs') ships. You can also ${prepHint(s)} now.`
+    : `${s.catalog.companies} companies discovered, but pulling their live job postings (gather 'fetch_jobs') isn't available in this build yet — so the job catalog is still empty. You can ${prepHint(s)} now; jobs appear once fetch_jobs ships.`;
 const marketOverlay = (s: State) =>
   s.catalog.jobs === 0
-    ? "(no market data yet — lead-gen is pending; coach on resume structure/clarity/impact for now, and don't fabricate demand)"
+    ? "(no market data yet — discover companies via gather 'find_companies'; live job fetching is pending, so coach on resume structure/clarity/impact for now and don't fabricate demand)"
     : "(market-demand overlay isn't computed in this build yet — derive the delta from look({ at: 'jobs' }) + each job's skills for now)";
 
 // Modes are the single source of truth for the closed vocabularies. loadMode does
@@ -105,7 +125,7 @@ export function registerTools(server: McpServer): void {
     if (detail === "recommend") {
       base.recommended_skill = !s.dimensions.onboarded ? "coach — onboard first"
         : !s.dimensions.level_assessed ? "coach — assess the user's level (the keystone)"
-        : (!DISCOVERY_AVAILABLE || s.catalog.jobs === 0) ? `coach — ${prepHint(s)}; live job search opens once discovery ships`
+        : s.catalog.jobs === 0 ? `coach — ${prepHint(s)}${FIND_COMPANIES_AVAILABLE ? "; build your target list with gather('find_companies')" : ""}; live job search opens once fetch_jobs ships`
         : "job-search or application";
       base.tool_discovery = "your client already has the full tool list; pending_tools above are the gather steps not yet functional in this build.";
       base.pending_note = "pending tools are integrations that ship later — nothing is broken; coaching + prep is the full first-run experience.";
@@ -119,12 +139,14 @@ export function registerTools(server: McpServer): void {
         `SELECT count(*) c FROM jobs WHERE still_live=1 AND grade_seniority IN (${band.map(() => "?").join(",")})`,
       ).get(...band) as { c: number }).c;
       gap = { relevant_in_band: relevant, whole_market: s.catalog.jobs, ungraded: s.catalog.ungraded_jobs, band };
-      if (s.catalog.jobs === 0) gap.note = "zeros reflect pending lead-gen, not market demand";
+      if (s.catalog.jobs === 0) gap.note = "zeros reflect pending live-job-fetching (and/or undiscovered companies), not measured market demand";
       else if (s.catalog.ungraded_jobs > 0) gap.note = `${s.catalog.ungraded_jobs} jobs ungraded — grade them (look scope:'worklist') before reading the band count as final`;
     }
     const notes: string[] = [];
-    if (!DISCOVERY_AVAILABLE && s.catalog.jobs === 0)
-      notes.push(`automated lead-gen isn't available in this build yet — the catalog stays empty until discovery (gather) ships. You can ${prepHint(s)} now.`);
+    if (s.catalog.jobs === 0)
+      notes.push(s.catalog.companies === 0
+        ? `no companies discovered yet — run gather({ step: 'find_companies' }) to build the target catalog. Live job fetching (fetch_jobs) ships next; until then jobs stay empty. You can ${prepHint(s)} now.`
+        : `${s.catalog.companies} companies discovered${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} still unresolved — no ATS slug yet)` : ""}, but live job fetching (fetch_jobs) isn't available in this build yet — jobs stay empty until it ships. You can ${prepHint(s)} now.`);
     if (s.profile?.no_resume || s.profile?.no_github)
       notes.push("the user opted out of a resume/GitHub — coach from their self-described projects and self-reported level (mark it as self-reported).");
     if (s.profile?.github_handle && !s.dimensions.portfolio_fetched && !s.profile.no_github)
@@ -152,9 +174,15 @@ export function registerTools(server: McpServer): void {
     const s = readJourneyState();
 
     if (a.at === "companies") {
-      const companies = DB.getCompanies(a.limit ?? 200);
+      // Surface the comma-delimited `tags` column as an array, and `resolved` as a
+      // readable status, so the agent reads structured fields rather than raw storage.
+      const companies = DB.getCompanies(a.limit ?? 200).map((c) => ({
+        ...c,
+        tags: c.tags ? c.tags.split(",").filter(Boolean) : [],
+        ats_status: c.resolved ? "resolved" : "unresolved",
+      }));
       const out: Record<string, unknown> = { companies };
-      if (companies.length === 0) out.note = DISCOVERY_AVAILABLE ? "no companies yet — run gather({ step: 'find_companies' })." : "no companies discovered yet — automated discovery isn't available in this build yet.";
+      if (companies.length === 0) out.note = FIND_COMPANIES_AVAILABLE ? "no companies yet — run gather({ step: 'find_companies' })." : "no companies discovered yet — automated discovery isn't available in this build yet.";
       return json(out);
     }
 
@@ -319,31 +347,151 @@ export function registerTools(server: McpServer): void {
     return json(out);
   });
 
-  // ── gather: the one door to the outside world (pending integrations) ──────
+  // ── gather: the one door to the outside world ─────────────────────────────
   const pending = pendingSteps();
   const gatherDesc =
     `${pending.length ? `[NOT YET AVAILABLE IN THIS BUILD: ${pending.join(", ")}] ` : ""}` +
-    "The one door to the outside world — reach out and persist new data, then return it. step selects the integration: 'find_companies' (lead-gen + ATS slugs for a niche; needs niche), 'fetch_jobs' (a company's live ATS board → raw, ungraded jobs; needs ats_platform + ats_slug), 'ingest_portfolio' (the user's public GitHub repos; needs github_handle), 'sync_catalog' (bidirectional, catalog-only sync; uses dry_run to show the diff first). Persistence is a side effect of gathering — the agent still never writes the DB itself.";
+    "The one door to the outside world — reach out and persist new data, then return it. step selects the integration: " +
+    "'find_companies' (lead-gen → ATS-slug resolution; FREE by default. Lightest: pass companies:[{name,domain}] to resolve specific companies on demand, no key. Or build a query from the resume — titles/technologies/seniority/locations — for the free curated roster; pass provider:'theirstack' (+ THEIRSTACK_API_KEY) for paid targeted discovery, count-first and credit-ceiling-gated), " +
+    "'fetch_jobs' (a company's live ATS board → raw, ungraded jobs; needs ats_platform + ats_slug), " +
+    "'ingest_portfolio' (the user's public GitHub repos; needs github_handle), " +
+    "'sync_catalog' (bidirectional, catalog-only sync; uses dry_run to show the diff first). " +
+    "Persistence is a side effect of gathering — the agent still never writes the DB itself.";
   server.registerTool("gather", {
     description: gatherDesc,
     inputSchema: {
       step: enumOf(["find_companies", "fetch_jobs", "ingest_portfolio", "sync_catalog"]),
+      // find_companies — on-demand (free, zero-config): name companies to resolve directly.
+      companies: z.array(z.object({ name: z.string(), domain: z.string().optional() })).optional(),
+      // find_companies query (you build this from the resume — stages 1–2 are yours):
+      titles: z.array(z.string()).optional(),
+      technologies: z.array(z.string()).optional(),
+      seniority: enumOf(["junior", "mid_level", "senior", "staff", "c_level"]).optional(),
+      locations: z.array(z.string()).optional(),
+      posted_within_days: z.number().int().positive().optional(),
+      provider: z.string().optional(),     // default: 'curated' (free); 'theirstack' opt-in
+      max_credits: z.number().int().positive().optional(), // override the per-run ceiling
+      confirm: z.boolean().optional(),     // proceed with a paid pull above the ceiling
       niche: z.string().optional(),
       ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(),
       ats_slug: z.string().optional(),
       github_handle: z.string().optional(),
-      dry_run: z.boolean().optional(),
+      dry_run: z.boolean().optional(),     // free count-first only — never spends
       limit: z.number().int().positive().optional(),
     },
   }, async (a) => {
-    // Each step is a stub until its capability flag flips; then replace planned()
-    // with the real persister (write via a db.ts helper, then return the findings).
     switch (a.step) {
-      case "find_companies": return planned("lead-gen + ATS-slug resolution for a niche");
-      case "fetch_jobs": return planned("fetch + normalize a live ATS board");
+      case "find_companies":
+        return FIND_COMPANIES_AVAILABLE ? findCompanies(a) : planned("lead-gen + ATS-slug resolution");
+      case "fetch_jobs":
+        return FETCH_JOBS_AVAILABLE ? json({ ok: false, error: "fetch_jobs handler not wired" }) : planned("fetch + normalize a live ATS board");
       case "ingest_portfolio": return planned("fetch the user's public GitHub repos");
       case "sync_catalog": return planned("bidirectional catalog sync with an external pool");
       default: return json({ ok: false, error: `unknown gather step '${a.step}'` });
     }
   });
+}
+
+// ── find_companies orchestration (gather step 'find_companies') ──────────────
+// Stages 3–4: discovery (a sense) → free ATS resolution → persist via db.ts (the sole
+// writer). Stages 1–2 (resume → query) are the agent's; this receives the built query.
+// DEFAULT IS FREE: no provider arg → the free curated roster; the zero-config on-demand
+// path ('companies') is free too. TheirStack is opt-in (provider:'theirstack' + key).
+// Cost-disciplined: count-first is free, paid pulls gate on a per-run credit ceiling,
+// and persistence is idempotent (re-runs dedup on domain, never re-pay). `deps` is
+// injectable so the whole path is testable offline against a mocked fetch.
+interface FindArgs {
+  titles?: string[]; technologies?: string[]; seniority?: string;
+  locations?: string[]; posted_within_days?: number;
+  companies?: { name: string; domain?: string }[]; // on-demand: resolve these directly (free)
+  provider?: string; max_credits?: number; confirm?: boolean; dry_run?: boolean; limit?: number;
+}
+interface FindDeps { ctx?: ProviderContext; resolve?: typeof resolveAts }
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+// Resolve + persist a batch of discovered companies. Slug-complete entries skip
+// resolution; name/domain entries resolve for free; unresolved-but-domained rows persist
+// as candidates (dedupable on re-run); a row with neither slug nor domain is unfetchable
+// and undedupable, so it's skipped rather than persisted as a re-inserting orphan.
+async function persistDiscovered(companies: DiscoveredCompany[], resolve: typeof resolveAts) {
+  let inserted = 0, resolved = 0, unresolved = 0, skipped = 0;
+  for (const c of companies) {
+    if (c.ats_platform && c.ats_slug) {
+      const up = DB.upsertCompany({ name: c.name, domain: c.domain, source: c.source, tags: c.tags, ats_platform: c.ats_platform, ats_slug: c.ats_slug });
+      if (up.inserted) inserted++;
+      resolved++;
+      continue;
+    }
+    const hit = await resolve({ name: c.name, domain: c.domain });
+    if (hit) {
+      const up = DB.upsertCompany({ name: c.name, domain: c.domain, source: c.source, tags: c.tags, ats_platform: hit.platform, ats_slug: hit.slug });
+      if (up.inserted) inserted++;
+      resolved++;
+    } else if (c.domain) {
+      const up = DB.upsertCompany({ name: c.name, domain: c.domain, source: c.source, tags: c.tags }); // resolved=0
+      if (up.inserted) inserted++;
+      DB.bumpResolveAttempt(up.id);
+      unresolved++;
+    } else {
+      skipped++;
+    }
+  }
+  return { inserted, resolved, unresolved, skipped };
+}
+
+const nextNote = () => FETCH_JOBS_AVAILABLE
+  ? "resolved companies are ready — pull their live boards with gather({ step: 'fetch_jobs', ats_platform, ats_slug })."
+  : "companies are in the catalog; pulling their live jobs (gather 'fetch_jobs') ships next. Unresolved rows have no ATS slug yet.";
+
+export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
+  const resolve = deps.resolve ?? resolveAts;
+
+  // ── On-demand path (free, zero-config): the user named specific companies. Resolve and
+  // persist them directly — no provider, no count, no key. The lightest free path.
+  if (a.companies?.length) {
+    const discovered: DiscoveredCompany[] = a.companies.map((c) => ({
+      name: c.name, domain: c.domain ?? null, tags: [], source: "manual", ats_platform: null, ats_slug: null,
+    }));
+    const persisted = await persistDiscovered(discovered, resolve);
+    return json({ ok: true, mode: "on_demand", credits_spent: 0, discovered: discovered.length, persisted, catalog: readJourneyState().catalog, next: nextNote() });
+  }
+
+  // ── Provider discovery path. Default provider is the free curated roster.
+  const providerName = a.provider ?? Object.keys(PROVIDERS)[0];
+  const provider = PROVIDERS[providerName];
+  if (!provider) return json({ ok: false, error: `unknown provider '${providerName}' — available: ${Object.keys(PROVIDERS).join(", ") || "(none)"}` });
+
+  const ctx = deps.ctx ?? providerContext();
+  if (!provider.available(ctx))
+    return json({ ok: false, error: `provider '${provider.name}' is unavailable${provider.requiresKey ? " — set THEIRSTACK_API_KEY in the local env to opt into paid targeting (a data-source key; the model key never enters the server). The free 'curated' provider and the 'companies' on-demand path need no key." : "."}` });
+
+  const q: DiscoverQuery = {
+    titles: a.titles, technologies: a.technologies, seniority: a.seniority ?? null,
+    locations: a.locations, posted_within_days: a.posted_within_days, limit: a.limit,
+  };
+
+  let est;
+  try { est = await provider.estimate(q, ctx); }            // FREE count-first
+  catch (e) { return json({ ok: false, error: `discovery pre-flight failed: ${errMsg(e)}` }); }
+
+  const ceiling = a.max_credits ?? MAX_CREDITS_PER_RUN;
+  if (a.dry_run)
+    return json({ ok: true, dry_run: true, provider: provider.name, estimate: est, ceiling, note: est.projected_credits === 0 ? "free provider — no spend; re-run without dry_run to persist." : "free count only — re-run without dry_run to pull (paid)." });
+  if (est.projected_credits > ceiling && !a.confirm)
+    return json({ ok: false, confirmation_required: true, provider: provider.name, estimate: est, ceiling,
+      note: `projected ~${est.projected_credits} credits exceeds the per-run ceiling (${ceiling}). Re-run with confirm:true to proceed, or lower limit / raise max_credits.` });
+
+  let result;
+  try { result = await provider.discover(q, ctx); }
+  catch (e) { return json({ ok: false, error: `discovery failed: ${errMsg(e)}` }); }
+
+  const persisted = await persistDiscovered(result.companies, resolve);
+  const out: Record<string, unknown> = {
+    ok: true, provider: provider.name, estimate: est, credits_spent: result.records_billed,
+    discovered: result.companies.length, persisted, catalog: readJourneyState().catalog, next: nextNote(),
+  };
+  // Honest guidance when the default free roster is empty — point at the paths that work now.
+  if (result.companies.length === 0 && provider.name === "curated")
+    out.note = "the curated seed roster is empty. Name companies directly to add them now — gather({ step: 'find_companies', companies: [{ name, domain }] }) — or add entries to seeds/companies.json, or set THEIRSTACK_API_KEY and pass provider:'theirstack' for paid targeted discovery.";
+  return json(out);
 }
