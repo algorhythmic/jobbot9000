@@ -143,6 +143,13 @@ const lv = await ats.fetchBoard("lever", "x", boardFetch("api.lever.co/v0/postin
   { hostedUrl: "https://lv/1", text: "SRE", categories: { location: "Berlin" }, workplaceType: "remote" },
 ]));
 eq([lv.length, lv[0].title, lv[0].remote], [1, "SRE", 1], "fetchBoard lever: array shape, remote flag");
+// Workable widget shape (verified live): city/state/country + telecommuting are top-level
+const wk = await ats.fetchBoard("workable", "wco", boardFetch("widget/accounts/wco", { name: "WCo", jobs: [
+  { url: "https://apply.workable.com/j/AAA", title: "Analyst", city: "", state: "", country: "Mexico", telecommuting: true },
+  { shortlink: "https://apply.workable.com/j/BBB", title: "Onsite Role", city: "Austin", state: "TX", country: "United States", telecommuting: false },
+] }));
+eq([wk[0].source_url, wk[0].location, wk[0].remote], ["https://apply.workable.com/j/AAA", "Mexico", 1], "fetchBoard workable: top-level country + telecommuting -> location/remote");
+eq([wk[1].location, wk[1].remote], ["Austin, TX, United States", null], "fetchBoard workable: city/state/country joined; non-telecommuting -> remote null");
 eq((await ats.fetchBoard("ashby", "empty", boardFetch("job-board/empty", { jobs: [] }))).length, 0, "fetchBoard: empty-but-valid board -> []");
 eq(await ats.fetchBoard("greenhouse", "nope", boardFetch("never", {})), null, "fetchBoard: 404 -> null");
 eq((await ats.fetchBoard("greenhouse", "d", boardFetch("boards/d/", { jobs: [{ title: "NoUrl" }, { absolute_url: "https://d/1", title: "Ok" }] }))).length, 1, "fetchBoard: postings without source_url dropped");
