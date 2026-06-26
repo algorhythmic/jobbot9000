@@ -6,9 +6,14 @@
 // that ATS; it just has no live postings right now) — only a 404/garbage board is a
 // miss. This module never writes the DB and holds no key; tools.ts persists the result.
 //
-// NOTE: the Workable endpoint shape is the least-verified here; confirm it against
-// ats_endpoint_verification.md before trusting it in production. The others (Ashby,
-// Greenhouse, Lever) match the verified table in the handoff.
+// VERIFICATION STATUS (checked against live boards):
+//   • Greenhouse, Ashby, Lever — VERIFIED live (real boards: stripe/gitlab/figma,
+//     ramp/linear, ro). Field paths below match real responses.
+//   • Workable — UNVERIFIED. The widget endpoint returns { name, jobs }, but on the
+//     boards tried it reported jobs:[] even for active companies, so it may UNDER-REPORT
+//     (wrong/legacy endpoint, or those firms left Workable — couldn't find a positive
+//     control). Resolution via it is fine (a 200 confirms the account); treat fetched
+//     job counts as best-effort until the correct jobs endpoint is confirmed.
 
 export type AtsPlatform = "ashby" | "greenhouse" | "lever" | "workable";
 
@@ -49,35 +54,64 @@ export function slugCandidates(name: string, domain?: string | null): { slug: st
   return out;
 }
 
-// ── per-ATS probes — return the live job count for a valid board, or null on miss ──
-// A valid board with zero postings returns 0 (resolved). A 404/non-OK/garbage returns null.
-const okJson = async (res: Response): Promise<any | null> => {
-  if (!res.ok) return null;
-  try { return await res.json(); } catch { return null; }
+// ── board endpoints + fetch/normalize ────────────────────────────────────────
+// One keyless GET per (platform, slug). Shared by resolution (which only needs the
+// count) and fetch_jobs (which needs the normalized postings) so the endpoint knowledge
+// lives in one place.
+const ENDPOINTS: Record<AtsPlatform, (slug: string) => string> = {
+  ashby: (s) => `https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(s)}?includeCompensation=true`,
+  greenhouse: (s) => `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(s)}/jobs?content=true`,
+  lever: (s) => `https://api.lever.co/v0/postings/${encodeURIComponent(s)}?mode=json`,
+  workable: (s) => `https://apply.workable.com/api/v1/widget/accounts/${encodeURIComponent(s)}?details=true`,
 };
 
-const PROBES: Record<AtsPlatform, (slug: string, f: FetchFn) => Promise<number | null>> = {
-  // Ashby — GET (not POST); { jobs: [...] }
-  ashby: async (slug, f) => {
-    const j = await okJson(await f(`https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(slug)}?includeCompensation=true`));
-    return j && Array.isArray(j.jobs) ? j.jobs.length : null;
-  },
-  // Greenhouse — { jobs: [...], meta: { total } }
-  greenhouse: async (slug, f) => {
-    const j = await okJson(await f(`https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(slug)}/jobs?content=true`));
-    return j && Array.isArray(j.jobs) ? j.jobs.length : null;
-  },
-  // Lever — a bare array of postings
-  lever: async (slug, f) => {
-    const j = await okJson(await f(`https://api.lever.co/v0/postings/${encodeURIComponent(slug)}?mode=json`));
-    return Array.isArray(j) ? j.length : null;
-  },
-  // Workable — public widget feed (least-verified; see file header note)
-  workable: async (slug, f) => {
-    const j = await okJson(await f(`https://apply.workable.com/api/v1/widget/accounts/${encodeURIComponent(slug)}?details=true`));
-    return j && Array.isArray(j.jobs) ? j.jobs.length : null;
-  },
+// A normalized posting. `source_url` is the per-company dedup key (UNIQUE(company_id,
+// source_url) in db.ts); a posting without one is dropped (can't dedup/track liveness).
+export interface RawJob {
+  source_url: string;
+  title: string | null;
+  location: string | null;
+  remote: number | null;       // 1 | null
+  comp_min: number | null;     // left null for now — comp shapes vary and aren't verified
+  comp_max: number | null;     // live; raw_json carries the source data for later extraction
+  raw: unknown;                // the full posting (→ raw_json)
+}
+
+const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v : null);
+
+// Per-platform normalizers. Return null when the payload isn't a valid board of that
+// platform (wrong shape) — that's a resolution miss. Return [] for a valid EMPTY board.
+// Extraction is tolerant (defensive field reads) since the live shapes can't be pinned
+// in the sandbox; whatever isn't mapped survives in raw_json.
+const NORMALIZERS: Record<AtsPlatform, (j: any) => RawJob[] | null> = {
+  greenhouse: (j) => Array.isArray(j?.jobs)
+    ? j.jobs.map((p: any): RawJob => ({ source_url: str(p?.absolute_url) ?? "", title: str(p?.title), location: str(p?.location?.name), remote: /remote/i.test(p?.location?.name ?? "") ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
+    : null,
+  lever: (j) => Array.isArray(j)
+    ? j.map((p: any): RawJob => ({ source_url: str(p?.hostedUrl) ?? str(p?.applyUrl) ?? "", title: str(p?.text), location: str(p?.categories?.location), remote: (p?.workplaceType ?? "").toLowerCase() === "remote" ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
+    : null,
+  ashby: (j) => Array.isArray(j?.jobs)
+    ? j.jobs.map((p: any): RawJob => ({ source_url: str(p?.jobUrl) ?? str(p?.applyUrl) ?? "", title: str(p?.title), location: str(p?.location) ?? str(p?.locationName), remote: p?.isRemote ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
+    : null,
+  workable: (j) => Array.isArray(j?.jobs)
+    ? j.jobs.map((p: any): RawJob => ({ source_url: str(p?.url) ?? str(p?.shortlink) ?? str(p?.application_url) ?? "", title: str(p?.title), location: [p?.location?.city, p?.location?.country].filter(Boolean).join(", ") || null, remote: p?.remote ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
+    : null,
 };
+
+/**
+ * Fetch + normalize one ATS board. Returns the postings (possibly empty for a live but
+ * vacant board), or null if the board is unreachable / not that platform (404, network
+ * error, garbage payload). The null-vs-[] distinction matters for liveness: [] means
+ * "valid board, nothing open" (close everything), null means "couldn't reach" (leave as-is).
+ */
+export async function fetchBoard(platform: AtsPlatform, slug: string, fetchFn: FetchFn = fetch): Promise<RawJob[] | null> {
+  let res: Response;
+  try { res = await fetchFn(ENDPOINTS[platform](slug)); } catch { return null; }
+  if (!res.ok) return null;
+  let json: unknown;
+  try { json = await res.json(); } catch { return null; }
+  return NORMALIZERS[platform](json);
+}
 
 export interface ResolveOpts {
   fetchFn?: FetchFn;
@@ -102,9 +136,8 @@ export async function resolveAts(
   for (const via of ["domain", "name"] as const) {
     for (const cand of candidates.filter((c) => c.via === via)) {
       for (const platform of order) {
-        let count: number | null = null;
-        try { count = await PROBES[platform](cand.slug, f); } catch { count = null; }
-        if (count !== null) return { platform, slug: cand.slug, job_count: count, via };
+        const board = await fetchBoard(platform, cand.slug, f); // null = miss, [] = empty-but-valid
+        if (board !== null) return { platform, slug: cand.slug, job_count: board.length, via };
       }
     }
   }

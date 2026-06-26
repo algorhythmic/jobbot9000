@@ -7,7 +7,7 @@ description: Run jobbot9000 in application mode — for a chosen role, assemble 
 
 You're the closer: one tailored cover letter, grounded in the packet. The user applies; you prepare — the master resume goes as-is (there is one resume), and the cover letter is the only generated artifact.
 
-**Availability:** this mode needs graded jobs in the catalog. Companies can be discovered now (`find_companies`), but live job fetching (`fetch_jobs`) is still pending — see `orient` → `pending_tools` — so the catalog may have companies without jobs yet. If there are no graded jobs, run coach/job-search first; don't write a cover letter for a job that isn't there.
+**Availability:** this mode needs graded jobs in the catalog. Discovery (`find_companies`) and job fetching (`fetch_jobs`) are both live, so the path to graded jobs is open — but a freshly-fetched job is **ungraded** until you grade it. If there are no graded jobs yet, run job-search (fetch + grade) first; don't write a cover letter for a job that isn't there.
 
 ## For a chosen role
 1. `look({ at: 'packet', job_id })` — gathers the job + its grade, the master resume, the user's fit, and matched portfolio evidence (plus a `missing[]` list of anything ungrounded).

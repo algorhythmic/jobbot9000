@@ -36,7 +36,7 @@ const ok = (body) => ({ ok: true, status: 200, json: async () => body });
 const notFound = () => ({ ok: false, status: 404, json: async () => ({}) });
 // ATS mock: greenhouse 'acme' valid (2 jobs); ashby 'emptyco' empty-but-valid; else 404.
 const atsFetch = async (url) => {
-  if (url.includes("boards-api.greenhouse.io/v1/boards/acme/")) return ok({ jobs: [{ id: 1 }, { id: 2 }] });
+  if (url.includes("boards-api.greenhouse.io/v1/boards/acme/")) return ok({ jobs: [{ absolute_url: "https://acme/1", title: "A" }, { absolute_url: "https://acme/2", title: "B" }] });
   if (url.includes("api.ashbyhq.com/posting-api/job-board/emptyco")) return ok({ jobs: [] });
   return notFound();
 };
@@ -113,6 +113,58 @@ eq([DB.counts().companies, DB.counts().unresolved], [3, 2], "paid pull: now 3 co
 const rerun = jres(await tools.findCompanies({ provider: "theirstack", titles: ["SWE"], limit: 25, confirm: true }, { ctx: tsCtx, resolve: atsResolve }));
 eq(rerun.persisted.inserted, 0, "re-run: 0 net-new (idempotent persist, dedup-before-fetch)");
 eq(DB.counts().companies, 3, "re-run: still 3 companies");
+
+// ════════════════════ fetch_jobs ════════════════════
+const live = (cid) => DB.db.prepare("SELECT count(*) c FROM jobs WHERE company_id=? AND still_live=1").get(cid).c;
+
+// ── I. Board fetch + normalize (real fetchBoard, mocked HTTP) ──────────────────
+const boardFetch = (frag, body) => async (url) => (url.includes(frag) ? ok(body) : notFound());
+const gh = await ats.fetchBoard("greenhouse", "acmeco", boardFetch("boards/acmeco/", { jobs: [
+  { absolute_url: "https://gh/1", title: "Eng", location: { name: "Remote - US" } },
+  { absolute_url: "https://gh/2", title: "PM", location: { name: "NYC" } },
+] }));
+eq([gh.length, gh[0].source_url, gh[0].remote, gh[1].remote], [2, "https://gh/1", 1, null], "fetchBoard greenhouse: normalize + remote-from-location");
+const lv = await ats.fetchBoard("lever", "x", boardFetch("api.lever.co/v0/postings/x", [
+  { hostedUrl: "https://lv/1", text: "SRE", categories: { location: "Berlin" }, workplaceType: "remote" },
+]));
+eq([lv.length, lv[0].title, lv[0].remote], [1, "SRE", 1], "fetchBoard lever: array shape, remote flag");
+eq((await ats.fetchBoard("ashby", "empty", boardFetch("job-board/empty", { jobs: [] }))).length, 0, "fetchBoard: empty-but-valid board -> []");
+eq(await ats.fetchBoard("greenhouse", "nope", boardFetch("never", {})), null, "fetchBoard: 404 -> null");
+eq((await ats.fetchBoard("greenhouse", "d", boardFetch("boards/d/", { jobs: [{ title: "NoUrl" }, { absolute_url: "https://d/1", title: "Ok" }] }))).length, 1, "fetchBoard: postings without source_url dropped");
+
+// ── J. upsertJobs liveness (direct) ───────────────────────────────────────────
+const cid = DB.upsertCompany({ name: "LiveCo", domain: "liveco.com", ats_platform: "greenhouse", ats_slug: "liveco" }).id;
+eq(DB.upsertJobs(cid, [{ source_url: "u1", title: "A" }, { source_url: "u2", title: "B" }]), { inserted: 2, updated: 0, closed: 0, seen: 2 }, "upsertJobs: initial insert");
+eq(DB.upsertJobs(cid, [{ source_url: "u1", title: "A2" }]), { inserted: 0, updated: 1, closed: 1, seen: 1 }, "upsertJobs: update u1, close vanished u2 (liveness)");
+eq(live(cid), 1, "upsertJobs: only u1 live after u2 closed");
+eq([DB.upsertJobs(cid, [{ source_url: "u1" }, { source_url: "u2" }]).inserted, live(cid)], [0, 2], "upsertJobs: u2 reopens (update, not insert)");
+eq(DB.upsertJobs(cid, []).closed, 2, "upsertJobs: empty feed closes all live");
+eq(live(cid), 0, "upsertJobs: nothing live after empty feed");
+
+// ── K. fetchJobs orchestration (injected boards) ──────────────────────────────
+const boards = { "greenhouse:newco": [{ source_url: "n1", title: "Eng" }, { source_url: "n2", title: "PM" }], "ashby:deadco": null };
+const fbf = async (platform, slug) => (`${platform}:${slug}` in boards ? boards[`${platform}:${slug}`] : null);
+const noSleep = async () => {};
+const fd = { fetchBoardFn: fbf, sleep: noSleep, politeDelayMs: 0 };
+
+const f1 = jres(await tools.fetchJobs({ ats_platform: "greenhouse", ats_slug: "newco" }, fd));
+eq([f1.ok, f1.boards_fetched, f1.jobs.inserted], [true, 1, 2], "fetchJobs: one board by slug -> 2 jobs inserted");
+eq(!!DB.getCompanyByAts("greenhouse", "newco"), true, "fetchJobs: auto-created company for a new slug");
+eq(typeof f1.next === "string" && f1.next.includes("worklist"), true, "fetchJobs: next points at grading");
+
+DB.upsertCompany({ name: "DeadCo", ats_platform: "ashby", ats_slug: "deadco" });
+const f2 = jres(await tools.fetchJobs({ ats_platform: "ashby", ats_slug: "deadco" }, fd));
+eq([f2.boards_fetched, f2.unreachable, f2.jobs.inserted], [0, 1, 0], "fetchJobs: unreachable board skipped, nothing persisted");
+
+const noslug = DB.upsertCompany({ name: "NoSlug", domain: "noslug.com" }).id;
+eq(jres(await tools.fetchJobs({ company_id: noslug }, fd)).ok, false, "fetchJobs: unresolved company_id -> honest error");
+eq(jres(await tools.fetchJobs({ company_id: 999999 }, fd)).ok, false, "fetchJobs: missing company_id -> honest error");
+
+const fc = jres(await tools.fetchJobs({ company_id: DB.getCompanyByAts("greenhouse", "newco").id }, fd));
+eq([fc.ok, fc.jobs.updated], [true, 2], "fetchJobs: by company_id refetches (idempotent update)");
+
+const fb = jres(await tools.fetchJobs({}, fd));
+eq([fb.ok, fb.boards_fetched >= 1], [true, true], "fetchJobs: batch-all refreshes resolved companies");
 
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}

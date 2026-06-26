@@ -57,7 +57,7 @@ The surface is union-free and order-independent. Read it as: *orient yourself, l
 
 - **`orient(detail?)`** — where the user is in the journey, which skill fits now, and what isn't built yet. `detail`: `recommend` (default), `raw` (bare state for rehydrate), `dashboard` (the relevant-vs-market gap + notes). Safe as the first call.
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`scope`: `market` / `relevant` / `worklist`), `companies`, `resume`, `portfolio`, `packet` (needs `job_id`). `relevant` vs `market` is a deliberate pair — the gap between them is the job-search signal.
-- **`gather(step, …)`** — the one fetch door; reaches an external source, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog`. **`find_companies` is live and free by default** (name companies on demand, or a local curated seed roster → free ATS-slug resolution; TheirStack is an opt-in paid accelerator); the other three are still pending stubs (the tool's description and `orient`→`pending_tools` name which).
+- **`gather(step, …)`** — the one fetch door; reaches an external source, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog`. **`find_companies` and `fetch_jobs` are live and keyless by default** (discover companies on demand / from a curated roster → resolve ATS slugs for free; then pull their live boards; TheirStack is an opt-in paid discovery accelerator). `ingest_portfolio` / `sync_catalog` are still pending stubs (the tool's description and `orient`→`pending_tools` name which).
 
 **Six writes** — two raw intake, four judgment (each governed by a mode):
 
@@ -84,7 +84,7 @@ flowchart LR
 2. **Prep** — coach the master resume and portfolio against what the live market actually asks for (read-only on code: ideas and critique, never writing it).
 3. **Search** — surface roles in the user's level ±1 band, grade them and judge fit, then assemble a packet and a tailored cover letter the user applies with (the master resume goes as-is — there is one resume).
 
-Company discovery (`gather find_companies`) is **live and free by default** — name companies on demand (`companies: [{ name, domain }]`) or draw from a local curated seed roster, and their ATS slugs are resolved for free. TheirStack is an **opt-in paid accelerator** for targeted "who's hiring my title now" discovery (set `THEIRSTACK_API_KEY`, pass `provider: 'theirstack'`; count-first and credit-ceiling-gated so a run never overspends). Live **job** fetching (`gather fetch_jobs`) is the next piece being built; until it lands, the catalog can hold target companies but no jobs, so stage 3 still coaches from the resume. The three bundled skills — **coach**, **job-search**, **application** — are the playbooks for these stages. Claude invokes them automatically by their `description`, and they're available as the namespaced commands `/jobbot9000:coach`, `/jobbot9000:job-search`, `/jobbot9000:application`.
+Company discovery (`gather find_companies`) is **live and free by default** — name companies on demand (`companies: [{ name, domain }]`) or draw from a local curated seed roster, and their ATS slugs are resolved for free. TheirStack is an **opt-in paid accelerator** for targeted "who's hiring my title now" discovery (set `THEIRSTACK_API_KEY`, pass `provider: 'theirstack'`; count-first and credit-ceiling-gated so a run never overspends). Live **job** fetching (`gather fetch_jobs`) is also live and keyless — it pulls a resolved company's public ATS board (one company, or all resolved companies stalest-first), upserts the postings, and runs a liveness pass that closes roles that left the feed. (Greenhouse / Ashby / Lever are verified against live boards; Workable is best-effort.) Newly-fetched jobs are **ungraded** — grade them, then they surface in the relevant-vs-market views. The three bundled skills — **coach**, **job-search**, **application** — are the playbooks for these stages. Claude invokes them automatically by their `description`, and they're available as the namespaced commands `/jobbot9000:coach`, `/jobbot9000:job-search`, `/jobbot9000:application`.
 
 ## Install (Claude Code)
 
@@ -120,7 +120,7 @@ src/
   state.ts                   the journey state machine (state derived from what data exists)
   tools.ts                   the 9-tool surface (incl. the find_companies orchestration)
   providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in); CC is a drop-in
-  ats.ts                     free, keyless ATS-slug resolution (Ashby/Greenhouse/Lever/Workable)
+  ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
 seeds/                       curated company roster (free default for find_companies); ships empty
 skills/                      bundled skills: coach / job-search / application
 modes/                       grading modes (rubric + output schema) for the judgment writes

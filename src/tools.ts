@@ -11,7 +11,7 @@ import { z } from "zod";
 import { readFileSync } from "node:fs";
 import * as DB from "./db.js";
 import { readJourneyState } from "./state.js";
-import { resolveAts } from "./ats.js";
+import { resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
 import { PROVIDERS, type DiscoverQuery, type DiscoveredCompany, type ProviderContext } from "./providers.js";
 
 type State = ReturnType<typeof readJourneyState>;
@@ -35,7 +35,7 @@ const providerContext = (): ProviderContext => ({ apiKey: process.env.THEIRSTACK
 // §5): find_companies (lead-gen → ATS-slug resolution) is the priced/built arm;
 // fetch_jobs (keyless per-slug ATS pull) lands next. They flip independently.
 const FIND_COMPANIES_AVAILABLE = true;    // gather: find_companies — lead-gen + ATS-slug resolution
-const FETCH_JOBS_AVAILABLE = false;       // gather: fetch_jobs — live ATS board → raw jobs
+const FETCH_JOBS_AVAILABLE = true;        // gather: fetch_jobs — live ATS board → raw jobs
 const PORTFOLIO_INGEST_AVAILABLE = false; // gather: ingest_portfolio
 const SYNC_AVAILABLE = false;             // gather: sync_catalog
 const pendingSteps = (): string[] => [
@@ -56,16 +56,15 @@ const prepHint = (s: State) => {
   else if (!s.has_resume) steps.push("prep your resume");
   return steps.length ? steps.join(", ") : "sharpen your resume and portfolio against real demand";
 };
-// The job catalog can be empty for two different reasons now that find_companies
-// ships ahead of fetch_jobs: no companies discovered yet, OR companies discovered
-// but their live boards can't be pulled until fetch_jobs lands. Say which honestly.
+// The job catalog can be empty for two different reasons: no companies discovered yet,
+// or companies discovered but their boards not pulled yet. Say which, and the next step.
 const emptyCatalogNote = (s: State) =>
   s.catalog.companies === 0
-    ? `no jobs yet — discover target companies with gather({ step: 'find_companies' }), then pull their boards once live job fetching (gather 'fetch_jobs') ships. You can also ${prepHint(s)} now.`
-    : `${s.catalog.companies} companies discovered, but pulling their live job postings (gather 'fetch_jobs') isn't available in this build yet — so the job catalog is still empty. You can ${prepHint(s)} now; jobs appear once fetch_jobs ships.`;
+    ? `no jobs yet — discover target companies with gather({ step: 'find_companies' }), then pull their boards with gather({ step: 'fetch_jobs' }). You can also ${prepHint(s)} now.`
+    : `${s.catalog.companies} companies discovered but no jobs pulled yet — run gather({ step: 'fetch_jobs' }) to fetch their live boards${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} have no ATS slug yet and can't be fetched until resolved)` : ""}. You can also ${prepHint(s)} now.`;
 const marketOverlay = (s: State) =>
   s.catalog.jobs === 0
-    ? "(no market data yet — discover companies via gather 'find_companies'; live job fetching is pending, so coach on resume structure/clarity/impact for now and don't fabricate demand)"
+    ? "(no market data yet — discover companies via gather 'find_companies' and pull their boards via gather 'fetch_jobs'; until then coach on resume structure/clarity/impact and don't fabricate demand)"
     : "(market-demand overlay isn't computed in this build yet — derive the delta from look({ at: 'jobs' }) + each job's skills for now)";
 
 // Modes are the single source of truth for the closed vocabularies. loadMode does
@@ -125,7 +124,9 @@ export function registerTools(server: McpServer): void {
     if (detail === "recommend") {
       base.recommended_skill = !s.dimensions.onboarded ? "coach — onboard first"
         : !s.dimensions.level_assessed ? "coach — assess the user's level (the keystone)"
-        : s.catalog.jobs === 0 ? `coach — ${prepHint(s)}${FIND_COMPANIES_AVAILABLE ? "; build your target list with gather('find_companies')" : ""}; live job search opens once fetch_jobs ships`
+        : s.catalog.jobs === 0 ? (s.catalog.companies === 0
+            ? `coach — ${prepHint(s)}; then build your target list with gather('find_companies') and pull boards with gather('fetch_jobs')`
+            : `job-search — you have ${s.catalog.companies} companies but no jobs yet; run gather('fetch_jobs') to populate them, then grade`)
         : "job-search or application";
       base.tool_discovery = "your client already has the full tool list; pending_tools above are the gather steps not yet functional in this build.";
       base.pending_note = "pending tools are integrations that ship later — nothing is broken; coaching + prep is the full first-run experience.";
@@ -139,14 +140,14 @@ export function registerTools(server: McpServer): void {
         `SELECT count(*) c FROM jobs WHERE still_live=1 AND grade_seniority IN (${band.map(() => "?").join(",")})`,
       ).get(...band) as { c: number }).c;
       gap = { relevant_in_band: relevant, whole_market: s.catalog.jobs, ungraded: s.catalog.ungraded_jobs, band };
-      if (s.catalog.jobs === 0) gap.note = "zeros reflect pending live-job-fetching (and/or undiscovered companies), not measured market demand";
+      if (s.catalog.jobs === 0) gap.note = "zeros reflect an unpopulated catalog (discover companies, then gather 'fetch_jobs'), not measured market demand";
       else if (s.catalog.ungraded_jobs > 0) gap.note = `${s.catalog.ungraded_jobs} jobs ungraded — grade them (look scope:'worklist') before reading the band count as final`;
     }
     const notes: string[] = [];
     if (s.catalog.jobs === 0)
       notes.push(s.catalog.companies === 0
-        ? `no companies discovered yet — run gather({ step: 'find_companies' }) to build the target catalog. Live job fetching (fetch_jobs) ships next; until then jobs stay empty. You can ${prepHint(s)} now.`
-        : `${s.catalog.companies} companies discovered${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} still unresolved — no ATS slug yet)` : ""}, but live job fetching (fetch_jobs) isn't available in this build yet — jobs stay empty until it ships. You can ${prepHint(s)} now.`);
+        ? `no companies discovered yet — run gather({ step: 'find_companies' }) to build the target catalog, then gather({ step: 'fetch_jobs' }) to pull their boards. You can ${prepHint(s)} now.`
+        : `${s.catalog.companies} companies discovered${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} still unresolved — no ATS slug yet)` : ""} but no jobs pulled — run gather({ step: 'fetch_jobs' }) to fetch their live boards. You can also ${prepHint(s)} now.`);
     if (s.profile?.no_resume || s.profile?.no_github)
       notes.push("the user opted out of a resume/GitHub — coach from their self-described projects and self-reported level (mark it as self-reported).");
     if (s.profile?.github_handle && !s.dimensions.portfolio_fetched && !s.profile.no_github)
@@ -353,7 +354,7 @@ export function registerTools(server: McpServer): void {
     `${pending.length ? `[NOT YET AVAILABLE IN THIS BUILD: ${pending.join(", ")}] ` : ""}` +
     "The one door to the outside world — reach out and persist new data, then return it. step selects the integration: " +
     "'find_companies' (lead-gen → ATS-slug resolution; FREE by default. Lightest: pass companies:[{name,domain}] to resolve specific companies on demand, no key. Or build a query from the resume — titles/technologies/seniority/locations — for the free curated roster; pass provider:'theirstack' (+ THEIRSTACK_API_KEY) for paid targeted discovery, count-first and credit-ceiling-gated), " +
-    "'fetch_jobs' (a company's live ATS board → raw, ungraded jobs; needs ats_platform + ats_slug), " +
+    "'fetch_jobs' (pull live ATS boards → raw, ungraded jobs; keyless. Target one board with ats_platform+ats_slug or company_id, or pass none to refresh all resolved companies (stalest first, bounded by limit). A liveness pass closes postings that vanished; grade the new jobs next), " +
     "'ingest_portfolio' (the user's public GitHub repos; needs github_handle), " +
     "'sync_catalog' (bidirectional, catalog-only sync; uses dry_run to show the diff first). " +
     "Persistence is a side effect of gathering — the agent still never writes the DB itself.";
@@ -373,8 +374,10 @@ export function registerTools(server: McpServer): void {
       max_credits: z.number().int().positive().optional(), // override the per-run ceiling
       confirm: z.boolean().optional(),     // proceed with a paid pull above the ceiling
       niche: z.string().optional(),
+      // fetch_jobs targets (all optional — none = refresh every resolved company):
       ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(),
       ats_slug: z.string().optional(),
+      company_id: z.number().int().optional(),
       github_handle: z.string().optional(),
       dry_run: z.boolean().optional(),     // free count-first only — never spends
       limit: z.number().int().positive().optional(),
@@ -384,7 +387,7 @@ export function registerTools(server: McpServer): void {
       case "find_companies":
         return FIND_COMPANIES_AVAILABLE ? findCompanies(a) : planned("lead-gen + ATS-slug resolution");
       case "fetch_jobs":
-        return FETCH_JOBS_AVAILABLE ? json({ ok: false, error: "fetch_jobs handler not wired" }) : planned("fetch + normalize a live ATS board");
+        return FETCH_JOBS_AVAILABLE ? fetchJobs(a) : planned("fetch + normalize a live ATS board");
       case "ingest_portfolio": return planned("fetch the user's public GitHub repos");
       case "sync_catalog": return planned("bidirectional catalog sync with an external pool");
       default: return json({ ok: false, error: `unknown gather step '${a.step}'` });
@@ -494,4 +497,79 @@ export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
   if (result.companies.length === 0 && provider.name === "curated")
     out.note = "the curated seed roster is empty. Name companies directly to add them now — gather({ step: 'find_companies', companies: [{ name, domain }] }) — or add entries to seeds/companies.json, or set THEIRSTACK_API_KEY and pass provider:'theirstack' for paid targeted discovery.";
   return json(out);
+}
+
+// ── fetch_jobs orchestration (gather step 'fetch_jobs') ──────────────────────
+// Keyless: pull one or many ATS boards, normalize, and persist via db.ts (the sole
+// writer). Targets: ats_platform+ats_slug (one board; auto-creates a minimal resolved
+// company if that slug is new), company_id (one known company), or none (refresh all
+// resolved companies, stalest-first, bounded by limit). An UNREACHABLE board (null) is
+// reported and skipped — never persisted, so a transient 404 never closes a whole
+// company; a valid EMPTY board ([]) closes that company's stale postings via the liveness
+// pass. `deps` is injectable so the whole path is testable offline against a mocked fetch.
+interface FetchArgs { ats_platform?: string; ats_slug?: string; company_id?: number; limit?: number }
+interface FetchTarget { company_id: number; platform: AtsPlatform; slug: string; name: string }
+interface FetchDeps {
+  fetchBoardFn?: typeof fetchBoard;
+  sleep?: (ms: number) => Promise<void>;
+  politeDelayMs?: number; // between consecutive boards (Lever asks ~1s); 0 in tests
+}
+const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
+  const fetchBoardFn = deps.fetchBoardFn ?? fetchBoard;
+  const sleep = deps.sleep ?? realSleep;
+  const politeDelayMs = deps.politeDelayMs ?? 1000;
+
+  // ── resolve the target list ────────────────────────────────────────────────
+  const targets: FetchTarget[] = [];
+  if (a.ats_platform && a.ats_slug) {
+    const platform = a.ats_platform as AtsPlatform; // constrained by the gather enum
+    const existing = DB.getCompanyByAts(platform, a.ats_slug);
+    const id = existing?.id ?? DB.upsertCompany({ name: a.ats_slug, ats_platform: platform, ats_slug: a.ats_slug, source: "manual" }).id;
+    targets.push({ company_id: id, platform, slug: a.ats_slug, name: existing?.name ?? a.ats_slug });
+  } else if (a.company_id !== undefined) {
+    const c = DB.db.prepare("SELECT id, name, ats_platform, ats_slug FROM companies WHERE id=?").get(a.company_id) as
+      { id: number; name: string; ats_platform: string | null; ats_slug: string | null } | undefined;
+    if (!c) return json({ ok: false, error: `no company ${a.company_id} — list companies via look({ at: 'companies' }).` });
+    if (!c.ats_platform || !c.ats_slug) return json({ ok: false, error: `company ${a.company_id} (${c.name}) has no ATS slug yet — resolve it via gather('find_companies') first.` });
+    targets.push({ company_id: c.id, platform: c.ats_platform as AtsPlatform, slug: c.ats_slug, name: c.name });
+  } else {
+    for (const c of DB.getResolvedCompanies(a.limit ?? 25))
+      targets.push({ company_id: c.id, platform: c.ats_platform as AtsPlatform, slug: c.ats_slug!, name: c.name });
+  }
+  if (targets.length === 0)
+    return json({ ok: true, boards_fetched: 0, note: "no resolved companies to fetch — discover and resolve some via gather('find_companies'), or target a board with ats_platform + ats_slug." });
+
+  // ── fetch each board, persist via db.ts ────────────────────────────────────
+  const totals = { inserted: 0, updated: 0, closed: 0 };
+  const per_company: Record<string, unknown>[] = [];
+  let unreachable = 0;
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i];
+    if (i > 0 && politeDelayMs > 0) await sleep(politeDelayMs); // be polite between boards
+    let board;
+    try { board = await fetchBoardFn(t.platform, t.slug); }
+    catch { board = null; }
+    if (board === null) { // unreachable — skip, do NOT touch liveness
+      unreachable++;
+      per_company.push({ company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true });
+      continue;
+    }
+    const r = DB.upsertJobs(t.company_id, board);
+    totals.inserted += r.inserted; totals.updated += r.updated; totals.closed += r.closed;
+    per_company.push({ company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, ...r });
+  }
+
+  return json({
+    ok: true,
+    boards_fetched: targets.length - unreachable,
+    unreachable,
+    jobs: totals,
+    per_company,
+    catalog: readJourneyState().catalog,
+    next: totals.inserted + totals.updated > 0
+      ? "grade the new jobs — look({ at: 'jobs', scope: 'worklist' }) for the queue, then grade_job + grade_job_fit."
+      : "no live postings found on these boards (or all unreachable). Try other companies, or coach from the resume.",
+  });
 }

@@ -7,7 +7,7 @@ description: Run jobbot9000 in job-search mode — discover companies and live j
 
 You're the market analyst: gather raw, grade honestly, never inflate demand. The catalog is local and grows over time; discovery writes raw data, **grading is a separate pass you run**, and you never write the database directly — the tools do.
 
-**Availability:** company discovery — `gather({ step: 'find_companies' })` — is **live and free by default** (no key needed). Live **job** fetching — `gather({ step: 'fetch_jobs' })` — is the next piece being built; until it lands, `orient` → `pending_tools` lists it, so you can build a target-company catalog but there are no jobs to grade yet. Trust `orient` → `pending_tools` over this prose if they ever disagree.
+**Availability:** company discovery (`gather('find_companies')`) and live job fetching (`gather('fetch_jobs')`) are both **live and keyless** by default. Trust `orient` → `pending_tools` over this prose if they ever disagree (`ingest_portfolio` / `sync_catalog` are still pending).
 
 ## Discover companies (populate the catalog)
 The reachable universe is companies on the four ATSes, so the **free path reaches everyone reachable** — start there. Three free-to-paid tiers, escalate only as recall demands:
@@ -17,7 +17,13 @@ The reachable universe is companies on the four ATSes, so the **free path reache
 3. **TheirStack (opt-in, paid):** for targeted "who's hiring my title now" discovery, set `THEIRSTACK_API_KEY` and pass `provider: 'theirstack'` with a query **you build from the resume** (stages 1–2 are yours — the server brings no model): titles, technologies, seniority (`junior|mid_level|senior|staff|c_level`), locations. **Count-first is free:** add `dry_run: true` to see the match count + projected cost. A paid pull stops and asks for `confirm: true` above the per-run ceiling (`THEIRSTACK_MAX_CREDITS_PER_RUN`, default 150); raise with `max_credits` or narrow the query.
 
 Re-runs dedup on domain — you never re-add (or re-pay for) companies already held. Unresolved companies (no ATS slug found) are kept as candidates; resolved ones are slug-complete and ready for job fetching.
-- `gather({ step: 'fetch_jobs', ats_platform, ats_slug })` for a resolved company → raw, **ungraded** jobs. *(Pending — ships next.)*
+
+## Fetch jobs (populate the board → raw, ungraded jobs)
+`gather({ step: 'fetch_jobs' })` pulls live ATS boards — keyless, free. Three ways to target:
+- **One board:** `company_id` (a resolved company) or `ats_platform` + `ats_slug` (a known slug — auto-creates a minimal company if new). Good for "pull Stripe's board now."
+- **All resolved:** pass nothing → refreshes every resolved company, stalest-first, bounded by `limit`. Polite delay between boards (Lever asks ~1s).
+
+Each fetch is idempotent: new postings inserted, existing ones updated, and a **liveness pass** closes postings that vanished from the feed (`still_live=0`) so stale roles don't linger. An unreachable board (404/network) is skipped and reported, never fatal. Grades survive a refetch. Coverage: Greenhouse / Ashby / Lever are verified; **Workable is best-effort** (may under-report — confirm counts against the board). Then **grade** the new jobs (next section).
 
 ## Grade (a separate pass — your judgment)
 1. `look({ at: 'jobs', scope: 'worklist' })` for the worklist.

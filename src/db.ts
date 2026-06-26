@@ -242,15 +242,70 @@ export const getJobSkills = (jobId: number): JobSkill[] =>
     "SELECT skill, kind FROM job_skills WHERE job_id = ? ORDER BY CASE kind WHEN 'required' THEN 0 ELSE 1 END, skill",
   ).all(jobId) as JobSkill[];
 
+// ── job fetch write path (gather('fetch_jobs') calls this — db.ts is the sole writer) ──
+// Idempotent per board: upsert each posting by (company_id, source_url) and refresh
+// last_seen_at + still_live=1 for those present this fetch, then a LIVENESS pass closes
+// (still_live=0) any of this company's still-live jobs that vanished from the feed. An
+// empty feed (a valid but vacant board → []) closes them all; an UNREACHABLE board must
+// NOT reach here (callers skip on null) so a transient 404 never closes a whole company.
+// Reappearing jobs reopen (still_live=1). Stamps companies.last_fetched_at. Grades are
+// left untouched — a refetch never wipes a job's grade, only its liveness/raw fields.
+export interface RawJobInput {
+  source_url: string; title?: string | null; location?: string | null;
+  remote?: number | null; comp_min?: number | null; comp_max?: number | null; raw?: unknown;
+}
+export interface FetchJobsResult { inserted: number; updated: number; closed: number; seen: number }
+export function upsertJobs(companyId: number, jobs: RawJobInput[]): FetchJobsResult {
+  const tx = db.transaction((): FetchJobsResult => {
+    const upsert = db.prepare(
+      `INSERT INTO jobs (company_id, source_url, title, location, remote, comp_min, comp_max, raw_json, fetched_at, last_seen_at, still_live)
+       VALUES (@company_id, @source_url, @title, @location, @remote, @comp_min, @comp_max, @raw_json, datetime('now'), datetime('now'), 1)
+       ON CONFLICT(company_id, source_url) DO UPDATE SET
+         title=excluded.title, location=excluded.location, remote=excluded.remote,
+         comp_min=excluded.comp_min, comp_max=excluded.comp_max, raw_json=excluded.raw_json,
+         last_seen_at=datetime('now'), still_live=1`);
+    const exists = db.prepare("SELECT 1 FROM jobs WHERE company_id=? AND source_url=?");
+    const seen: string[] = [];
+    let inserted = 0, updated = 0;
+    for (const j of jobs) {
+      if (!j.source_url) continue;
+      const had = exists.get(companyId, j.source_url);
+      upsert.run({
+        company_id: companyId, source_url: j.source_url, title: j.title ?? null, location: j.location ?? null,
+        remote: j.remote ?? null, comp_min: j.comp_min ?? null, comp_max: j.comp_max ?? null,
+        raw_json: j.raw != null ? JSON.stringify(j.raw) : null,
+      });
+      had ? updated++ : inserted++;
+      seen.push(j.source_url);
+    }
+    const closed = seen.length === 0
+      ? db.prepare("UPDATE jobs SET still_live=0 WHERE company_id=? AND still_live=1").run(companyId).changes
+      : db.prepare(`UPDATE jobs SET still_live=0 WHERE company_id=? AND still_live=1 AND source_url NOT IN (${seen.map(() => "?").join(",")})`).run(companyId, ...seen).changes;
+    db.prepare("UPDATE companies SET last_fetched_at=datetime('now') WHERE id=?").run(companyId);
+    return { inserted, updated, closed, seen: seen.length };
+  });
+  return tx();
+}
+
 export interface Company {
   id: number; name: string; domain: string | null; tags: string | null; source: string | null;
   ats_platform: string | null; ats_slug: string | null; resolved: number;
   resolve_attempts: number; last_resolve_attempt_at: string | null;
   added_at: string; last_fetched_at: string | null;
 }
+const COMPANY_COLS = "id, name, domain, tags, source, ats_platform, ats_slug, resolved, resolve_attempts, last_resolve_attempt_at, added_at, last_fetched_at";
 export const getCompanies = (limit = 200): Company[] =>
+  db.prepare(`SELECT ${COMPANY_COLS} FROM companies ORDER BY added_at DESC LIMIT ?`).all(limit) as Company[];
+
+// Look up a company by its resolved ATS slug — fetch_jobs uses this to attach pulled jobs.
+export const getCompanyByAts = (platform: string, slug: string): Company | undefined =>
+  db.prepare(`SELECT ${COMPANY_COLS} FROM companies WHERE ats_platform=? AND ats_slug=?`).get(platform, slug) as Company | undefined;
+
+// Resolved (slug-complete) companies, stalest-first (never-fetched NULLs sort first in
+// SQLite ASC) — the batch fetch_jobs refresh order.
+export const getResolvedCompanies = (limit = 200): Company[] =>
   db.prepare(
-    "SELECT id, name, domain, tags, source, ats_platform, ats_slug, resolved, resolve_attempts, last_resolve_attempt_at, added_at, last_fetched_at FROM companies ORDER BY added_at DESC LIMIT ?",
+    `SELECT ${COMPANY_COLS} FROM companies WHERE resolved=1 AND ats_platform IS NOT NULL AND ats_slug IS NOT NULL ORDER BY last_fetched_at ASC, added_at ASC LIMIT ?`,
   ).all(limit) as Company[];
 
 // ── company write path (build-zero: the persisters gather('find_companies') will call) ──
