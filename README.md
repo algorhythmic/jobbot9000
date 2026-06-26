@@ -9,7 +9,8 @@ flowchart LR
   JB --> DB[("SQLite — local")]
   DB --> P["Personal<br/>local only · never shared"]
   DB --> C["Catalog<br/>public jobs · shareable"]
-  JB -. "fetch jobs (pending)" .-> ATS[("Live ATS boards")]
+  JB --> ATS[("Live ATS boards")]
+  JB -. "opt-in sync" .-> POOL[("Shared catalog pool")]
 ```
 
 ## How it works
@@ -35,7 +36,7 @@ flowchart TB
   subgraph Doors["3 doors — read / fetch"]
     orient
     look
-    gather["gather (pending)"]
+    gather
   end
   subgraph Writes["6 writes — the agent records judgment"]
     subgraph Raw["raw intake"]
@@ -57,7 +58,7 @@ The surface is union-free and order-independent. Read it as: *orient yourself, l
 
 - **`orient(detail?)`** — where the user is in the journey, which skill fits now, and what isn't built yet. `detail`: `recommend` (default), `raw` (bare state for rehydrate), `dashboard` (the relevant-vs-market gap + notes). Safe as the first call.
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`scope`: `market` / `relevant` / `worklist`), `companies`, `resume`, `portfolio`, `packet` (needs `job_id`). `relevant` vs `market` is a deliberate pair — the gap between them is the job-search signal.
-- **`gather(step, …)`** — the one fetch door; reaches an external source, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog`. **`find_companies` and `fetch_jobs` are live and keyless by default** (discover companies on demand / from a curated roster → resolve ATS slugs for free; then pull their live boards; TheirStack is an opt-in paid discovery accelerator). `ingest_portfolio` / `sync_catalog` are still pending stubs (the tool's description and `orient`→`pending_tools` name which).
+- **`gather(step, …)`** — the one fetch door; reaches an external source, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog` — **all four are wired**. `find_companies` (discover companies on demand / from a curated roster → resolve ATS slugs; TheirStack is an opt-in paid accelerator), `fetch_jobs` (pull their live boards), and `ingest_portfolio` (public GitHub repos) are keyless and free by default. `sync_catalog` is the opt-in egress boundary — it shares **public catalog data only** with a configured pool (`JOBBOT_POOL_URL`); with no pool set it does nothing but report the local diff.
 
 **Six writes** — two raw intake, four judgment (each governed by a mode):
 
@@ -107,7 +108,7 @@ npm test           # run the discovery test suite (tsx against src/, mocked HTTP
 
 The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/state`) and opens `jobbot.db` there; if `STATE_DIR` is unset it falls back to `~/.jobbot/state`.
 
-**Discovery env (all optional — discovery is free without any of it):** `find_companies` defaults to the free curated roster and the on-demand `companies` path; ATS-slug resolution is keyless. `JOBBOT_SEEDS_FILE` points the curated roster at a file of your own (outside the plugin dir, so it survives updates); unset, the bundled `seeds/companies.json` is used. Only the opt-in TheirStack accelerator reads the rest: `THEIRSTACK_API_KEY` (a data-source key — the *model* key never enters the server) and `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`, the per-run spend ceiling — a run estimates cost for free first and won't exceed it without an explicit `confirm`). Auto-recharge is never enabled. `ingest_portfolio` reads public GitHub keylessly; `GITHUB_TOKEN`, if set, only raises the rate limit.
+**Discovery env (all optional — discovery is free without any of it):** `find_companies` defaults to the free curated roster and the on-demand `companies` path; ATS-slug resolution is keyless. `JOBBOT_SEEDS_FILE` points the curated roster at a file of your own (outside the plugin dir, so it survives updates); unset, the bundled `seeds/companies.json` is used. Only the opt-in TheirStack accelerator reads the rest: `THEIRSTACK_API_KEY` (a data-source key — the *model* key never enters the server) and `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`, the per-run spend ceiling — a run estimates cost for free first and won't exceed it without an explicit `confirm`). Auto-recharge is never enabled. `ingest_portfolio` reads public GitHub keylessly; `GITHUB_TOKEN`, if set, only raises the rate limit. `sync_catalog` is the one egress path — it's off unless `JOBBOT_POOL_URL` (+ optional `JOBBOT_POOL_TOKEN`) names a shared pool, and even then only **public catalog data** (companies + jobs + grades) is sent; the personal plane is structurally excluded from the snapshot. No hosted pool ships with this build, so the wire contract is provisional.
 
 ## Layout
 
@@ -122,6 +123,7 @@ src/
   providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in); CC is a drop-in
   ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
   github.ts                  keyless GitHub sense — public repos → portfolio facts (ingest_portfolio)
+  pool.ts                    shared-catalog-pool seam (sync_catalog egress; off unless JOBBOT_POOL_URL)
 seeds/                       curated company roster (free default for find_companies); ships empty
 skills/                      bundled skills: coach / job-search / application
 modes/                       grading modes (rubric + output schema) for the judgment writes

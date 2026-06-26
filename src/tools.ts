@@ -13,6 +13,8 @@ import * as DB from "./db.js";
 import { readJourneyState } from "./state.js";
 import { resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
 import { fetchUserRepos, type RepoFacts } from "./github.js";
+import { getPool, type PoolAdapter } from "./pool.js";
+import type { CatalogSnapshot, SnapshotJob, SnapshotCompany } from "./db.js";
 import { PROVIDERS, type DiscoverQuery, type DiscoveredCompany, type ProviderContext } from "./providers.js";
 
 type State = ReturnType<typeof readJourneyState>;
@@ -38,7 +40,7 @@ const providerContext = (): ProviderContext => ({ apiKey: process.env.THEIRSTACK
 const FIND_COMPANIES_AVAILABLE = true;    // gather: find_companies — lead-gen + ATS-slug resolution
 const FETCH_JOBS_AVAILABLE = true;        // gather: fetch_jobs — live ATS board → raw jobs
 const PORTFOLIO_INGEST_AVAILABLE = true;  // gather: ingest_portfolio — public GitHub repos
-const SYNC_AVAILABLE = false;             // gather: sync_catalog
+const SYNC_AVAILABLE = true;              // gather: sync_catalog — bidirectional pool sync
 const pendingSteps = (): string[] => [
   ...(!FIND_COMPANIES_AVAILABLE ? ["find_companies"] : []),
   ...(!FETCH_JOBS_AVAILABLE ? ["fetch_jobs"] : []),
@@ -359,7 +361,7 @@ export function registerTools(server: McpServer): void {
     "'find_companies' (lead-gen → ATS-slug resolution; FREE by default. Lightest: pass companies:[{name,domain}] to resolve specific companies on demand, no key. Or build a query from the resume — titles/technologies/seniority/locations — for the free curated roster; pass provider:'theirstack' (+ THEIRSTACK_API_KEY) for paid targeted discovery, count-first and credit-ceiling-gated), " +
     "'fetch_jobs' (pull live ATS boards → raw, ungraded jobs; keyless. Target one board with ats_platform+ats_slug or company_id, or pass none to refresh all resolved companies (stalest first, bounded by limit). A liveness pass closes postings that vanished; grade the new jobs next), " +
     "'ingest_portfolio' (the user's public GitHub repos → portfolio facts for coaching; keyless. Uses the profile's github_handle, or pass one; forks skipped unless include_forks), " +
-    "'sync_catalog' (bidirectional, catalog-only sync; uses dry_run to show the diff first). " +
+    "'sync_catalog' (bidirectional sync of PUBLIC catalog data only — companies + jobs + grades — with a shared pool; personal data never leaves. Opt-in: needs JOBBOT_POOL_URL configured. dry_run shows the push/pull diff without sending or writing anything). " +
     "Persistence is a side effect of gathering — the agent still never writes the DB itself.";
   server.registerTool("gather", {
     description: gatherDesc,
@@ -394,7 +396,8 @@ export function registerTools(server: McpServer): void {
         return FETCH_JOBS_AVAILABLE ? fetchJobs(a) : planned("fetch + normalize a live ATS board");
       case "ingest_portfolio":
         return PORTFOLIO_INGEST_AVAILABLE ? ingestPortfolio(a) : planned("fetch the user's public GitHub repos");
-      case "sync_catalog": return planned("bidirectional catalog sync with an external pool");
+      case "sync_catalog":
+        return SYNC_AVAILABLE ? syncCatalog(a) : planned("bidirectional catalog sync with an external pool");
       default: return json({ ok: false, error: `unknown gather step '${a.step}'` });
     }
   });
@@ -617,5 +620,70 @@ export async function ingestPortfolio(a: IngestArgs, deps: IngestDeps = {}) {
     next: kept.length === 0
       ? "no public repos found (or all forks). Coach from projects the user describes in chat instead."
       : "coach the portfolio against demand — look({ at: 'portfolio', with_market_overlay: true }); you pick which projects to feature.",
+  });
+}
+
+// ── sync_catalog orchestration (gather step 'sync_catalog') ──────────────────
+// The egress boundary. Bidirectional sync of PUBLIC catalog data only (the snapshot is
+// built from the catalog plane in db.ts — personal data is structurally excluded). Opt-in:
+// with no pool configured nothing leaves and we just report the local catalog. dry_run
+// computes the push/pull diff in memory and writes/sends nothing. A real run pulls first
+// (merge, newer-wins), then pushes local. Merge policy is the provisional default; see
+// db.applyCatalogSnapshot (handoff §4 lists conflict resolution as an open question).
+interface SyncArgs { dry_run?: boolean }
+interface SyncDeps { pool?: PoolAdapter | null }
+
+// Cross-instance natural keys (local ids are meaningless across the pool).
+const companyKey = (c: SnapshotCompany) => (c.ats_platform && c.ats_slug ? `ats:${c.ats_platform}/${c.ats_slug}` : `dom:${c.domain ?? c.name}`);
+const jobKey = (j: SnapshotJob) => `${j.ats_platform && j.ats_slug ? `ats:${j.ats_platform}/${j.ats_slug}` : `dom:${j.domain}`}|${j.source_url}`;
+const jobNewer = (a: SnapshotJob, b: SnapshotJob) => a.last_seen_at > b.last_seen_at || (!!a.grade_seniority && !b.grade_seniority);
+
+// Pure, in-memory diff between two snapshots — what a pull would add/refresh locally and
+// what a push would contribute to the pool. No DB reads, no mutation; drives dry_run.
+function diffCatalog(local: CatalogSnapshot, remote: CatalogSnapshot) {
+  const lJobs = new Map(local.jobs.map((j) => [jobKey(j), j]));
+  const rJobs = new Map(remote.jobs.map((j) => [jobKey(j), j]));
+  const lCos = new Set(local.companies.map(companyKey));
+  const rCos = new Set(remote.companies.map(companyKey));
+  let pull_new = 0, pull_updated = 0, push_new = 0, push_updated = 0;
+  for (const [k, rj] of rJobs) { const lj = lJobs.get(k); if (!lj) pull_new++; else if (jobNewer(rj, lj)) pull_updated++; }
+  for (const [k, lj] of lJobs) { const rj = rJobs.get(k); if (!rj) push_new++; else if (jobNewer(lj, rj)) push_updated++; }
+  return {
+    pull: { companies_new: [...rCos].filter((k) => !lCos.has(k)).length, jobs_new: pull_new, jobs_updated: pull_updated },
+    push: { companies_new: [...lCos].filter((k) => !rCos.has(k)).length, jobs_new: push_new, jobs_updated: push_updated },
+  };
+}
+
+export async function syncCatalog(a: SyncArgs, deps: SyncDeps = {}) {
+  const local = DB.catalogSnapshot();
+  const pool = deps.pool !== undefined
+    ? deps.pool
+    : getPool({ url: process.env.JOBBOT_POOL_URL, token: process.env.JOBBOT_POOL_TOKEN });
+
+  if (!pool)
+    return json({
+      ok: false, pool_configured: false,
+      local_catalog: { companies: local.companies.length, jobs: local.jobs.length },
+      note: "no shared catalog pool is configured — set JOBBOT_POOL_URL (and optionally JOBBOT_POOL_TOKEN) to enable sync. Only PUBLIC catalog data (companies + jobs + grades) would ever leave; personal data (resume, fit, cover letters) never syncs. No hosted pool ships with this build.",
+    });
+
+  let remote: CatalogSnapshot;
+  try { remote = await pool.pull(); }
+  catch (e) { return json({ ok: false, error: `pool pull failed: ${errMsg(e)}` }); }
+
+  const diff = diffCatalog(local, remote);
+  if (a.dry_run)
+    return json({ ok: true, dry_run: true, pool: pool.name, diff, note: "dry run — nothing was sent or written. Re-run without dry_run to sync (pull-then-push). Only public catalog data is shared." });
+
+  const pulled = DB.applyCatalogSnapshot(remote);   // pull + merge (newer-wins) first
+  let pushed;
+  try { pushed = await pool.push(local); }          // then push local (public catalog only)
+  catch (e) { return json({ ok: false, error: `pool push failed (pull already applied locally): ${errMsg(e)}`, pulled }); }
+  DB.setMeta("last_synced", DB.nowStr());
+
+  return json({
+    ok: true, pool: pool.name, pulled, pushed: pushed.accepted,
+    catalog: readJourneyState().catalog,
+    note: "synced — only public catalog data (companies + jobs + grades) was shared; personal data never left.",
   });
 }

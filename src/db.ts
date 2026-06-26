@@ -484,3 +484,106 @@ export const counts = (): Counts => ({
   ungraded: countOf("SELECT count(*) c FROM jobs WHERE grade_seniority IS NULL"),
   portfolio: countOf("SELECT count(*) c FROM portfolio_projects"),
 });
+
+export const nowStr = (): string => (db.prepare("SELECT datetime('now') t").get() as { t: string }).t;
+
+// ── catalog sync (gather('sync_catalog')) — the ONLY data that leaves the instance ──
+// THE EGRESS BOUNDARY. A snapshot reads the CATALOG plane ONLY (companies, jobs,
+// job_skills) and NEVER the personal plane (resume, profile, assessment, job_fit,
+// cover_letters) — that is the "only public data ever leaves" invariant, enforced here
+// in the one place data is serialized for sharing. Cross-instance, local ids are
+// meaningless, so rows carry NATURAL keys: a company by (ats_platform, ats_slug) or
+// domain; a job by its company + source_url. Grades (the shareable judgment) ride along;
+// raw_json is deliberately omitted (bulky, and the normalized fields suffice).
+export interface SnapshotCompany {
+  name: string; domain: string | null; tags: string | null; source: string | null;
+  ats_platform: string | null; ats_slug: string | null; resolved: number;
+}
+export interface SnapshotJob {
+  ats_platform: string | null; ats_slug: string | null; domain: string | null; // company key
+  source_url: string; title: string | null; location: string | null; remote: number | null;
+  comp_min: number | null; comp_max: number | null;
+  grade_seniority: string | null; grade_market_signal: string | null; graded_at: string | null;
+  last_seen_at: string; still_live: number; skills: { skill: string; kind: string }[];
+}
+export interface CatalogSnapshot { companies: SnapshotCompany[]; jobs: SnapshotJob[] }
+
+export function catalogSnapshot(): CatalogSnapshot {
+  const companies = db.prepare(
+    "SELECT name, domain, tags, source, ats_platform, ats_slug, resolved FROM companies",
+  ).all() as SnapshotCompany[];
+  const rows = db.prepare(
+    `SELECT j.id, c.ats_platform, c.ats_slug, c.domain, j.source_url, j.title, j.location, j.remote,
+            j.comp_min, j.comp_max, j.grade_seniority, j.grade_market_signal, j.graded_at,
+            j.last_seen_at, j.still_live
+     FROM jobs j JOIN companies c ON c.id = j.company_id`,
+  ).all() as (SnapshotJob & { id: number })[];
+  const skillsOf = db.prepare("SELECT skill, kind FROM job_skills WHERE job_id = ?");
+  const jobs = rows.map(({ id, ...j }) => ({ ...j, skills: skillsOf.all(id) as { skill: string; kind: string }[] }));
+  return { companies, jobs };
+}
+
+const localCompanyId = (ats_platform: string | null, ats_slug: string | null, domain: string | null): number | undefined => {
+  if (ats_platform && ats_slug) {
+    const r = db.prepare("SELECT id FROM companies WHERE ats_platform=? AND ats_slug=?").get(ats_platform, ats_slug) as { id: number } | undefined;
+    if (r) return r.id;
+  }
+  if (domain) {
+    const r = db.prepare("SELECT id FROM companies WHERE domain=? ORDER BY id LIMIT 1").get(domain) as { id: number } | undefined;
+    if (r) return r.id;
+  }
+  return undefined;
+};
+
+// Merge an incoming (pool) snapshot into the local catalog. NEWER-WINS by last_seen_at for
+// liveness/fields; a grade is taken when incoming is graded and local is ungraded OR the
+// incoming grade is newer (graded_at). Never closes local jobs (a pull only adds/refreshes),
+// and never touches the personal plane. Companies dedupe through upsertCompany.
+export interface ApplyResult { companies_added: number; jobs_added: number; jobs_updated: number; jobs_skipped: number }
+export function applyCatalogSnapshot(snap: CatalogSnapshot): ApplyResult {
+  const tx = db.transaction((): ApplyResult => {
+    let companies_added = 0, jobs_added = 0, jobs_updated = 0, jobs_skipped = 0;
+    for (const c of snap.companies) {
+      const r = upsertCompany({
+        name: c.name, domain: c.domain, source: c.source, ats_platform: c.ats_platform, ats_slug: c.ats_slug,
+        resolved: c.resolved === 1, tags: c.tags ? c.tags.split(",").filter(Boolean) : [],
+      });
+      if (r.inserted) companies_added++;
+    }
+    const insSkills = db.prepare("INSERT OR IGNORE INTO job_skills (job_id, skill, kind) VALUES (?, ?, ?)");
+    const setSkills = (jobId: number, skills: { skill: string; kind: string }[]) => {
+      db.prepare("DELETE FROM job_skills WHERE job_id=?").run(jobId);
+      for (const s of skills) insSkills.run(jobId, s.skill, s.kind);
+    };
+    for (const j of snap.jobs) {
+      const cid = localCompanyId(j.ats_platform, j.ats_slug, j.domain);
+      if (cid === undefined || !j.source_url) { jobs_skipped++; continue; }
+      const local = db.prepare("SELECT id, last_seen_at, grade_seniority, graded_at FROM jobs WHERE company_id=? AND source_url=?")
+        .get(cid, j.source_url) as { id: number; last_seen_at: string; grade_seniority: string | null; graded_at: string | null } | undefined;
+      if (!local) {
+        const info = db.prepare(
+          `INSERT INTO jobs (company_id, source_url, title, location, remote, comp_min, comp_max, grade_seniority, grade_market_signal, graded_at, fetched_at, last_seen_at, still_live)
+           VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),?,?)`,
+        ).run(cid, j.source_url, j.title, j.location, j.remote, j.comp_min, j.comp_max, j.grade_seniority, j.grade_market_signal, j.graded_at, j.last_seen_at, j.still_live);
+        if (j.skills.length) setSkills(Number(info.lastInsertRowid), j.skills);
+        jobs_added++;
+      } else {
+        const incomingNewer = j.last_seen_at > local.last_seen_at;
+        const takeGrade = j.grade_seniority != null
+          && (local.grade_seniority == null || (j.graded_at != null && (local.graded_at == null || j.graded_at > local.graded_at)));
+        if (!incomingNewer && !takeGrade) { jobs_skipped++; continue; }
+        if (incomingNewer)
+          db.prepare("UPDATE jobs SET title=?, location=?, remote=?, comp_min=?, comp_max=?, last_seen_at=?, still_live=? WHERE id=?")
+            .run(j.title, j.location, j.remote, j.comp_min, j.comp_max, j.last_seen_at, j.still_live, local.id);
+        if (takeGrade) {
+          db.prepare("UPDATE jobs SET grade_seniority=?, grade_market_signal=?, graded_at=? WHERE id=?")
+            .run(j.grade_seniority, j.grade_market_signal, j.graded_at, local.id);
+          setSkills(local.id, j.skills);
+        }
+        jobs_updated++;
+      }
+    }
+    return { companies_added, jobs_added, jobs_updated, jobs_skipped };
+  });
+  return tx();
+}

@@ -207,6 +207,57 @@ eq([ing2.kept, ing2.portfolio_count], [2, 2], "ingest: include_forks keeps the f
 const ing3 = jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/alpha" })] }));
 eq([ing3.portfolio_count, DB.getPortfolio().length], [1, 1], "ingest: snapshot replaces prior (fork dropped)");
 
+// ════════════════════ sync_catalog ════════════════════
+// snapshot builders for controlled merge tests
+const sc = (o) => ({ name: "MergeCo", domain: null, tags: null, source: null, ats_platform: "lever", ats_slug: "mergeco", resolved: 1, ...o });
+const sj = (o) => ({ ats_platform: "lever", ats_slug: "mergeco", domain: null, source_url: "m1", title: null, location: null, remote: null, comp_min: null, comp_max: null, grade_seniority: null, grade_market_signal: null, graded_at: null, last_seen_at: "2025-01-01 00:00:00", still_live: 1, skills: [], ...o });
+
+// ── R. EGRESS SAFETY: snapshot carries catalog only, never personal data ──────
+DB.setMasterResume("SECRETRESUME_xyz");
+DB.upsertProfile({ target_role: "SECRETROLE", location_pref: "SECRETLOC" });
+DB.setAssessment("senior", "SECRETRATIONALE", ["SECRETEVIDENCE"]);
+const aJob = DB.db.prepare("SELECT id FROM jobs LIMIT 1").get();
+DB.setJobFit(aJob.id, "over", ["SECRETGAP"], "SECRETFITRATIONALE");
+DB.recordCoverLetter(aJob.id, "SECRETCOVERLETTER", ["SECRETTALKINGPOINT"]);
+const snap = DB.catalogSnapshot();
+const blob = JSON.stringify(snap);
+eq(Object.keys(snap).sort().join(","), "companies,jobs", "egress: snapshot has only companies + jobs");
+for (const secret of ["SECRETRESUME", "SECRETROLE", "SECRETLOC", "SECRETRATIONALE", "SECRETEVIDENCE", "SECRETGAP", "SECRETFITRATIONALE", "SECRETCOVERLETTER", "SECRETTALKINGPOINT"])
+  eq(blob.includes(secret), false, `egress: snapshot excludes personal '${secret}'`);
+
+// ── S. no pool configured → honest no-op, nothing leaves ──────────────────────
+const np = jres(await tools.syncCatalog({}, { pool: null }));
+eq([np.ok, np.pool_configured], [false, false], "sync: no pool -> not configured (no egress)");
+
+// ── T. mock pool: dry_run previews, full sync pulls+pushes ────────────────────
+const remoteSnap = {
+  companies: [sc({ name: "PoolCo", domain: "poolco.com", source: "pool", ats_platform: "greenhouse", ats_slug: "poolco" })],
+  jobs: [sj({ ats_platform: "greenhouse", ats_slug: "poolco", domain: "poolco.com", source_url: "https://poolco/1", title: "Pool Eng", grade_seniority: "senior", grade_market_signal: "A", graded_at: "2026-06-01 00:00:00", last_seen_at: "2026-06-01 00:00:00", skills: [{ skill: "go", kind: "required" }] })],
+};
+let pushed = null;
+const mockPool = { name: "mock", pull: async () => remoteSnap, push: async (s) => { pushed = s; return { accepted: s.jobs.length }; } };
+
+const sdry = jres(await tools.syncCatalog({ dry_run: true }, { pool: mockPool }));
+eq([sdry.ok, sdry.dry_run, sdry.diff.pull.jobs_new], [true, true, 1], "sync dry_run: previews 1 job to pull");
+eq([pushed, !!DB.getCompanyByAts("greenhouse", "poolco")], [null, false], "sync dry_run: nothing pushed or written");
+
+const full = jres(await tools.syncCatalog({}, { pool: mockPool }));
+eq([full.ok, full.pulled.companies_added, full.pulled.jobs_added], [true, 1, 1], "sync: pulled new company + job");
+eq([pushed !== null, !!DB.getCompanyByAts("greenhouse", "poolco")], [true, true], "sync: pushed local + persisted pulled rows");
+eq(DB.getMeta("last_synced") !== null, true, "sync: last_synced stamped (flips the 'synced' dimension)");
+eq(JSON.stringify(pushed).includes("SECRETRESUME"), false, "sync: pushed payload carries no personal data");
+
+// ── U. applyCatalogSnapshot merge semantics (newer-wins, grade-take) ──────────
+const mid = DB.upsertCompany({ name: "MergeCo", ats_platform: "lever", ats_slug: "mergeco" }).id;
+DB.upsertJobs(mid, [{ source_url: "m1", title: "Local" }]); // last_seen ~ now
+eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ title: "Older", last_seen_at: "2000-01-01 00:00:00" })] }).jobs_skipped, 1, "merge: older incoming skipped");
+eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ title: "Newer", last_seen_at: "2099-01-01 00:00:00" })] }).jobs_updated, 1, "merge: newer incoming updates");
+eq(DB.db.prepare("SELECT title FROM jobs WHERE company_id=? AND source_url='m1'").get(mid).title, "Newer", "merge: field updated to newer");
+eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ last_seen_at: "2000-01-01 00:00:00", grade_seniority: "staff", grade_market_signal: "A", graded_at: "2050-01-01 00:00:00", skills: [{ skill: "rust", kind: "required" }] })] }).jobs_updated, 1, "merge: grade taken even when last_seen older");
+eq(DB.db.prepare("SELECT grade_seniority FROM jobs WHERE company_id=? AND source_url='m1'").get(mid).grade_seniority, "staff", "merge: grade applied to ungraded local");
+eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ source_url: "m2", title: "Fresh" })] }).jobs_added, 1, "merge: brand-new job added");
+eq(DB.applyCatalogSnapshot({ companies: [], jobs: [sj({ ats_slug: "ghostco", source_url: "x" })] }).jobs_skipped, 1, "merge: job for unknown company skipped");
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
 try { rmSync(TMP, { recursive: true, force: true }); } catch {}
