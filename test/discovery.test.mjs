@@ -51,6 +51,21 @@ eq(await atsResolve({ name: "EmptyCo", domain: "emptyco.com" }),
    { platform: "ashby", slug: "emptyco", job_count: 0, via: "domain" }, "resolveAts: empty-but-valid = resolved");
 eq(await atsResolve({ name: "Ghost", domain: "ghost.com" }), null, "resolveAts: miss -> null (not throw)");
 
+// resolver preference: an empty/false-positive board must never mask a populated real one
+const prefFetch = async (url) => {
+  if (url.includes("ashbyhq.com/posting-api/job-board/vercel")) return ok({ jobs: [] });                       // empty (non-workable)
+  if (url.includes("greenhouse.io/v1/boards/vercel/")) return ok({ jobs: [{ absolute_url: "https://v/1" }, { absolute_url: "https://v/2" }] }); // populated
+  if (url.includes("apply.workable.com/api/v1/widget/accounts/onlyworkable")) return ok({ name: "x", jobs: [] }); // workable false-positive empty
+  if (url.includes("apply.workable.com/api/v1/widget/accounts/realworkable")) return ok({ jobs: [{ url: "https://w/1" }] }); // real workable postings
+  return notFound();
+};
+eq(await ats.resolveAts({ name: "Vercel", domain: "vercel.com" }, { fetchFn: prefFetch }),
+   { platform: "greenhouse", slug: "vercel", job_count: 2, via: "domain" }, "resolveAts: populated board beats an earlier EMPTY board (no masking)");
+eq(await ats.resolveAts({ name: "OnlyWorkable", domain: "onlyworkable.com" }, { fetchFn: prefFetch }),
+   null, "resolveAts: empty Workable board is a false positive -> unresolved (not workable)");
+eq(await ats.resolveAts({ name: "RealWorkable", domain: "realworkable.com" }, { fetchFn: prefFetch }),
+   { platform: "workable", slug: "realworkable", job_count: 1, via: "domain" }, "resolveAts: Workable WITH postings still resolves");
+
 // ── B. TheirStack provider direct (estimate free + discover paid) ─────────────
 let lastBody = null;
 const tsFetch = async (url, init) => {

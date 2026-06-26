@@ -9,11 +9,12 @@
 // VERIFICATION STATUS (checked against live boards):
 //   • Greenhouse, Ashby, Lever — VERIFIED live (real boards: stripe/gitlab/figma,
 //     ramp/linear, ro). Field paths below match real responses.
-//   • Workable — UNVERIFIED. The widget endpoint returns { name, jobs }, but on the
-//     boards tried it reported jobs:[] even for active companies, so it may UNDER-REPORT
-//     (wrong/legacy endpoint, or those firms left Workable — couldn't find a positive
-//     control). Resolution via it is fine (a 200 confirms the account); treat fetched
-//     job counts as best-effort until the correct jobs endpoint is confirmed.
+//   • Workable — PERMISSIVE / best-effort. The widget endpoint returns 200 + { name, jobs:[] }
+//     for slugs that are NOT real active accounts (`deel`, `bolt`, `scale`, `together`, `hex`
+//     all resolve empty), so an empty Workable board is a FALSE POSITIVE. resolveAts therefore
+//     refuses to resolve on an empty Workable board (see its WORKABLE CAVEAT) — Workable only
+//     counts when it actually returns postings. Fetching a known Workable slug still works;
+//     the correct/most-complete Workable jobs endpoint is still unconfirmed.
 
 export type AtsPlatform = "ashby" | "greenhouse" | "lever" | "workable";
 
@@ -119,11 +120,18 @@ export interface ResolveOpts {
 }
 
 /**
- * Resolve a company to its ATS board. Walks the platform order; for each platform tries
- * domain-derived slugs before name-derived ones. Returns the first valid board (incl.
- * empty) as { platform, slug, job_count, via }, or null if nothing resolved. Network
- * errors on a single probe are swallowed (treated as a miss) so one dead host never
- * aborts resolution — a dead slug just 404s and is skipped, never fatal (handoff §5).
+ * Resolve a company to its ATS board. Walks domain-derived slugs before name-derived ones,
+ * each across the platform order. PREFERS A NON-EMPTY BOARD: returns the first board that
+ * has live postings (a populated real board is the company's board), short-circuiting once
+ * found. An empty-but-valid board is only a FALLBACK — kept if nothing populated turns up —
+ * so a stale/empty board can't mask a populated one (e.g. Vercel's empty Ashby board vs its
+ * 75-job Greenhouse board). Returns null if nothing resolves. Network errors on a probe are
+ * swallowed (a dead slug 404s and is skipped, never fatal — handoff §5).
+ *
+ * WORKABLE CAVEAT: its widget endpoint returns 200+empty for slugs that aren't real accounts
+ * (`deel`, `bolt`, `scale`, … all false-positive), so an EMPTY Workable board is NOT accepted
+ * as a resolution (it would mask the real board on another ATS, or false-resolve a company
+ * that's on no ATS). Workable only counts when it actually has postings.
  */
 export async function resolveAts(
   company: { name: string; domain?: string | null },
@@ -132,14 +140,19 @@ export async function resolveAts(
   const f = opts.fetchFn ?? fetch;
   const order = opts.order ?? ORDER;
   const candidates = slugCandidates(company.name, company.domain);
+  let fallbackEmpty: AtsResolution | null = null; // first non-Workable empty board, used only if nothing populated
   // domain candidates first across all platforms, then name candidates — domain is primary.
   for (const via of ["domain", "name"] as const) {
     for (const cand of candidates.filter((c) => c.via === via)) {
       for (const platform of order) {
         const board = await fetchBoard(platform, cand.slug, f); // null = miss, [] = empty-but-valid
-        if (board !== null) return { platform, slug: cand.slug, job_count: board.length, via };
+        if (board === null) continue;
+        if (board.length > 0) return { platform, slug: cand.slug, job_count: board.length, via }; // populated → done
+        // empty board: a fallback only, and never from Workable (its empties are false positives)
+        if (platform !== "workable" && fallbackEmpty === null)
+          fallbackEmpty = { platform, slug: cand.slug, job_count: 0, via };
       }
     }
   }
-  return null;
+  return fallbackEmpty;
 }
