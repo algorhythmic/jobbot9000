@@ -315,6 +315,22 @@ eq(runFilter({ remote: true }), ["Applied AI Engineer"], "jobFilters e2e: remote
 eq(runFilter({ location: "US" }), ["Applied AI Engineer"], "jobFilters e2e: location substring");
 eq(runFilter({ titles_any: ["Engineer"], location: "London" }), ["Data Engineer"], "jobFilters e2e: title + location combined");
 
+// ════════════════════ on-demand PIN: explicit ats_platform/ats_slug ════════════════════
+// A company carrying both ats_platform + ats_slug is taken slug-complete, skipping the
+// resolver — for boards whose slug isn't derivable (e.g. Glean → greenhouse:gleanwork).
+let pinResolveCalls = 0;
+const countingResolve = async (c) => { pinResolveCalls++; return atsResolve(c); };
+const pin = jres(await tools.findCompanies({ companies: [{ name: "Glean", ats_platform: "greenhouse", ats_slug: "gleanwork" }] }, { resolve: countingResolve }));
+eq([pin.ok, pin.persisted.resolved], [true, 1], "pin: persisted as resolved");
+eq(pinResolveCalls, 0, "pin: skips the resolver entirely");
+eq(typeof pin.note === "string" && pin.note.includes("pinned"), true, "pin: notes the pinned board");
+const gleanCo = DB.getCompanyByAts("greenhouse", "gleanwork");
+eq([!!gleanCo, gleanCo?.ats_slug, gleanCo?.resolved], [true, "gleanwork", 1], "pin: stored slug-complete (resolved=1)");
+// a lone ats_slug (no platform) is NOT a pin — it falls through to normal resolution
+pinResolveCalls = 0;
+await tools.findCompanies({ companies: [{ name: "PartialCo", domain: "partialco.com", ats_slug: "partialco" }] }, { resolve: countingResolve });
+eq(pinResolveCalls, 1, "pin: lone ats_slug (no platform) falls through to resolution");
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
 try { rmSync(TMP, { recursive: true, force: true }); } catch {}

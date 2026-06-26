@@ -384,7 +384,7 @@ export function registerTools(server: McpServer): void {
   const gatherDesc =
     `${pending.length ? `[NOT YET AVAILABLE IN THIS BUILD: ${pending.join(", ")}] ` : ""}` +
     "The one door to the outside world — reach out and persist new data, then return it. step selects the integration: " +
-    "'find_companies' (lead-gen → ATS-slug resolution; FREE by default. Lightest: pass companies:[{name,domain}] to resolve specific companies on demand, no key. Or build a query from the resume — titles/technologies/seniority/locations — for the free curated roster; pass provider:'theirstack' (+ THEIRSTACK_API_KEY) for paid targeted discovery, count-first and credit-ceiling-gated), " +
+    "'find_companies' (lead-gen → ATS-slug resolution; FREE by default. Lightest: pass companies:[{name,domain}] to resolve specific companies on demand, no key — and for a board whose slug isn't derivable from name/domain, PIN it directly: companies:[{name, ats_platform, ats_slug}] (slug-complete, skips resolution). Or build a query from the resume — titles/technologies/seniority/locations — for the free curated roster; pass provider:'theirstack' (+ THEIRSTACK_API_KEY) for paid targeted discovery, count-first and credit-ceiling-gated), " +
     "'fetch_jobs' (pull live ATS boards → raw, ungraded jobs; keyless. Target one board with ats_platform+ats_slug or company_id, or pass none to refresh all resolved companies (stalest first, bounded by limit). A liveness pass closes postings that vanished; grade the new jobs next), " +
     "'ingest_portfolio' (the user's public GitHub repos → portfolio facts for coaching; keyless. Uses the profile's github_handle, or pass one; forks skipped unless include_forks), " +
     "'sync_catalog' (bidirectional sync of PUBLIC catalog data only — companies + jobs + grades — with a shared pool; personal data never leaves. Opt-in: needs JOBBOT_POOL_URL configured. dry_run shows the push/pull diff without sending or writing anything). " +
@@ -394,7 +394,12 @@ export function registerTools(server: McpServer): void {
     inputSchema: {
       step: enumOf(["find_companies", "fetch_jobs", "ingest_portfolio", "sync_catalog"]),
       // find_companies — on-demand (free, zero-config): name companies to resolve directly.
-      companies: z.array(z.object({ name: z.string(), domain: z.string().optional() })).optional(),
+      companies: z.array(z.object({
+        name: z.string(),
+        domain: z.string().optional(),
+        ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(),
+        ats_slug: z.string().optional(),
+      })).optional(),
       // find_companies query (you build this from the resume — stages 1–2 are yours):
       titles: z.array(z.string()).optional(),
       technologies: z.array(z.string()).optional(),
@@ -440,7 +445,10 @@ export function registerTools(server: McpServer): void {
 interface FindArgs {
   titles?: string[]; technologies?: string[]; seniority?: string;
   locations?: string[]; posted_within_days?: number;
-  companies?: { name: string; domain?: string }[]; // on-demand: resolve these directly (free)
+  // on-demand: resolve these directly (free). A company carrying ats_platform + ats_slug is
+  // PINNED — taken slug-complete, skipping resolution (for boards whose slug isn't derivable
+  // from name/domain, e.g. Greenhouse token 'gleanwork' for Glean).
+  companies?: { name: string; domain?: string; ats_platform?: string; ats_slug?: string }[];
   provider?: string; max_credits?: number; confirm?: boolean; dry_run?: boolean; limit?: number;
 }
 interface FindDeps { ctx?: ProviderContext; resolve?: typeof resolveAts }
@@ -486,11 +494,19 @@ export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
   // ── On-demand path (free, zero-config): the user named specific companies. Resolve and
   // persist them directly — no provider, no count, no key. The lightest free path.
   if (a.companies?.length) {
+    // A company with both ats_platform + ats_slug is PINNED (slug-complete → skips
+    // resolution); name/domain-only entries resolve normally. Pinning needs both halves —
+    // a lone ats_platform or ats_slug is ignored and the entry resolves by name/domain.
     const discovered: DiscoveredCompany[] = a.companies.map((c) => ({
-      name: c.name, domain: c.domain ?? null, tags: [], source: "manual", ats_platform: null, ats_slug: null,
+      name: c.name, domain: c.domain ?? null, tags: [], source: "manual",
+      ats_platform: (c.ats_platform && c.ats_slug) ? c.ats_platform : null,
+      ats_slug: (c.ats_platform && c.ats_slug) ? c.ats_slug : null,
     }));
     const persisted = await persistDiscovered(discovered, resolve);
-    return json({ ok: true, mode: "on_demand", credits_spent: 0, discovered: discovered.length, persisted, catalog: readJourneyState().catalog, next: nextNote() });
+    const pinned = a.companies.filter((c) => c.ats_platform && c.ats_slug).length;
+    const out: Record<string, unknown> = { ok: true, mode: "on_demand", credits_spent: 0, discovered: discovered.length, persisted, catalog: readJourneyState().catalog, next: nextNote() };
+    if (pinned) out.note = `${pinned} board(s) pinned by explicit ats_platform/ats_slug (slug-complete, not re-verified — gather('fetch_jobs') confirms them when it pulls).`;
+    return json(out);
   }
 
   // ── Provider discovery path. Default provider is the free curated roster.
