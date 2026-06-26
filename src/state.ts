@@ -15,7 +15,7 @@ export interface JourneyState {
   assessment: { level: string; rationale: string | null; evidence: unknown } | null;
   has_resume: boolean;
   profile: { target_role: string | null; target_niche: string | null; location_pref: string | null; github_handle: string | null; no_resume: boolean; no_github: boolean } | null;
-  catalog: { companies: number; jobs: number; ungraded_jobs: number };
+  catalog: { companies: number; unresolved: number; jobs: number; ungraded_jobs: number };
   last_synced: string | null;
 }
 
@@ -42,7 +42,7 @@ export function readJourneyState(): JourneyState {
           no_resume: !!profile.no_resume, no_github: !!profile.no_github,
         }
       : null,
-    catalog: { companies: c.companies, jobs: c.jobs, ungraded_jobs: c.ungraded },
+    catalog: { companies: c.companies, unresolved: c.unresolved, jobs: c.jobs, ungraded_jobs: c.ungraded },
     last_synced: getMeta("last_synced"),
   };
 }

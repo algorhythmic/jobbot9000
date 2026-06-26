@@ -9,7 +9,8 @@ flowchart LR
   JB --> DB[("SQLite — local")]
   DB --> P["Personal<br/>local only · never shared"]
   DB --> C["Catalog<br/>public jobs · shareable"]
-  JB -. "fetch jobs (pending)" .-> ATS[("Live ATS boards")]
+  JB --> ATS[("Live ATS boards")]
+  JB -. "opt-in sync" .-> POOL[("Shared catalog pool")]
 ```
 
 ## How it works
@@ -35,7 +36,7 @@ flowchart TB
   subgraph Doors["3 doors — read / fetch"]
     orient
     look
-    gather["gather (pending)"]
+    gather
   end
   subgraph Writes["6 writes — the agent records judgment"]
     subgraph Raw["raw intake"]
@@ -57,7 +58,7 @@ The surface is union-free and order-independent. Read it as: *orient yourself, l
 
 - **`orient(detail?)`** — where the user is in the journey, which skill fits now, and what isn't built yet. `detail`: `recommend` (default), `raw` (bare state for rehydrate), `dashboard` (the relevant-vs-market gap + notes). Safe as the first call.
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`scope`: `market` / `relevant` / `worklist`), `companies`, `resume`, `portfolio`, `packet` (needs `job_id`). `relevant` vs `market` is a deliberate pair — the gap between them is the job-search signal.
-- **`gather(step, …)`** — the one fetch door; reaches a board, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog`. **All steps are pending stubs in this build** (the tool's description names which).
+- **`gather(step, …)`** — the one fetch door; reaches an external source, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog` — **all four are wired**. `find_companies` (discover companies on demand / from a curated roster → resolve ATS slugs; TheirStack is an opt-in paid accelerator), `fetch_jobs` (pull their live boards), and `ingest_portfolio` (public GitHub repos) are keyless and free by default. `sync_catalog` is the opt-in egress boundary — it shares **public catalog data only** with a configured pool (`JOBBOT_POOL_URL`); with no pool set it does nothing but report the local diff.
 
 **Six writes** — two raw intake, four judgment (each governed by a mode):
 
@@ -84,7 +85,7 @@ flowchart LR
 2. **Prep** — coach the master resume and portfolio against what the live market actually asks for (read-only on code: ideas and critique, never writing it).
 3. **Search** — surface roles in the user's level ±1 band, grade them and judge fit, then assemble a packet and a tailored cover letter the user applies with (the master resume goes as-is — there is one resume).
 
-Discovery (`gather` `find_companies` / `fetch_jobs`) is the next piece being built; until it lands, the catalog starts empty and stage 3 coaches from the resume. The three bundled skills — **coach**, **job-search**, **application** — are the playbooks for these stages. Claude invokes them automatically by their `description`, and they're available as the namespaced commands `/jobbot9000:coach`, `/jobbot9000:job-search`, `/jobbot9000:application`.
+Company discovery (`gather find_companies`) is **live and free by default** — name companies on demand (`companies: [{ name, domain }]`) or draw from a local curated seed roster, and their ATS slugs are resolved for free. TheirStack is an **opt-in paid accelerator** for targeted "who's hiring my title now" discovery (set `THEIRSTACK_API_KEY`, pass `provider: 'theirstack'`; count-first and credit-ceiling-gated so a run never overspends). Live **job** fetching (`gather fetch_jobs`) is also live and keyless — it pulls a resolved company's public ATS board (one company, or all resolved companies stalest-first), upserts the postings, and runs a liveness pass that closes roles that left the feed. (Greenhouse / Ashby / Lever are verified against live boards; Workable is best-effort.) Newly-fetched jobs are **ungraded** — grade them, then they surface in the relevant-vs-market views. The three bundled skills — **coach**, **job-search**, **application** — are the playbooks for these stages. Claude invokes them automatically by their `description`, and they're available as the namespaced commands `/jobbot9000:coach`, `/jobbot9000:job-search`, `/jobbot9000:application`.
 
 ## Install (Claude Code)
 
@@ -102,9 +103,12 @@ State and the local catalog live in an embedded SQLite database under the plugin
 npm install
 npm run build      # compile the MCP server to dist/
 npm run dev        # run the server over stdio (tsx)
+npm test           # run the discovery test suite (tsx against src/, mocked HTTP — no network/key)
 ```
 
 The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/state`) and opens `jobbot.db` there; if `STATE_DIR` is unset it falls back to `~/.jobbot/state`.
+
+**Discovery env (all optional — discovery is free without any of it):** `find_companies` defaults to the free curated roster and the on-demand `companies` path; ATS-slug resolution is keyless. `JOBBOT_SEEDS_FILE` points the curated roster at a file of your own (outside the plugin dir, so it survives updates); unset, the bundled `seeds/companies.json` is used. Only the opt-in TheirStack accelerator reads the rest: `THEIRSTACK_API_KEY` (a data-source key — the *model* key never enters the server) and `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`, the per-run spend ceiling — a run estimates cost for free first and won't exceed it without an explicit `confirm`). Auto-recharge is never enabled. `ingest_portfolio` reads public GitHub keylessly; `GITHUB_TOKEN`, if set, only raises the rate limit. `sync_catalog` is the one egress path — it's off unless `JOBBOT_POOL_URL` (+ optional `JOBBOT_POOL_TOKEN`) names a shared pool, and even then only **public catalog data** (companies + jobs + grades) is sent; the personal plane is structurally excluded from the snapshot. No hosted pool ships with this build, so the wire contract is provisional.
 
 ## Layout
 
@@ -115,7 +119,12 @@ src/
   index.ts                   stdio entry; registers the tools
   db.ts                      SQLite schema + accessors — the only code that writes the DB
   state.ts                   the journey state machine (state derived from what data exists)
-  tools.ts                   the 9-tool surface
+  tools.ts                   the 9-tool surface (incl. the find_companies orchestration)
+  providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in); CC is a drop-in
+  ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
+  github.ts                  keyless GitHub sense — public repos → portfolio facts (ingest_portfolio)
+  pool.ts                    shared-catalog-pool seam (sync_catalog egress; off unless JOBBOT_POOL_URL)
+seeds/                       curated company roster (free default for find_companies); ships empty
 skills/                      bundled skills: coach / job-search / application
 modes/                       grading modes (rubric + output schema) for the judgment writes
 hooks/, scripts/             SessionStart bootstrap (install + build on first run)
