@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import * as DB from "./db.js";
 import { readJourneyState } from "./state.js";
 import { resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
-import { fetchUserRepos, type RepoFacts } from "./github.js";
+import { fetchUserRepos, enrichRepo, type RepoFacts } from "./github.js";
 import { getPool, type PoolAdapter } from "./pool.js";
 import type { CatalogSnapshot, SnapshotJob, SnapshotCompany } from "./db.js";
 import { PROVIDERS, type DiscoverQuery, type DiscoveredCompany, type ProviderContext } from "./providers.js";
@@ -114,6 +114,19 @@ function bandFor(level: string | null): string[] | null {
 const json = (o: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(o, null, 2) }] });
 const planned = (note: string) => json({ status: "planned", note: `${note} (external integration — implemented in a later pass).` });
 const noJob = (id: number) => json({ ok: false, error: `no job ${id} — find a valid job_id via look({ at: 'jobs' })` });
+
+// Extract a clean, ATS-agnostic posting description from the stored raw_json and truncate
+// it — so worklist/packet return gradeable TEXT instead of the bulky nested ATS payload (the
+// agent shouldn't have to jq it). Prefers plain-text fields, else strips HTML.
+const DESC_MAX = 1000;
+export function compactDescription(rawJson: string | null): string | null {
+  if (!rawJson) return null;
+  let p: any; try { p = JSON.parse(rawJson); } catch { return null; }
+  const raw = p?.descriptionPlain ?? p?.content ?? p?.description ?? p?.jobDescription ?? null;
+  if (typeof raw !== "string" || !raw) return null;
+  const text = raw.replace(/<[^>]+>/g, " ").replace(/&[a-z]+;/gi, " ").replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, DESC_MAX) : null;
+}
 
 // Application pipeline statuses — a reported fact (not a graded judgment), so a flat enum
 // here rather than a grading mode. interested → applied → interviewing → offer/rejected/withdrawn.
@@ -273,8 +286,11 @@ export function registerTools(server: McpServer): void {
       if (!master_resume) missing.push("master_resume");
       if (!fit) missing.push("fit");
       if (job.grade_seniority == null) missing.push("job_grade");
+      // Swap the bulky raw_json for a clean description excerpt.
+      const { raw_json, ...jobLean } = job;
       return json({
-        job, job_skills: DB.getJobSkills(a.job_id), master_resume, fit, portfolio: rankedPortfolio(),
+        job: { ...jobLean, description: compactDescription(raw_json) },
+        job_skills: DB.getJobSkills(a.job_id), master_resume, fit, portfolio: rankedPortfolio(),
         saved_cover_letter: saved, application: DB.getApplication(a.job_id) ?? null, missing,
         cover_letter_slot: missing.length
           ? `write the cover letter, then persist via record_cover_letter — but note it will be generic/ungrounded without: ${missing.join(", ")}. Don't fabricate the missing inputs.`
@@ -323,25 +339,30 @@ export function registerTools(server: McpServer): void {
                 CASE WHEN j.grade_seniority IS NULL THEN 'never_graded' ELSE 'stale' END AS reason
          FROM jobs j JOIN companies c ON c.id=j.company_id
          WHERE ${where.join(" AND ")} ORDER BY j.fetched_at ASC LIMIT ?`,
-      ).all(...flt.args, a.limit ?? 25);
-      const out: Record<string, unknown> = { count: rows.length, jobs: rows };
-      if (rows.length === 0) out.note = s.catalog.jobs === 0 ? emptyCatalogNote(s) : "no ungraded jobs match (all graded, or the filter is too narrow).";
+      ).all(...flt.args, a.limit ?? 25) as any[];
+      // Return a clean description excerpt, not the bulky raw_json — enough to grade from.
+      const jobs = rows.map(({ raw_json, ...r }) => ({ ...r, description: compactDescription(raw_json) }));
+      const out: Record<string, unknown> = { count: jobs.length, jobs };
+      if (jobs.length === 0) out.note = s.catalog.jobs === 0 ? emptyCatalogNote(s) : "no ungraded jobs match (all graded, or the filter is too narrow).";
       return json(out);
     }
 
     // scope === "market" — whole-market view + general catalog search
-    const limit = a.limit ?? 50;
+    const limit = a.limit ?? 100;
     const flt = jobFilters(a);
     const where = ["j.still_live=1", ...flt.where];
     if (a.grading_status === "ungraded") where.push("j.grade_seniority IS NULL");
     if (a.grading_status === "graded") where.push("j.grade_seniority IS NOT NULL");
+    const whereSql = where.join(" AND ");
+    const total = (DB.db.prepare(`SELECT count(*) c FROM jobs j JOIN companies c ON c.id=j.company_id WHERE ${whereSql}`).get(...flt.args) as { c: number }).c;
     const rows = DB.db.prepare(
       `SELECT j.id, c.name AS company, j.title, j.location, j.remote, j.comp_min, j.comp_max, j.grade_seniority
        FROM jobs j JOIN companies c ON c.id=j.company_id
-       WHERE ${where.join(" AND ")} ORDER BY j.last_seen_at DESC LIMIT ?`,
+       WHERE ${whereSql} ORDER BY j.last_seen_at DESC LIMIT ?`,
     ).all(...flt.args, limit);
-    const out: Record<string, unknown> = { count: rows.length, jobs: rows };
+    const out: Record<string, unknown> = { count: rows.length, total, jobs: rows };
     if (s.catalog.jobs === 0) out.note = emptyCatalogNote(s);
+    else if (rows.length < total) out.note = `showing ${rows.length} of ${total} matching jobs (most-recent first) — raise limit, or narrow with titles_any / location / remote / query.`;
     return json(out);
   });
 
@@ -457,7 +478,7 @@ export function registerTools(server: McpServer): void {
     "The one door to the outside world — reach out and persist new data, then return it. step selects the integration: " +
     "'find_companies' (lead-gen → ATS-slug resolution; FREE by default. Lightest: pass companies:[{name,domain}] to resolve specific companies on demand, no key — and for a board whose slug isn't derivable from name/domain, PIN it directly: companies:[{name, ats_platform, ats_slug}] (slug-complete, skips resolution). Or build a query from the resume — titles/technologies/seniority/locations — for the free curated roster; pass provider:'theirstack' (+ THEIRSTACK_API_KEY) for paid targeted discovery, count-first and credit-ceiling-gated), " +
     "'fetch_jobs' (pull live ATS boards → raw, ungraded jobs; keyless. Target one board with ats_platform+ats_slug or company_id, or pass none to refresh all resolved companies (stalest first, bounded by limit). A liveness pass closes postings that vanished; grade the new jobs next), " +
-    "'ingest_portfolio' (the user's public GitHub repos → portfolio facts for coaching; keyless. Uses the profile's github_handle, or pass one; forks skipped unless include_forks), " +
+    "'ingest_portfolio' (the user's public GitHub repos → portfolio facts for coaching; keyless. Each kept repo is enriched with its language breakdown + a README excerpt so grade_portfolio_project reads real substance, not a one-liner. Uses the profile's github_handle, or pass one; forks skipped unless include_forks; enrich_max bounds enrichment, GITHUB_TOKEN raises the rate limit), " +
     "'sync_catalog' (bidirectional sync of PUBLIC catalog data only — companies + jobs + grades — with a shared pool; personal data never leaves. Opt-in: needs JOBBOT_POOL_URL configured. dry_run shows the push/pull diff without sending or writing anything). " +
     "Persistence is a side effect of gathering — the agent still never writes the DB itself.";
   server.registerTool("gather", {
@@ -487,6 +508,7 @@ export function registerTools(server: McpServer): void {
       company_id: z.number().int().optional(),
       github_handle: z.string().optional(),
       include_forks: z.boolean().optional(), // ingest_portfolio: keep forked repos (default: skip)
+      enrich_max: z.number().int().nonnegative().optional(), // ingest_portfolio: how many repos to enrich with languages+README (default 20; 0 = metadata only)
       dry_run: z.boolean().optional(),     // free count-first only — never spends
       limit: z.number().int().positive().optional(),
     },
@@ -701,8 +723,9 @@ export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
 // look({ at: 'portfolio' }) and does the judging (which to feature, architecture read).
 // Honors the no_github opt-out; persists a passed handle to the profile. `deps` is
 // injectable so the path is testable offline against a mocked fetch.
-interface IngestArgs { github_handle?: string; include_forks?: boolean }
-interface IngestDeps { fetchReposFn?: typeof fetchUserRepos; token?: string }
+const ENRICH_MAX_DEFAULT = 20; // cap per-repo enrichment (~2 calls each) — bound the rate-limit hit
+interface IngestArgs { github_handle?: string; include_forks?: boolean; enrich_max?: number }
+interface IngestDeps { fetchReposFn?: typeof fetchUserRepos; enrichFn?: typeof enrichRepo; token?: string }
 
 export async function ingestPortfolio(a: IngestArgs, deps: IngestDeps = {}) {
   const s = readJourneyState();
@@ -712,12 +735,25 @@ export async function ingestPortfolio(a: IngestArgs, deps: IngestDeps = {}) {
   if (!handle)
     return json({ ok: false, error: "no github_handle — pass one, or capture it via capture_onboarding_profile first." });
 
+  const token = deps.token ?? process.env.GITHUB_TOKEN;
   const fetchReposFn = deps.fetchReposFn ?? fetchUserRepos;
   let repos: RepoFacts[];
-  try { repos = await fetchReposFn(handle, { token: deps.token ?? process.env.GITHUB_TOKEN }); }
+  try { repos = await fetchReposFn(handle, { token }); }
   catch (e) { return json({ ok: false, error: `GitHub fetch failed: ${errMsg(e)}` }); }
 
   const kept = a.include_forks ? repos : repos.filter((r) => !r.is_fork);
+  // Enrich the kept repos (most-recently-pushed first) with languages + README so the
+  // relevance grade reads real substance, not a one-line description. Bounded by enrich_max
+  // (0 = skip for a fast metadata-only pull); each enrichment degrades to basic facts on error.
+  const enrichFn = deps.enrichFn ?? enrichRepo;
+  const enrichMax = a.enrich_max ?? ENRICH_MAX_DEFAULT;
+  const toEnrich = kept.slice(0, enrichMax);
+  for (const r of toEnrich) {
+    const e = await enrichFn(r.repo, { token });
+    r.languages = e.languages;
+    r.readme_excerpt = e.readme_excerpt;
+  }
+
   DB.replacePortfolio(kept.map((r) => ({ repo: r.repo, facts: r })));
   // Persist a freshly-supplied handle so later calls (and orient) know it.
   if (a.github_handle && a.github_handle !== s.profile?.github_handle) DB.upsertProfile({ github_handle: a.github_handle });
@@ -727,12 +763,13 @@ export async function ingestPortfolio(a: IngestArgs, deps: IngestDeps = {}) {
     github_handle: handle,
     fetched: repos.length,
     kept: kept.length,
+    enriched: toEnrich.length,
     forks_skipped: a.include_forks ? 0 : repos.length - kept.length,
-    top_by_recent: kept.slice(0, 5).map((r) => ({ repo: r.repo, language: r.language, stars: r.stars, pushed_at: r.pushed_at })),
+    top_by_recent: kept.slice(0, 5).map((r) => ({ repo: r.repo, languages: r.languages ?? (r.language ? [r.language] : []), stars: r.stars, pushed_at: r.pushed_at })),
     portfolio_count: DB.counts().portfolio,
     next: kept.length === 0
       ? "no public repos found (or all forks). Coach from projects the user describes in chat instead."
-      : "coach the portfolio against demand — look({ at: 'portfolio', with_market_overlay: true }); you pick which projects to feature.",
+      : `coach the portfolio against demand and grade each repo's relevance to the target role with grade_portfolio_project — the enriched facts (languages + README excerpt) are in look({ at: 'portfolio' })${toEnrich.length < kept.length ? `; ${kept.length - toEnrich.length} repo(s) beyond enrich_max kept at basic facts` : ""}.`,
   });
 }
 
