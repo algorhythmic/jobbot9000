@@ -17,3 +17,9 @@ You're the closer: one tailored cover letter, grounded in the packet. The user a
 
 ## Hand off
 - Give the user the cover letter, the master resume, talking points, and any gaps to be ready for. Then it's theirs to submit.
+
+## Track the application
+The user applies themselves — once they do, **record it** so the pipeline stays honest:
+- `record_application({ job_id, status })` — `status`: `interested` (shortlisted, pre-apply) → `applied` → `interviewing` → `offer` / `rejected` / `withdrawn`. Optional `applied_at`, `notes`, `next_action` / `next_action_at` (e.g. "prep system-design round").
+- Updating the status later preserves the fields you don't re-pass (so going `applied` → `interviewing` keeps the original `applied_at`/notes).
+- `look({ at: 'applications' })` shows the funnel (counts by status + the tracked list); a role's status also appears in `look({ at: 'packet' })`, and `orient` surfaces a one-line pipeline summary. Don't invent a status — only record what the user reports.

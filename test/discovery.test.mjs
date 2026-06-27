@@ -331,6 +331,24 @@ pinResolveCalls = 0;
 await tools.findCompanies({ companies: [{ name: "PartialCo", domain: "partialco.com", ats_slug: "partialco" }] }, { resolve: countingResolve });
 eq(pinResolveCalls, 1, "pin: lone ats_slug (no platform) falls through to resolution");
 
+// ════════════════════ application tracking ════════════════════
+const state = await import(src("state.ts"));
+const appCo = DB.upsertCompany({ name: "AppCo", ats_platform: "greenhouse", ats_slug: "appco" }).id;
+DB.upsertJobs(appCo, [{ source_url: "ja1", title: "Eng" }, { source_url: "ja2", title: "PM" }]);
+const j1 = DB.db.prepare("SELECT id FROM jobs WHERE source_url='ja1'").get().id;
+const j2 = DB.db.prepare("SELECT id FROM jobs WHERE source_url='ja2'").get().id;
+
+DB.recordApplication(j1, { status: "applied", applied_at: "2026-06-20", notes: "referred by X" });
+eq([DB.getApplication(j1).status, DB.getApplication(j1).applied_at, DB.getApplication(j1).notes], ["applied", "2026-06-20", "referred by X"], "recordApplication: stored");
+// a status update preserves the fields not passed (applied_at, notes)
+DB.recordApplication(j1, { status: "interviewing" });
+eq([DB.getApplication(j1).status, DB.getApplication(j1).applied_at, DB.getApplication(j1).notes], ["interviewing", "2026-06-20", "referred by X"], "recordApplication: status update preserves applied_at/notes");
+DB.recordApplication(j2, { status: "interested" });
+eq([DB.applicationCounts().interviewing, DB.applicationCounts().interested, DB.applicationCounts().applied ?? 0], [1, 1, 0], "applicationCounts: funnel by status");
+eq([DB.getApplications().length, DB.getApplications()[0].company], [2, "AppCo"], "getApplications: lists tracked apps, joined to company");
+// journey state surfaces it
+eq([state.readJourneyState().dimensions.has_applications, state.readJourneyState().pipeline.interviewing], [true, 1], "state: has_applications dimension + pipeline counts");
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
 try { rmSync(TMP, { recursive: true, force: true }); } catch {}

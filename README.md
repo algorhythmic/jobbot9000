@@ -29,7 +29,7 @@ Two rules hold everywhere:
 - **Personal** — resume, portfolio, assessed level, fit, journey — is **always local, never shared.**
 - **Catalog** — companies and their live jobs (public market data) — is **local-first**, with an optional user-triggered sync to a shared pool. Only public data ever leaves.
 
-## The surface — 9 tools
+## The surface — 10 tools
 
 ```mermaid
 flowchart TB
@@ -38,10 +38,11 @@ flowchart TB
     look
     gather
   end
-  subgraph Writes["6 writes — the agent records judgment"]
-    subgraph Raw["raw intake"]
+  subgraph Writes["7 writes"]
+    subgraph Raw["raw / mechanical"]
       capture_onboarding_profile
       replace_master_resume
+      record_application
     end
     subgraph Judgment["judgment — mode-governed"]
       record_level_assessment
@@ -57,15 +58,16 @@ The surface is union-free and order-independent. Read it as: *orient yourself, l
 **Three doors:**
 
 - **`orient(detail?)`** — where the user is in the journey, which skill fits now, and what isn't built yet. `detail`: `recommend` (default), `raw` (bare state for rehydrate), `dashboard` (the relevant-vs-market gap + notes). Safe as the first call.
-- **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`scope`: `market` / `relevant` / `worklist`), `companies`, `resume`, `portfolio`, `packet` (needs `job_id`). `relevant` vs `market` is a deliberate pair — the gap between them is the job-search signal.
+- **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`scope`: `market` / `relevant` / `worklist`), `companies`, `resume`, `portfolio`, `packet` (needs `job_id`), `applications` (the pipeline funnel). `relevant` vs `market` is a deliberate pair — the gap between them is the job-search signal.
 - **`gather(step, …)`** — the one fetch door; reaches an external source, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog` — **all four are wired**. `find_companies` (discover companies on demand / from a curated roster → resolve ATS slugs; TheirStack is an opt-in paid accelerator), `fetch_jobs` (pull their live boards), and `ingest_portfolio` (public GitHub repos) are keyless and free by default. `sync_catalog` is the opt-in egress boundary — it shares **public catalog data only** with a configured pool (`JOBBOT_POOL_URL`); with no pool set it does nothing but report the local diff.
 
-**Six writes** — two raw intake, four judgment (each governed by a mode):
+**Seven writes** — three raw/mechanical, four judgment (each governed by a mode):
 
 | Tool | Plane | Mode |
 |---|---|---|
 | `capture_onboarding_profile` | personal | — (mechanical) |
 | `replace_master_resume` | personal | — (mechanical) |
+| `record_application` | personal | — (mechanical: reported status, not graded judgment) |
 | `record_level_assessment` | personal | `level_assessment` |
 | `grade_job` | **catalog** (the only write to the shared plane) | `job_intrinsic` |
 | `grade_job_fit` | personal | `user_fit` |
@@ -78,12 +80,14 @@ flowchart LR
   S1["1 · Onboard<br/>orient · capture_onboarding_profile · record_level_assessment"]
   S2["2 · Prep<br/>look(resume / portfolio) · replace_master_resume"]
   S3["3 · Search<br/>look(jobs) · grade_job · grade_job_fit · look(packet) · record_cover_letter"]
-  S1 --> S2 --> S3
+  S4["4 · Track<br/>record_application · look(applications)"]
+  S1 --> S2 --> S3 --> S4
 ```
 
 1. **Onboard** — resume (or none), GitHub (or none), and target work; then assess the user's level on the ladder intern → principal (the keystone judgment).
 2. **Prep** — coach the master resume and portfolio against what the live market actually asks for (read-only on code: ideas and critique, never writing it).
 3. **Search** — surface roles in the user's level ±1 band, grade them and judge fit, then assemble a packet and a tailored cover letter the user applies with (the master resume goes as-is — there is one resume).
+4. **Track** — the user applies themselves; record each application's status (`interested → applied → interviewing → offer / rejected / withdrawn`) so the pipeline stays honest. `look(applications)` is the funnel; `orient` surfaces a one-line summary.
 
 Company discovery (`gather find_companies`) is **live and free by default** — name companies on demand (`companies: [{ name, domain }]`) or draw from a local curated seed roster, and their ATS slugs are resolved for free. TheirStack is an **opt-in paid accelerator** for targeted "who's hiring my title now" discovery (set `THEIRSTACK_API_KEY`, pass `provider: 'theirstack'`; count-first and credit-ceiling-gated so a run never overspends). Live **job** fetching (`gather fetch_jobs`) is also live and keyless — it pulls a resolved company's public ATS board (one company, or all resolved companies stalest-first), upserts the postings, and runs a liveness pass that closes roles that left the feed. (Greenhouse / Ashby / Lever are verified against live boards; Workable is best-effort.) Newly-fetched jobs are **ungraded** — grade them, then they surface in the relevant-vs-market views. The three bundled skills — **coach**, **job-search**, **application** — are the playbooks for these stages. Claude invokes them automatically by their `description`, and they're available as the namespaced commands `/jobbot9000:coach`, `/jobbot9000:job-search`, `/jobbot9000:application`.
 
@@ -104,7 +108,7 @@ claude --plugin-dir /path/to/jobbot9000
 /plugin install jobbot9000@jobbot9000
 ```
 
-Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 9 tools`.
+Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 10 tools`.
 
 On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir (so plugin updates don't reinstall them) and builds it; it no-ops on every session after. First-run setup compiles a native dependency, so it takes a moment; if the tools aren't available on that very first session, reload the plugin or start a new session. (Requires `node` and a build toolchain on `PATH`.)
 
