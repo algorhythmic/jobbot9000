@@ -402,6 +402,23 @@ eq([!!DB.getPortfolioRelevance("Saga"), !!DB.getPortfolioRelevance("u/alpha")], 
 const rp = tools.rankedPortfolio();
 eq([rp[0].repo, rp.find((p) => p.repo === "Saga").source], ["Saga", "manual"], "rankedPortfolio: manual project surfaces source + ranks by its strong grade");
 
+// ════════════════════ market-demand overlay (gap #2) ════════════════════
+// Unique skill names so the aggregation is deterministic despite graded jobs from earlier sections.
+const mdCo = DB.upsertCompany({ name: "MDCo", ats_platform: "greenhouse", ats_slug: "mdco" }).id;
+DB.upsertJobs(mdCo, [{ source_url: "md1" }, { source_url: "md2" }, { source_url: "md3" }]);
+const [m1, m2, m3] = ["md1", "md2", "md3"].map((u) => DB.db.prepare("SELECT id FROM jobs WHERE source_url=?").get(u).id);
+DB.setJobGrade(m1, "mid", "A", [{ skill: "Pymdx", kind: "required" }, { skill: "Sqlmdx", kind: "required" }]);
+DB.setJobGrade(m2, "mid", "A", [{ skill: "pymdx", kind: "required" }]);                                  // lowercase -> merges with Pymdx
+DB.setJobGrade(m3, "senior", "B", [{ skill: "Pymdx", kind: "preferred" }, { skill: "Gomdx", kind: "required" }]);
+const dAll = DB.marketSkillDemand(null, 50);
+const py = dAll.skills.find((x) => x.skill.toLowerCase() === "pymdx");
+eq([py.total, py.required, py.preferred], [3, 2, 1], "marketSkillDemand: skill aggregated case-insensitively across required+preferred");
+const dMid = DB.marketSkillDemand(["mid"], 50);
+eq(dMid.skills.find((x) => x.skill.toLowerCase() === "pymdx").total, 2, "marketSkillDemand: band filter (mid) -> demand from 2 jobs");
+eq(dMid.skills.find((x) => x.skill.toLowerCase() === "gomdx"), undefined, "marketSkillDemand: band filter excludes a senior-only skill");
+const ov = tools.marketOverlay(state.readJourneyState());
+eq([ov.computed, ov.top_skills.length > 0, typeof ov.basis === "string"], [true, true, true], "marketOverlay: computed (top_skills + basis) once jobs are graded");
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
 try { rmSync(TMP, { recursive: true, force: true }); } catch {}

@@ -65,10 +65,24 @@ const emptyCatalogNote = (s: State) =>
   s.catalog.companies === 0
     ? `no jobs yet — discover target companies with gather({ step: 'find_companies' }), then pull their boards with gather({ step: 'fetch_jobs' }). You can also ${prepHint(s)} now.`
     : `${s.catalog.companies} companies discovered but no jobs pulled yet — run gather({ step: 'fetch_jobs' }) to fetch their live boards${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} have no ATS slug yet and can't be fetched until resolved)` : ""}. You can also ${prepHint(s)} now.`;
-const marketOverlay = (s: State) =>
-  s.catalog.jobs === 0
-    ? "(no market data yet — discover companies via gather 'find_companies' and pull their boards via gather 'fetch_jobs'; until then coach on resume structure/clarity/impact and don't fabricate demand)"
-    : "(market-demand overlay isn't computed in this build yet — derive the delta from look({ at: 'jobs' }) + each job's skills for now)";
+// The market-demand overlay: the COMPUTED skill demand from graded jobs (the agent then
+// derives the delta vs. the resume/portfolio). Honest when nothing's gradeable yet.
+export function marketOverlay(s: State) {
+  if (s.catalog.jobs === 0)
+    return { computed: false, note: "no market data yet — discover companies via gather 'find_companies' and pull boards via gather 'fetch_jobs'; until then coach on resume structure/clarity/impact and don't fabricate demand." };
+  if (s.catalog.jobs - s.catalog.ungraded_jobs === 0)
+    return { computed: false, note: `${s.catalog.jobs} jobs but none graded — run grade_job (look scope:'worklist') so demand can be computed from each job's required/preferred skills.` };
+  const band = bandFor(s.assessed_level);
+  const demand = DB.marketSkillDemand(band, 20);
+  return {
+    computed: true,
+    basis: band
+      ? `${demand.total_jobs} graded job(s) in your level±1 band (${band.join("/")})`
+      : `${demand.total_jobs} graded job(s) (whole catalog — assess your level for a banded view)`,
+    top_skills: demand.skills,
+    note: "what the market asks for — compare it against the resume/portfolio; the in-demand skills the user can't evidence are the gap to coach. Don't invent demand beyond this.",
+  };
+}
 
 // Modes are the single source of truth for the closed vocabularies. loadMode does
 // NOT swallow errors: a missing/corrupt mode fails the server at startup (loud),
@@ -213,6 +227,7 @@ export function registerTools(server: McpServer): void {
     if (s.dimensions.portfolio_fetched && !s.dimensions.portfolio_graded)
       notes.push("portfolio fetched but ungraded — score each project's relevance to the target role with grade_portfolio_project so the cover letter features the right ones.");
     base.market_readiness_gap = gap;
+    base.market_demand = marketOverlay(s); // computed skill demand (or an honest note if nothing's gradeable yet)
     base.notes = notes;
     base.summary_note = "the honest read is yours to deliver — this only surfaces the numbers";
     return json(base);
@@ -221,7 +236,7 @@ export function registerTools(server: McpServer): void {
   // ── look: the one read door (never fetches, never writes) ─────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). All three scopes accept the same filters — use them to TRIAGE a big pull down to your lanes in ONE call instead of many: titles_any (string[], OR-match any keyword against the job title), location (substring, e.g. 'US' or 'Remote'), remote (true = only remote-flagged), query (title OR company substring); grading_status filters market/worklist. e.g. look({at:'jobs',scope:'worklist',titles_any:['Applied AI','Forward Deployed','Data Engineer'],remote:true}) → the gradeable shortlist. Results carry location/remote/comp so you can geo-filter without opening a packet. 'relevant' vs 'market' is a deliberate pair — the gap is the signal (for a precomputed gap use orient detail:'dashboard'). at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials (portfolio is ranked by each repo's graded relevance to the target role — score them via grade_portfolio_project); with_market_overlay adds the live-demand delta. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + relevance-ranked portfolio + any saved letter + application status. at='applications' is the pipeline funnel (counts by status + the tracked list). Returns JSON for you to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). All three scopes accept the same filters — use them to TRIAGE a big pull down to your lanes in ONE call instead of many: titles_any (string[], OR-match any keyword against the job title), location (substring, e.g. 'US' or 'Remote'), remote (true = only remote-flagged), query (title OR company substring); grading_status filters market/worklist. e.g. look({at:'jobs',scope:'worklist',titles_any:['Applied AI','Forward Deployed','Data Engineer'],remote:true}) → the gradeable shortlist. Results carry location/remote/comp so you can geo-filter without opening a packet. 'relevant' vs 'market' is a deliberate pair — the gap is the signal (for a precomputed gap use orient detail:'dashboard'). at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials (portfolio is ranked by each repo's graded relevance to the target role — score them via grade_portfolio_project); with_market_overlay adds the computed market skill demand (top required/preferred skills across graded jobs in your band) so you can coach the delta. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + relevance-ranked portfolio + any saved letter + application status. at='applications' is the pipeline funnel (counts by status + the tracked list). Returns JSON for you to interpret.`,
     inputSchema: {
       at: enumOf(["jobs", "companies", "resume", "portfolio", "packet", "applications"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
@@ -269,7 +284,7 @@ export function registerTools(server: McpServer): void {
       // Parsed facts + relevance judgment, ranked strong→weak→ungraded.
       const portfolio = rankedPortfolio();
       const ungraded = portfolio.filter((p) => !p.relevance).length;
-      const out: Record<string, unknown> = { portfolio, coverage_gaps: marketOverlay(s) };
+      const out: Record<string, unknown> = { portfolio, market_overlay: marketOverlay(s) };
       const notes: string[] = [];
       if (ungraded) notes.push(`${ungraded}/${portfolio.length} project(s) ungraded — score relevance to the target role with grade_portfolio_project so you know which to feature, anchor, or deep-dive.`);
       // Reconciliation nudge: ingest only sees public repos. Flagship/private work on the

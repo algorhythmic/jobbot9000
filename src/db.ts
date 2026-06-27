@@ -349,6 +349,31 @@ export const getJobSkills = (jobId: number): JobSkill[] =>
     "SELECT skill, kind FROM job_skills WHERE job_id = ? ORDER BY CASE kind WHEN 'required' THEN 0 ELSE 1 END, skill",
   ).all(jobId) as JobSkill[];
 
+// Live MARKET skill demand — aggregate the required/preferred skills recorded by grade_job
+// across live, graded jobs (optionally narrowed to a seniority band). This is the computable
+// half of the market-demand overlay: the agent compares it to the resume/portfolio to find
+// the delta. Skills are grouped case-insensitively (Python/python merge); the surfaced label
+// is the most common casing. Only graded jobs contribute (ungraded carry no skills).
+export interface SkillDemand { skill: string; required: number; preferred: number; total: number }
+export function marketSkillDemand(band?: string[] | null, limit = 20): { total_jobs: number; skills: SkillDemand[] } {
+  const where = ["j.still_live=1", "j.grade_seniority IS NOT NULL"];
+  const args: string[] = [];
+  if (band && band.length) { where.push(`j.grade_seniority IN (${band.map(() => "?").join(",")})`); args.push(...band); }
+  const clause = where.join(" AND ");
+  const total_jobs = countOf(`SELECT count(*) c FROM jobs j WHERE ${clause}`, ...args);
+  const skills = db.prepare(
+    `SELECT s.skill,
+            SUM(CASE WHEN s.kind='required' THEN 1 ELSE 0 END) AS required,
+            SUM(CASE WHEN s.kind='preferred' THEN 1 ELSE 0 END) AS preferred,
+            COUNT(DISTINCT s.job_id) AS total
+     FROM job_skills s JOIN jobs j ON j.id=s.job_id
+     WHERE ${clause}
+     GROUP BY lower(s.skill)
+     ORDER BY total DESC, required DESC, s.skill LIMIT ?`,
+  ).all(...args, limit) as SkillDemand[];
+  return { total_jobs, skills };
+}
+
 // ── job fetch write path (gather('fetch_jobs') calls this — db.ts is the sole writer) ──
 // Idempotent per board: upsert each posting by (company_id, source_url) and refresh
 // last_seen_at + still_live=1 for those present this fetch, then a LIVENESS pass closes
