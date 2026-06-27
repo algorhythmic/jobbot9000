@@ -78,6 +78,7 @@ interface ModeConstraints {
   level_must_be_one_of?: string[];
   market_signal_must_be_one_of?: string[];
   band_must_be_one_of?: string[];
+  relevance_must_be_one_of?: string[];
   [key: string]: unknown;
 }
 interface Mode { mode: string; rubric?: string; output_schema?: Record<string, string>; constraints: ModeConstraints }
@@ -89,12 +90,14 @@ const MODE = {
   job: loadMode("job_intrinsic"),
   fit: loadMode("user_fit"),
   letter: loadMode("cover_letter"),
+  portfolio: loadMode("portfolio_relevance"),
 };
 // The `!` asserts the closed-vocabulary key exists in the mode file; if it's missing,
 // the z.enum built from it throws at startup — the intended loud failure.
 const SENIORITY: string[] = MODE.level.constraints.level_must_be_one_of!;
 const MARKET: string[] = MODE.job.constraints.market_signal_must_be_one_of!;
 const FIT: string[] = MODE.fit.constraints.band_must_be_one_of!;
+const RELEVANCE: string[] = MODE.portfolio.constraints.relevance_must_be_one_of!;
 const enumOf = (v: string[]) => z.enum(v as [string, ...string[]]);
 const ladder = SENIORITY.join(" → ");
 
@@ -115,6 +118,18 @@ const noJob = (id: number) => json({ ok: false, error: `no job ${id} — find a 
 // Application pipeline statuses — a reported fact (not a graded judgment), so a flat enum
 // here rather than a grading mode. interested → applied → interviewing → offer/rejected/withdrawn.
 const APP_STATUS = ["interested", "applied", "interviewing", "offer", "rejected", "withdrawn"];
+
+// Portfolio repos enriched with their relevance judgment, ordered strong→moderate→weak→
+// ungraded (RELEVANCE order, ungraded last) — shared by look(at:'portfolio') and the packet
+// so "which project to feature" is the same ranked view everywhere.
+export function rankedPortfolio(): Array<Record<string, unknown> & { relevance: { band: string; demonstrates: unknown[]; gaps: unknown[]; rationale: string | null } | null }> {
+  const rank = (b?: string | null) => (b ? RELEVANCE.indexOf(b) : RELEVANCE.length);
+  return DB.getPortfolio().map((r) => {
+    const facts = r.facts_json ? JSON.parse(r.facts_json) : { repo: r.repo };
+    const rel = DB.getPortfolioRelevance(r.repo);
+    return { ...facts, fetched_at: r.fetched_at, relevance: rel ? { band: rel.relevance, demonstrates: rel.demonstrates, gaps: rel.gaps, rationale: rel.rationale } : null };
+  }).sort((a, b) => rank(a.relevance?.band) - rank(b.relevance?.band));
+}
 
 // Shared job filters for look(at:'jobs'), applied across all three scopes so the agent can
 // triage a large pull (thousands of postings) down to its lanes in one call: titles_any
@@ -182,6 +197,8 @@ export function registerTools(server: McpServer): void {
       notes.push("the user opted out of a resume/GitHub — coach from their self-described projects and self-reported level (mark it as self-reported).");
     if (s.profile?.github_handle && !s.dimensions.portfolio_fetched && !s.profile.no_github)
       notes.push(PORTFOLIO_INGEST_AVAILABLE ? "GitHub handle on file — run gather({ step: 'ingest_portfolio' }) to enable portfolio coaching." : "GitHub handle on file, but GitHub ingestion isn't available in this build yet.");
+    if (s.dimensions.portfolio_fetched && !s.dimensions.portfolio_graded)
+      notes.push("portfolio fetched but ungraded — score each project's relevance to the target role with grade_portfolio_project so the cover letter features the right ones.");
     base.market_readiness_gap = gap;
     base.notes = notes;
     base.summary_note = "the honest read is yours to deliver — this only surfaces the numbers";
@@ -191,7 +208,7 @@ export function registerTools(server: McpServer): void {
   // ── look: the one read door (never fetches, never writes) ─────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). All three scopes accept the same filters — use them to TRIAGE a big pull down to your lanes in ONE call instead of many: titles_any (string[], OR-match any keyword against the job title), location (substring, e.g. 'US' or 'Remote'), remote (true = only remote-flagged), query (title OR company substring); grading_status filters market/worklist. e.g. look({at:'jobs',scope:'worklist',titles_any:['Applied AI','Forward Deployed','Data Engineer'],remote:true}) → the gradeable shortlist. Results carry location/remote/comp so you can geo-filter without opening a packet. 'relevant' vs 'market' is a deliberate pair — the gap is the signal (for a precomputed gap use orient detail:'dashboard'). at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials; with_market_overlay adds the live-demand delta. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + portfolio + any saved letter + application status. at='applications' is the pipeline funnel (counts by status + the tracked list). Returns JSON for you to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). All three scopes accept the same filters — use them to TRIAGE a big pull down to your lanes in ONE call instead of many: titles_any (string[], OR-match any keyword against the job title), location (substring, e.g. 'US' or 'Remote'), remote (true = only remote-flagged), query (title OR company substring); grading_status filters market/worklist. e.g. look({at:'jobs',scope:'worklist',titles_any:['Applied AI','Forward Deployed','Data Engineer'],remote:true}) → the gradeable shortlist. Results carry location/remote/comp so you can geo-filter without opening a packet. 'relevant' vs 'market' is a deliberate pair — the gap is the signal (for a precomputed gap use orient detail:'dashboard'). at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials (portfolio is ranked by each repo's graded relevance to the target role — score them via grade_portfolio_project); with_market_overlay adds the live-demand delta. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + relevance-ranked portfolio + any saved letter + application status. at='applications' is the pipeline funnel (counts by status + the tracked list). Returns JSON for you to interpret.`,
     inputSchema: {
       at: enumOf(["jobs", "companies", "resume", "portfolio", "packet", "applications"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
@@ -236,9 +253,12 @@ export function registerTools(server: McpServer): void {
         if (s.profile?.no_github) return json({ opted_out: true, note: "The user opted out of GitHub — coach from projects they describe in chat." });
         return json({ note: PORTFOLIO_INGEST_AVAILABLE ? "no portfolio yet — run gather({ step: 'ingest_portfolio' })" : "no portfolio captured yet, and GitHub ingestion isn't available in this build yet — ask the user to describe their projects and coach from that." });
       }
-      // Surface the stored facts blob as structured fields (parsed) rather than raw JSON.
-      const portfolio = repos.map((r) => ({ ...(r.facts_json ? JSON.parse(r.facts_json) : { repo: r.repo }), fetched_at: r.fetched_at }));
-      return json({ portfolio, coverage_gaps: marketOverlay(s) });
+      // Parsed facts + relevance judgment, ranked strong→weak→ungraded.
+      const portfolio = rankedPortfolio();
+      const ungraded = portfolio.filter((p) => !p.relevance).length;
+      const out: Record<string, unknown> = { portfolio, coverage_gaps: marketOverlay(s) };
+      if (ungraded) out.note = `${ungraded}/${portfolio.length} project(s) ungraded — score relevance to the target role with grade_portfolio_project so you know which to feature, anchor, or deep-dive.`;
+      return json(out);
     }
 
     if (a.at === "packet") {
@@ -254,7 +274,7 @@ export function registerTools(server: McpServer): void {
       if (!fit) missing.push("fit");
       if (job.grade_seniority == null) missing.push("job_grade");
       return json({
-        job, job_skills: DB.getJobSkills(a.job_id), master_resume, fit, portfolio: DB.getPortfolio(),
+        job, job_skills: DB.getJobSkills(a.job_id), master_resume, fit, portfolio: rankedPortfolio(),
         saved_cover_letter: saved, application: DB.getApplication(a.job_id) ?? null, missing,
         cover_letter_slot: missing.length
           ? `write the cover letter, then persist via record_cover_letter — but note it will be generic/ungrounded without: ${missing.join(", ")}. Don't fabricate the missing inputs.`
@@ -376,6 +396,25 @@ export function registerTools(server: McpServer): void {
       return json({ ok: false, error: "assess the user's level first via record_level_assessment — fit is measured relative to it (see the user_fit mode's must_reference_assessed_level)." });
     DB.setJobFit(a.job_id, a.band, a.gaps ?? [], a.rationale);
     return json({ ok: true, job_id: a.job_id, band: a.band });
+  });
+
+  server.registerTool("grade_portfolio_project", {
+    description: `A portfolio project's relevance to the user's TARGET ROLE — the join point that grounds which projects to feature (cover letter), anchor (outreach), or deep-dive (interview). → personal. Mode: portfolio_relevance (${RELEVANCE.join(" | ")}). repo is the full_name from look({ at: 'portfolio' }). Reads best after ingest_portfolio + a target role on file.`,
+    inputSchema: {
+      repo: z.string(),
+      relevance: enumOf(RELEVANCE),
+      demonstrates: z.array(z.string()),
+      gaps: z.array(z.string()).optional(),
+      rationale: z.string().min(1),
+    },
+  }, async (a) => {
+    if (!DB.getPortfolio().some((p) => p.repo === a.repo))
+      return json({ ok: false, error: `no repo '${a.repo}' in the portfolio — list them via look({ at: 'portfolio' }), or run gather({ step: 'ingest_portfolio' }) first.` });
+    const out: Record<string, unknown> = { ok: true, repo: a.repo, relevance: a.relevance };
+    if (!readJourneyState().profile?.target_role)
+      out.note = "no target_role on file — grade against the role the user described; capture it via capture_onboarding_profile so the judgment is anchored (the mode wants must_reference_target_role).";
+    DB.setPortfolioRelevance(a.repo, a.relevance, a.demonstrates, a.gaps ?? [], a.rationale);
+    return json(out);
   });
 
   server.registerTool("record_cover_letter", {

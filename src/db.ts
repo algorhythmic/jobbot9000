@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS portfolio_projects (
   facts_json TEXT,
   fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS portfolio_relevance (     -- a project's relevance to the target role (judgment, personal)
+  repo              TEXT PRIMARY KEY,                 -- not FK-cascaded: re-ingest PRUNES grades for dropped repos but KEEPS them for repos that persist
+  relevance         TEXT NOT NULL,                    -- strong | moderate | weak (mode: portfolio_relevance)
+  demonstrates_json TEXT,
+  gaps_json         TEXT,
+  rationale         TEXT,
+  graded_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS assessment (              -- the user's level (judgment)
   id            INTEGER PRIMARY KEY CHECK (id = 1),
   level         TEXT NOT NULL,
@@ -193,10 +201,33 @@ export function replacePortfolio(projects: { repo: string; facts: unknown }[]): 
     db.prepare("DELETE FROM portfolio_projects").run();
     const ins = db.prepare("INSERT INTO portfolio_projects (repo, facts_json) VALUES (?, ?)");
     for (const p of projects) ins.run(p.repo, JSON.stringify(p.facts ?? null));
+    // Prune relevance grades for repos no longer present; KEEP them for repos that persist
+    // (a re-ingest refreshes facts but shouldn't wipe a still-valid relevance judgment).
+    const repos = projects.map((p) => p.repo);
+    if (repos.length === 0) db.prepare("DELETE FROM portfolio_relevance").run();
+    else db.prepare(`DELETE FROM portfolio_relevance WHERE repo NOT IN (${repos.map(() => "?").join(",")})`).run(...repos);
     return projects.length;
   });
   return tx();
 }
+
+// ── portfolio relevance (judgment, personal) — how each repo maps to the target role ──
+export interface PortfolioRelevance {
+  repo: string; relevance: string; demonstrates: unknown[]; gaps: unknown[]; rationale: string | null; graded_at: string;
+}
+export const getPortfolioRelevance = (repo: string): PortfolioRelevance | undefined => {
+  const r = db.prepare("SELECT repo, relevance, demonstrates_json, gaps_json, rationale, graded_at FROM portfolio_relevance WHERE repo = ?")
+    .get(repo) as { repo: string; relevance: string; demonstrates_json: string | null; gaps_json: string | null; rationale: string | null; graded_at: string } | undefined;
+  return r ? { repo: r.repo, relevance: r.relevance, demonstrates: r.demonstrates_json ? JSON.parse(r.demonstrates_json) : [], gaps: r.gaps_json ? JSON.parse(r.gaps_json) : [], rationale: r.rationale, graded_at: r.graded_at } : undefined;
+};
+export const setPortfolioRelevance = (repo: string, relevance: string, demonstrates: unknown, gaps: unknown, rationale: string): void => {
+  db.prepare(
+    `INSERT INTO portfolio_relevance (repo, relevance, demonstrates_json, gaps_json, rationale, graded_at)
+     VALUES (?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(repo) DO UPDATE SET relevance=excluded.relevance, demonstrates_json=excluded.demonstrates_json,
+       gaps_json=excluded.gaps_json, rationale=excluded.rationale, graded_at=datetime('now')`,
+  ).run(repo, relevance, JSON.stringify(demonstrates ?? []), JSON.stringify(gaps ?? []), rationale);
+};
 
 export interface CoverLetter { content: string; talking_points: unknown[]; created_at: string }
 export const getCoverLetter = (jobId: number): CoverLetter | null => {
@@ -527,13 +558,14 @@ export const bumpResolveAttempt = (id: number): void => {
 };
 
 const countOf = (sql: string, ...args: unknown[]): number => (db.prepare(sql).get(...args) as { c: number }).c;
-export interface Counts { companies: number; unresolved: number; jobs: number; ungraded: number; portfolio: number }
+export interface Counts { companies: number; unresolved: number; jobs: number; ungraded: number; portfolio: number; portfolio_graded: number }
 export const counts = (): Counts => ({
   companies: countOf("SELECT count(*) c FROM companies"),
   unresolved: countOf("SELECT count(*) c FROM companies WHERE resolved = 0"),
   jobs: countOf("SELECT count(*) c FROM jobs"),
   ungraded: countOf("SELECT count(*) c FROM jobs WHERE grade_seniority IS NULL"),
   portfolio: countOf("SELECT count(*) c FROM portfolio_projects"),
+  portfolio_graded: countOf("SELECT count(*) c FROM portfolio_relevance"),
 });
 
 export const nowStr = (): string => (db.prepare("SELECT datetime('now') t").get() as { t: string }).t;

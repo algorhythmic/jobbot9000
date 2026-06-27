@@ -1,0 +1,15 @@
+{
+  "mode": "portfolio_relevance",
+  "rubric": "Judge how strongly a portfolio project demonstrates the competencies the user's TARGET ROLE demands. Weigh what the project actually shows — shipped scope, ownership, relevant tech/stack, recency — against the role's core skills. A project can be impressive yet off-target; say so honestly. 'strong' = feature it prominently (in the cover letter, outreach, interview prep); 'moderate' = supporting evidence; 'weak' = tangential, skip it.",
+  "output_schema": {
+    "relevance": "strong | moderate | weak",
+    "demonstrates": "string[] — role-relevant competencies/skills this project actually shows",
+    "gaps": "string[] — competencies the target role wants that this project does NOT show",
+    "rationale": "string — grounded in the repo facts (language, scope, activity) vs. the target role"
+  },
+  "constraints": {
+    "relevance_must_be_one_of": ["strong", "moderate", "weak"],
+    "must_reference_target_role": true,
+    "rationale_required": true
+  }
+}

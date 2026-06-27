@@ -7,7 +7,7 @@ import { getProfile, getMasterResume, getAssessment, getMeta, counts, applicatio
 // (the Record<Dimension, boolean> makes the predicate mandatory at compile time),
 // then have the relevant tools return an honest note when it's unmet.
 export type Dimension =
-  | "onboarded" | "level_assessed" | "portfolio_fetched" | "jobs_discovered" | "synced" | "has_applications";
+  | "onboarded" | "level_assessed" | "portfolio_fetched" | "portfolio_graded" | "jobs_discovered" | "synced" | "has_applications";
 
 export interface JourneyState {
   dimensions: Record<Dimension, boolean>;
@@ -31,6 +31,7 @@ export function readJourneyState(): JourneyState {
       onboarded: !!profile,
       level_assessed: !!assessment,
       portfolio_fetched: c.portfolio > 0,
+      portfolio_graded: c.portfolio_graded > 0,
       jobs_discovered: c.jobs > 0,
       synced: getMeta("last_synced") !== null,
       has_applications: Object.keys(pipeline).length > 0,
