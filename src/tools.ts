@@ -112,6 +112,10 @@ const json = (o: unknown) => ({ content: [{ type: "text" as const, text: JSON.st
 const planned = (note: string) => json({ status: "planned", note: `${note} (external integration — implemented in a later pass).` });
 const noJob = (id: number) => json({ ok: false, error: `no job ${id} — find a valid job_id via look({ at: 'jobs' })` });
 
+// Application pipeline statuses — a reported fact (not a graded judgment), so a flat enum
+// here rather than a grading mode. interested → applied → interviewing → offer/rejected/withdrawn.
+const APP_STATUS = ["interested", "applied", "interviewing", "offer", "rejected", "withdrawn"];
+
 // Shared job filters for look(at:'jobs'), applied across all three scopes so the agent can
 // triage a large pull (thousands of postings) down to its lanes in one call: titles_any
 // OR-matches keywords against the title, location is a substring match, remote keeps only
@@ -143,6 +147,10 @@ export function registerTools(server: McpServer): void {
     if (detail === "raw") return json({ ...s, pending_tools: pendingTools() }); // rehydrate blackboard + what's pending
 
     const base: Record<string, unknown> = { server: "jobbot9000", state: s, pending_tools: pendingTools() };
+    if (s.dimensions.has_applications) {
+      const total = Object.values(s.pipeline).reduce((x, y) => x + y, 0);
+      base.pipeline_summary = `${total} application(s) tracked — ${Object.entries(s.pipeline).map(([k, v]) => `${v} ${k}`).join(", ")}. Review/update via look({ at: 'applications' }).`;
+    }
     if (detail === "recommend") {
       base.recommended_skill = !s.dimensions.onboarded ? "coach — onboard first"
         : !s.dimensions.level_assessed ? "coach — assess the user's level (the keystone)"
@@ -183,9 +191,9 @@ export function registerTools(server: McpServer): void {
   // ── look: the one read door (never fetches, never writes) ─────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). All three scopes accept the same filters — use them to TRIAGE a big pull down to your lanes in ONE call instead of many: titles_any (string[], OR-match any keyword against the job title), location (substring, e.g. 'US' or 'Remote'), remote (true = only remote-flagged), query (title OR company substring); grading_status filters market/worklist. e.g. look({at:'jobs',scope:'worklist',titles_any:['Applied AI','Forward Deployed','Data Engineer'],remote:true}) → the gradeable shortlist. Results carry location/remote/comp so you can geo-filter without opening a packet. 'relevant' vs 'market' is a deliberate pair — the gap is the signal (for a precomputed gap use orient detail:'dashboard'). at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials; with_market_overlay adds the live-demand delta. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + portfolio + any saved letter. Returns JSON for you to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). All three scopes accept the same filters — use them to TRIAGE a big pull down to your lanes in ONE call instead of many: titles_any (string[], OR-match any keyword against the job title), location (substring, e.g. 'US' or 'Remote'), remote (true = only remote-flagged), query (title OR company substring); grading_status filters market/worklist. e.g. look({at:'jobs',scope:'worklist',titles_any:['Applied AI','Forward Deployed','Data Engineer'],remote:true}) → the gradeable shortlist. Results carry location/remote/comp so you can geo-filter without opening a packet. 'relevant' vs 'market' is a deliberate pair — the gap is the signal (for a precomputed gap use orient detail:'dashboard'). at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials; with_market_overlay adds the live-demand delta. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + portfolio + any saved letter + application status. at='applications' is the pipeline funnel (counts by status + the tracked list). Returns JSON for you to interpret.`,
     inputSchema: {
-      at: enumOf(["jobs", "companies", "resume", "portfolio", "packet"]),
+      at: enumOf(["jobs", "companies", "resume", "portfolio", "packet", "applications"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
       query: z.string().optional(),
       titles_any: z.array(z.string()).optional(),
@@ -247,13 +255,20 @@ export function registerTools(server: McpServer): void {
       if (job.grade_seniority == null) missing.push("job_grade");
       return json({
         job, job_skills: DB.getJobSkills(a.job_id), master_resume, fit, portfolio: DB.getPortfolio(),
-        saved_cover_letter: saved, missing,
+        saved_cover_letter: saved, application: DB.getApplication(a.job_id) ?? null, missing,
         cover_letter_slot: missing.length
           ? `write the cover letter, then persist via record_cover_letter — but note it will be generic/ungrounded without: ${missing.join(", ")}. Don't fabricate the missing inputs.`
           : saved
             ? "a cover letter is already saved — refine it only if the packet changed, then persist via record_cover_letter."
             : "write the cover letter, then persist via record_cover_letter.",
       });
+    }
+
+    if (a.at === "applications") {
+      const applications = DB.getApplications();
+      const out: Record<string, unknown> = { pipeline: DB.applicationCounts(), applications };
+      if (applications.length === 0) out.note = "no applications tracked yet — after the user applies to a role, record it with record_application.";
+      return json(out);
     }
 
     // a.at === "jobs"
@@ -374,9 +389,26 @@ export function registerTools(server: McpServer): void {
     if (!DB.getMasterResume()?.content) missing.push("master_resume");
     if (!DB.db.prepare("SELECT 1 FROM job_fit WHERE job_id=?").get(a.job_id)) missing.push("fit");
     if (job.grade_seniority == null) missing.push("job_grade");
-    const out: Record<string, unknown> = { ok: true, job_id: a.job_id };
+    const out: Record<string, unknown> = { ok: true, job_id: a.job_id, next: "when the user applies, track it with record_application." };
     if (missing.length) out.note = `saved — but this job is missing ${missing.join(", ")}, so the letter may be ungrounded. The cover_letter mode forbids inventing experience — don't fabricate those inputs.`;
     return json(out);
+  });
+
+  // ── application tracking (personal, mechanical) — the apply→…→offer pipeline ──
+  server.registerTool("record_application", {
+    description: `Track the user's application to a job (they apply themselves; this records it). → personal. status: ${APP_STATUS.join(" | ")}. Idempotent per job — updating the status preserves the fields you don't pass (applied_at, notes, next_action). Optional applied_at / next_action / next_action_at / notes. Read the funnel via look({ at: 'applications' }); a job's status also shows in look({ at: 'packet' }).`,
+    inputSchema: {
+      job_id: z.number().int(),
+      status: enumOf(APP_STATUS),
+      applied_at: z.string().optional(),
+      next_action: z.string().optional(),
+      next_action_at: z.string().optional(),
+      notes: z.string().optional(),
+    },
+  }, async (a) => {
+    if (!DB.getJob(a.job_id)) return noJob(a.job_id);
+    DB.recordApplication(a.job_id, { status: a.status, applied_at: a.applied_at, next_action: a.next_action, next_action_at: a.next_action_at, notes: a.notes });
+    return json({ ok: true, job_id: a.job_id, status: a.status, pipeline: DB.applicationCounts() });
   });
 
   // ── gather: the one door to the outside world ─────────────────────────────

@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS cover_letters (           -- the per-role deliverable
   talking_points_json TEXT,
   created_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS applications (            -- the user's application to a job (personal)
+  job_id         INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  status         TEXT NOT NULL,                      -- interested | applied | interviewing | offer | rejected | withdrawn
+  applied_at     TEXT,                               -- the user's report of when they applied
+  next_action    TEXT,                               -- e.g. "follow up", "prep system-design round"
+  next_action_at TEXT,
+  notes          TEXT,
+  updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT
@@ -211,6 +220,48 @@ export const recordCoverLetter = (jobId: number, content: string, points: unknow
        talking_points_json=excluded.talking_points_json`,
   ).run(jobId, content, JSON.stringify(points ?? null));
 };
+
+// ── application tracking (personal) — the apply→applied→… pipeline ───────────
+// User-reported fact (status of their own application), not a graded judgment, so it's a
+// mechanical write (like the profile). Idempotent per job; a status update PRESERVES the
+// fields you don't pass (applied_at, notes, …) rather than nulling them.
+export interface Application {
+  job_id: number; status: string; applied_at: string | null;
+  next_action: string | null; next_action_at: string | null; notes: string | null; updated_at: string;
+}
+export const getApplication = (jobId: number): Application | undefined =>
+  db.prepare("SELECT * FROM applications WHERE job_id = ?").get(jobId) as Application | undefined;
+
+export function recordApplication(
+  jobId: number,
+  fields: { status: string; applied_at?: string | null; next_action?: string | null; next_action_at?: string | null; notes?: string | null },
+): void {
+  const cur = getApplication(jobId);
+  const pick = <K extends keyof Application>(k: K): unknown => (fields as any)[k] !== undefined ? (fields as any)[k] : (cur?.[k] ?? null);
+  db.prepare(
+    `INSERT INTO applications (job_id, status, applied_at, next_action, next_action_at, notes, updated_at)
+     VALUES (@job_id, @status, @applied_at, @next_action, @next_action_at, @notes, datetime('now'))
+     ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, applied_at=excluded.applied_at,
+       next_action=excluded.next_action, next_action_at=excluded.next_action_at, notes=excluded.notes, updated_at=datetime('now')`,
+  ).run({
+    job_id: jobId, status: fields.status,
+    applied_at: pick("applied_at"), next_action: pick("next_action"),
+    next_action_at: pick("next_action_at"), notes: pick("notes"),
+  });
+}
+
+export interface ApplicationRow extends Application { title: string | null; company: string }
+export const getApplications = (): ApplicationRow[] =>
+  db.prepare(
+    `SELECT a.*, j.title, c.name AS company FROM applications a
+     JOIN jobs j ON j.id = a.job_id JOIN companies c ON c.id = j.company_id
+     ORDER BY a.updated_at DESC`,
+  ).all() as ApplicationRow[];
+
+// Funnel counts by status (for orient + look pipeline summaries).
+export const applicationCounts = (): Record<string, number> =>
+  Object.fromEntries((db.prepare("SELECT status, count(*) c FROM applications GROUP BY status").all() as { status: string; c: number }[])
+    .map((r) => [r.status, r.c]));
 
 export const getMeta = (key: string): string | null =>
   (db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined)?.value ?? null;
