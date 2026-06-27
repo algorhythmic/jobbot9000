@@ -349,6 +349,19 @@ eq([DB.getApplications().length, DB.getApplications()[0].company], [2, "AppCo"],
 // journey state surfaces it
 eq([state.readJourneyState().dimensions.has_applications, state.readJourneyState().pipeline.interviewing], [true, 1], "state: has_applications dimension + pipeline counts");
 
+// ════════════════════ portfolio relevance (the join point) ════════════════════
+DB.replacePortfolio([{ repo: "u/strong", facts: { repo: "u/strong" } }, { repo: "u/weak", facts: { repo: "u/weak" } }, { repo: "u/ungraded", facts: { repo: "u/ungraded" } }]);
+DB.setPortfolioRelevance("u/strong", "strong", ["go", "distributed systems"], [], "core to the target role");
+DB.setPortfolioRelevance("u/weak", "weak", [], ["off-target"], "tangential to the role");
+eq([DB.getPortfolioRelevance("u/strong").relevance, DB.getPortfolioRelevance("u/strong").demonstrates], ["strong", ["go", "distributed systems"]], "setPortfolioRelevance: stored + parsed");
+eq([DB.counts().portfolio, DB.counts().portfolio_graded], [3, 2], "counts: portfolio_graded tracks graded repos");
+eq(state.readJourneyState().dimensions.portfolio_graded, true, "state: portfolio_graded dimension flips");
+eq(tools.rankedPortfolio().map((p) => `${p.repo}:${p.relevance?.band ?? "-"}`), ["u/strong:strong", "u/weak:weak", "u/ungraded:-"], "rankedPortfolio: strong → weak → ungraded last");
+// re-ingest prunes grades for dropped repos but KEEPS them for repos that persist
+DB.replacePortfolio([{ repo: "u/strong", facts: { repo: "u/strong" } }, { repo: "u/new", facts: { repo: "u/new" } }]);
+eq([!!DB.getPortfolioRelevance("u/strong"), !!DB.getPortfolioRelevance("u/weak")], [true, false], "re-ingest: keeps persisting repo's grade, prunes dropped repo's");
+eq(DB.counts().portfolio_graded, 1, "re-ingest: only the persisting grade remains");
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
 try { rmSync(TMP, { recursive: true, force: true }); } catch {}
