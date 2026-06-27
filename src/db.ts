@@ -47,8 +47,9 @@ CREATE TABLE IF NOT EXISTS master_resume (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS portfolio_projects (
-  repo       TEXT PRIMARY KEY,
+  repo       TEXT PRIMARY KEY,                       -- github: "owner/name"; manual: a bare name (no slash)
   facts_json TEXT,
+  source     TEXT NOT NULL DEFAULT 'github',         -- 'github' (ingested) | 'manual' (described, e.g. a private/flagship project)
   fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS portfolio_relevance (     -- a project's relevance to the target role (judgment, personal)
@@ -147,6 +148,7 @@ function ensureColumn(table: string, column: string, ddl: string): void {
 }
 ensureColumn("companies", "resolve_attempts", "resolve_attempts INTEGER NOT NULL DEFAULT 0");
 ensureColumn("companies", "last_resolve_attempt_at", "last_resolve_attempt_at TEXT");
+ensureColumn("portfolio_projects", "source", "source TEXT NOT NULL DEFAULT 'github'"); // 'github' (ingested) | 'manual' (added)
 
 // ── personal accessors ─────────────────────────────────────────────────────
 export interface Profile {
@@ -188,27 +190,36 @@ export const getAssessment = (): { level: string; rationale: string | null; evid
   return r ? { level: r.level, rationale: r.rationale, evidence: r.evidence_json ? JSON.parse(r.evidence_json) : null } : undefined;
 };
 
-export interface PortfolioProject { repo: string; facts_json: string | null; fetched_at: string }
+export interface PortfolioProject { repo: string; facts_json: string | null; source: string; fetched_at: string }
 export const getPortfolio = (): PortfolioProject[] =>
-  db.prepare("SELECT repo, facts_json, fetched_at FROM portfolio_projects ORDER BY fetched_at DESC, repo").all() as PortfolioProject[];
+  db.prepare("SELECT repo, facts_json, source, fetched_at FROM portfolio_projects ORDER BY fetched_at DESC, repo").all() as PortfolioProject[];
 
-// Replace the portfolio with a fresh snapshot (gather('ingest_portfolio') calls this —
-// db.ts is the sole writer). A full replace, not an upsert: the ingest reflects the user's
-// CURRENT public repos, so repos they deleted/renamed since the last pull drop out. Each
-// project's facts are stored as a JSON blob (facts_json) for the agent to read and judge.
+// Replace the GITHUB-sourced portfolio with a fresh snapshot (gather('ingest_portfolio')
+// calls this — db.ts is the sole writer). Manual projects (added via addPortfolioProject,
+// e.g. a private/flagship repo) are NOT touched — they persist across re-ingest. A re-ingest
+// reflects the user's CURRENT public repos, so deleted/renamed github repos drop out.
 export function replacePortfolio(projects: { repo: string; facts: unknown }[]): number {
   const tx = db.transaction((): number => {
-    db.prepare("DELETE FROM portfolio_projects").run();
-    const ins = db.prepare("INSERT INTO portfolio_projects (repo, facts_json) VALUES (?, ?)");
+    db.prepare("DELETE FROM portfolio_projects WHERE source='github'").run();
+    const ins = db.prepare("INSERT INTO portfolio_projects (repo, facts_json, source) VALUES (?, ?, 'github')");
     for (const p of projects) ins.run(p.repo, JSON.stringify(p.facts ?? null));
-    // Prune relevance grades for repos no longer present; KEEP them for repos that persist
-    // (a re-ingest refreshes facts but shouldn't wipe a still-valid relevance judgment).
-    const repos = projects.map((p) => p.repo);
-    if (repos.length === 0) db.prepare("DELETE FROM portfolio_relevance").run();
-    else db.prepare(`DELETE FROM portfolio_relevance WHERE repo NOT IN (${repos.map(() => "?").join(",")})`).run(...repos);
+    // Prune relevance grades for projects no longer present. Keep set = the new github repos
+    // PLUS surviving manual projects (whose grades must not be pruned).
+    const keep = [...projects.map((p) => p.repo), ...(db.prepare("SELECT repo FROM portfolio_projects WHERE source='manual'").all() as { repo: string }[]).map((r) => r.repo)];
+    if (keep.length === 0) db.prepare("DELETE FROM portfolio_relevance").run();
+    else db.prepare(`DELETE FROM portfolio_relevance WHERE repo NOT IN (${keep.map(() => "?").join(",")})`).run(...keep);
     return projects.length;
   });
   return tx();
+}
+
+// Add/replace a MANUAL portfolio project — work the agent should be able to feature that
+// ingest can't see (a private/flagship repo on the resume). Persists across re-ingest.
+export function addPortfolioProject(name: string, facts: unknown): void {
+  db.prepare(
+    `INSERT INTO portfolio_projects (repo, facts_json, source, fetched_at) VALUES (?, ?, 'manual', datetime('now'))
+     ON CONFLICT(repo) DO UPDATE SET facts_json=excluded.facts_json, source='manual', fetched_at=datetime('now')`,
+  ).run(name, JSON.stringify(facts ?? null));
 }
 
 // ── portfolio relevance (judgment, personal) — how each repo maps to the target role ──

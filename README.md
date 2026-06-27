@@ -29,7 +29,7 @@ Two rules hold everywhere:
 - **Personal** — resume, portfolio, assessed level, fit, journey — is **always local, never shared.**
 - **Catalog** — companies and their live jobs (public market data) — is **local-first**, with an optional user-triggered sync to a shared pool. Only public data ever leaves.
 
-## The surface — 11 tools
+## The surface — 12 tools
 
 ```mermaid
 flowchart TB
@@ -38,10 +38,11 @@ flowchart TB
     look
     gather
   end
-  subgraph Writes["8 writes"]
+  subgraph Writes["9 writes"]
     subgraph Raw["raw / mechanical"]
       capture_onboarding_profile
       replace_master_resume
+      add_portfolio_project
       record_application
     end
     subgraph Judgment["judgment — mode-governed"]
@@ -62,12 +63,13 @@ The surface is union-free and order-independent. Read it as: *orient yourself, l
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`scope`: `market` / `relevant` / `worklist`), `companies`, `resume`, `portfolio`, `packet` (needs `job_id`), `applications` (the pipeline funnel). `relevant` vs `market` is a deliberate pair — the gap between them is the job-search signal.
 - **`gather(step, …)`** — the one fetch door; reaches an external source, persists via a helper, returns the findings. `step`: `find_companies`, `fetch_jobs`, `ingest_portfolio`, `sync_catalog` — **all four are wired**. `find_companies` (discover companies on demand / from a curated roster → resolve ATS slugs; TheirStack is an opt-in paid accelerator), `fetch_jobs` (pull their live boards), and `ingest_portfolio` (public GitHub repos) are keyless and free by default. `sync_catalog` is the opt-in egress boundary — it shares **public catalog data only** with a configured pool (`JOBBOT_POOL_URL`); with no pool set it does nothing but report the local diff.
 
-**Eight writes** — three raw/mechanical, five judgment (each governed by a mode):
+**Nine writes** — four raw/mechanical, five judgment (each governed by a mode):
 
 | Tool | Plane | Mode |
 |---|---|---|
 | `capture_onboarding_profile` | personal | — (mechanical) |
 | `replace_master_resume` | personal | — (mechanical) |
+| `add_portfolio_project` | personal | — (mechanical: a described/private project ingest can't see) |
 | `record_application` | personal | — (mechanical: reported status, not graded judgment) |
 | `record_level_assessment` | personal | `level_assessment` |
 | `grade_job` | **catalog** (the only write to the shared plane) | `job_intrinsic` |
@@ -110,7 +112,7 @@ claude --plugin-dir /path/to/jobbot9000
 /plugin install jobbot9000@jobbot9000
 ```
 
-Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 11 tools`.
+Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 12 tools`.
 
 On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir (so plugin updates don't reinstall them) and builds it; it no-ops on every session after. First-run setup compiles a native dependency, so it takes a moment; if the tools aren't available on that very first session, reload the plugin or start a new session. (Requires `node` and a build toolchain on `PATH`.)
 

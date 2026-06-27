@@ -140,7 +140,7 @@ export function rankedPortfolio(): Array<Record<string, unknown> & { relevance: 
   return DB.getPortfolio().map((r) => {
     const facts = r.facts_json ? JSON.parse(r.facts_json) : { repo: r.repo };
     const rel = DB.getPortfolioRelevance(r.repo);
-    return { ...facts, fetched_at: r.fetched_at, relevance: rel ? { band: rel.relevance, demonstrates: rel.demonstrates, gaps: rel.gaps, rationale: rel.rationale } : null };
+    return { ...facts, source: r.source, fetched_at: r.fetched_at, relevance: rel ? { band: rel.relevance, demonstrates: rel.demonstrates, gaps: rel.gaps, rationale: rel.rationale } : null };
   }).sort((a, b) => rank(a.relevance?.band) - rank(b.relevance?.band));
 }
 
@@ -270,7 +270,12 @@ export function registerTools(server: McpServer): void {
       const portfolio = rankedPortfolio();
       const ungraded = portfolio.filter((p) => !p.relevance).length;
       const out: Record<string, unknown> = { portfolio, coverage_gaps: marketOverlay(s) };
-      if (ungraded) out.note = `${ungraded}/${portfolio.length} project(s) ungraded — score relevance to the target role with grade_portfolio_project so you know which to feature, anchor, or deep-dive.`;
+      const notes: string[] = [];
+      if (ungraded) notes.push(`${ungraded}/${portfolio.length} project(s) ungraded — score relevance to the target role with grade_portfolio_project so you know which to feature, anchor, or deep-dive.`);
+      // Reconciliation nudge: ingest only sees public repos. Flagship/private work on the
+      // resume (with no public repo) is invisible to packets until added manually.
+      if (s.has_resume) notes.push("cross-reference the resume — projects it features with no matching repo here (private/flagship work) won't reach packets until you add them via add_portfolio_project. Conversely, repos here the resume omits may be evidence worth surfacing.");
+      if (notes.length) out.note = notes.join(" ");
       return json(out);
     }
 
@@ -436,6 +441,19 @@ export function registerTools(server: McpServer): void {
       out.note = "no target_role on file — grade against the role the user described; capture it via capture_onboarding_profile so the judgment is anchored (the mode wants must_reference_target_role).";
     DB.setPortfolioRelevance(a.repo, a.relevance, a.demonstrates, a.gaps ?? [], a.rationale);
     return json(out);
+  });
+
+  server.registerTool("add_portfolio_project", {
+    description: "Add a project to the portfolio that ingest_portfolio can't see — a private or flagship project the user describes (e.g. one on the resume with no public repo). → personal; persists across re-ingest (unlike fetched repos). name is the key (a bare name, not 'owner/name'); describe what it is and its stack. Then grade_portfolio_project scores it like any repo and it flows into packets. Use it when reconciling the resume against the fetched repos and a key project is missing.",
+    inputSchema: {
+      name: z.string(),
+      description: z.string().min(1),
+      languages: z.array(z.string()).optional(),
+      url: z.string().optional(),
+    },
+  }, async (a) => {
+    DB.addPortfolioProject(a.name, { repo: a.name, name: a.name, description: a.description, languages: a.languages ?? [], url: a.url ?? null, source: "manual" });
+    return json({ ok: true, repo: a.name, note: "added (manual) — grade its relevance with grade_portfolio_project so it ranks into packets alongside the fetched repos." });
   });
 
   server.registerTool("record_cover_letter", {

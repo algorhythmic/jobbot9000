@@ -389,6 +389,19 @@ DB.replacePortfolio([{ repo: "u/strong", facts: { repo: "u/strong" } }, { repo: 
 eq([!!DB.getPortfolioRelevance("u/strong"), !!DB.getPortfolioRelevance("u/weak")], [true, false], "re-ingest: keeps persisting repo's grade, prunes dropped repo's");
 eq(DB.counts().portfolio_graded, 1, "re-ingest: only the persisting grade remains");
 
+// ════════════════════ gap #6: manual projects (resume↔repo reconciliation) ════════════════════
+await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/alpha" })], enrichFn: noEnrich });
+DB.setPortfolioRelevance("u/alpha", "moderate", [], [], "r");                 // grade the github repo
+DB.addPortfolioProject("Saga", { repo: "Saga", name: "Saga", description: "multi-agent orchestration", languages: ["TypeScript", "Python"], source: "manual" });
+DB.setPortfolioRelevance("Saga", "strong", ["multi-agent"], [], "flagship");  // grade the manual project
+eq(DB.getPortfolio().map((p) => `${p.repo}:${p.source}`).sort(), ["Saga:manual", "u/alpha:github"], "add: manual project sits alongside github repos");
+// re-ingest: github repos replaced (u/alpha gone), manual project + its grade SURVIVE
+await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/beta" })], enrichFn: noEnrich });
+eq(DB.getPortfolio().map((p) => `${p.repo}:${p.source}`).sort(), ["Saga:manual", "u/beta:github"], "re-ingest: keeps the manual project, replaces github repos");
+eq([!!DB.getPortfolioRelevance("Saga"), !!DB.getPortfolioRelevance("u/alpha")], [true, false], "re-ingest: keeps manual grade, prunes the dropped github repo's grade");
+const rp = tools.rankedPortfolio();
+eq([rp[0].repo, rp.find((p) => p.repo === "Saga").source], ["Saga", "manual"], "rankedPortfolio: manual project surfaces source + ranks by its strong grade");
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
 try { rmSync(TMP, { recursive: true, force: true }); } catch {}
