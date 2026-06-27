@@ -217,28 +217,55 @@ eq(threw, true, "fetchUserRepos: 404 -> throws unknown-user");
 // injectable mock returning RepoFacts directly (orchestration deps)
 const mkFacts = (o) => ({ repo: "u/x", name: "x", description: null, language: "TS", stars: 0, forks: 0, topics: [], is_fork: false, is_archived: false, pushed_at: "2026-01-01", url: "u", homepage: null, ...o });
 const fr = async () => [mkFacts({ repo: "u/alpha", language: "TypeScript", stars: 10 }), mkFacts({ repo: "u/forked", is_fork: true })];
+const noEnrich = async () => ({ languages: [], readme_excerpt: null }); // offline: don't hit the real GitHub enrich endpoints
 
 // ── M. no handle (profile has none) -> honest error ───────────────────────────
-eq(jres(await tools.ingestPortfolio({}, { fetchReposFn: fr })).ok, false, "ingest: no handle -> ok:false");
+eq(jres(await tools.ingestPortfolio({}, { fetchReposFn: fr, enrichFn: noEnrich })).ok, false, "ingest: no handle -> ok:false");
 
 // ── N. no_github opt-out -> honest error, then clear ──────────────────────────
 DB.upsertProfile({ no_github: 1 });
-eq(jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: fr })).ok, false, "ingest: no_github opt-out -> ok:false");
+eq(jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: fr, enrichFn: noEnrich })).ok, false, "ingest: no_github opt-out -> ok:false");
 DB.upsertProfile({ no_github: 0 });
 
 // ── O. happy path: forks skipped, snapshot stored, handle persisted ───────────
-const ing = jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: fr }));
+const ing = jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: fr, enrichFn: noEnrich }));
 eq([ing.ok, ing.fetched, ing.kept, ing.forks_skipped, ing.portfolio_count], [true, 2, 1, 1, 1], "ingest: fork skipped, 1 kept");
 eq(DB.getPortfolio()[0].repo, "u/alpha", "ingest: stored the non-fork repo");
 eq(DB.getProfile()?.github_handle, "u", "ingest: persisted the handle to the profile");
 
 // ── P. include_forks keeps forks ─────────────────────────────────────────────
-const ing2 = jres(await tools.ingestPortfolio({ github_handle: "u", include_forks: true }, { fetchReposFn: fr }));
+const ing2 = jres(await tools.ingestPortfolio({ github_handle: "u", include_forks: true }, { fetchReposFn: fr, enrichFn: noEnrich }));
 eq([ing2.kept, ing2.portfolio_count], [2, 2], "ingest: include_forks keeps the fork");
 
 // ── Q. replace semantics: re-ingest is a fresh snapshot (dropped repo leaves) ──
-const ing3 = jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/alpha" })] }));
+const ing3 = jres(await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/alpha" })], enrichFn: noEnrich }));
 eq([ing3.portfolio_count, DB.getPortfolio().length], [1, 1], "ingest: snapshot replaces prior (fork dropped)");
+
+// ── enrichment: languages + README excerpt (the deep-ingest fix) ──────────────
+const enrFetch = async (url) => {
+  if (url.endsWith("/repos/u/alpha/languages")) return ok({ TypeScript: 9000, Python: 3000, CSS: 500 });
+  if (url.endsWith("/repos/u/alpha/readme")) return { ok: true, status: 200, text: async () => "# Alpha\n\nA 158-test inference engine." };
+  if (url.endsWith("/repos/u/b64/readme")) return { ok: true, status: 200, text: async () => JSON.stringify({ content: Buffer.from("# B64 readme", "utf8").toString("base64"), encoding: "base64" }) };
+  return notFound();
+};
+const enr = await githubMod.enrichRepo("u/alpha", { fetchFn: enrFetch });
+eq(enr.languages, ["TypeScript", "Python", "CSS"], "enrichRepo: languages by bytes desc (full stack, not just primary)");
+eq(enr.readme_excerpt.includes("158-test inference engine"), true, "enrichRepo: README excerpt captured");
+eq((await githubMod.enrichRepo("u/b64", { fetchFn: enrFetch })).readme_excerpt, "# B64 readme", "enrichRepo: decodes base64 README envelope");
+eq(await githubMod.enrichRepo("u/missing", { fetchFn: enrFetch }), { languages: [], readme_excerpt: null }, "enrichRepo: missing repo -> empty (no throw)");
+// ingest attaches enrichment to the stored facts
+const enrichingFn = async (repo) => ({ languages: ["TypeScript", "Python"], readme_excerpt: `readme of ${repo}` });
+await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/alpha" })], enrichFn: enrichingFn });
+const af = JSON.parse(DB.getPortfolio().find((p) => p.repo === "u/alpha").facts_json);
+eq([af.languages, af.readme_excerpt], [["TypeScript", "Python"], "readme of u/alpha"], "ingest: enrichment attached to stored facts");
+await tools.ingestPortfolio({ github_handle: "u", enrich_max: 0 }, { fetchReposFn: async () => [mkFacts({ repo: "u/alpha" })], enrichFn: enrichingFn });
+eq(JSON.parse(DB.getPortfolio()[0].facts_json).readme_excerpt ?? null, null, "ingest: enrich_max:0 -> metadata only (no enrichment)");
+
+// ── compactDescription: clean gradeable text from raw_json (worklist/packet) ───
+eq(tools.compactDescription(JSON.stringify({ content: "<p>Build <b>LLM</b> systems.</p>" })), "Build LLM systems.", "compactDescription: strips HTML (greenhouse content)");
+eq(tools.compactDescription(JSON.stringify({ descriptionPlain: "Plain text role." })), "Plain text role.", "compactDescription: prefers plain text (ashby)");
+eq([tools.compactDescription(null), tools.compactDescription("not json")], [null, null], "compactDescription: null/garbage -> null");
+eq(tools.compactDescription(JSON.stringify({ description: "x".repeat(2000) })).length, 1000, "compactDescription: truncated to DESC_MAX");
 
 // ════════════════════ sync_catalog ════════════════════
 // snapshot builders for controlled merge tests

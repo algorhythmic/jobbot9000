@@ -3,18 +3,23 @@
 // model. The deep judgment — which project to feature, architecture read, relevance to a
 // role — is the agent's (the brain); this only supplies the raw facts to judge.
 //
-// Keyless by default (GitHub's unauthenticated REST API allows ~60 req/hr — plenty for
-// one user, since a repo list is 1–few requests). GITHUB_TOKEN, if set, raises the limit;
-// it's an optional accelerator, never required. We read only the repos-list payload (no
-// per-repo language/README calls) to stay well inside the rate limit and keep it one pass.
+// Keyless by default (GitHub's unauthenticated REST API allows ~60 req/hr). The repo LIST
+// is one call; ENRICHMENT (languages + README, so the grade isn't blind to the actual work)
+// is ~2 calls/repo, so it's bounded by enrichMax and best run with GITHUB_TOKEN (raises the
+// limit). Enrichment degrades gracefully — a rate-limit/error on a repo just leaves it at
+// basic facts. Still no DB writes, no model calls: this only supplies raw facts to judge.
 
 import type { FetchFn } from "./ats.js";
+
+const README_MAX = 1500; // README excerpt length — enough to judge substance, not the whole file
 
 export interface RepoFacts {
   repo: string;                 // full_name ("owner/name") — the portfolio PK
   name: string;
   description: string | null;
   language: string | null;      // GitHub's primary-language guess
+  languages?: string[];         // full stack by bytes desc (enrichment) — undefined if not enriched
+  readme_excerpt?: string | null; // first ~1500 chars of the README (enrichment)
   stars: number;
   forks: number;
   topics: string[];
@@ -34,6 +39,10 @@ export interface GithubOpts {
 
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+const ghHeaders = (opts: GithubOpts): Record<string, string> => ({
+  Accept: "application/vnd.github+json", "User-Agent": "jobbot9000",
+  ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
+});
 
 function toFacts(r: any): RepoFacts | null {
   const repo = str(r?.full_name);
@@ -64,8 +73,7 @@ export async function fetchUserRepos(handle: string, opts: GithubOpts = {}): Pro
   const f = opts.fetchFn ?? fetch;
   const base = opts.baseUrl ?? "https://api.github.com";
   const maxPages = opts.maxPages ?? 3;
-  const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": "jobbot9000" };
-  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+  const headers = ghHeaders(opts);
 
   const out: RepoFacts[] = [];
   for (let page = 1; page <= maxPages; page++) {
@@ -82,4 +90,38 @@ export async function fetchUserRepos(handle: string, opts: GithubOpts = {}): Pro
     if (page_data.length < 100) break; // last page
   }
   return out;
+}
+
+/**
+ * Enrich one repo so a relevance grade isn't blind to the actual work: the full LANGUAGE
+ * breakdown (by bytes desc — surfaces e.g. the Python ETL hidden behind a TypeScript
+ * primary) and a README excerpt (what the project actually is). ~2 keyless calls; errors/
+ * rate-limits are swallowed (returns whatever it got), so enrichment never aborts ingest.
+ */
+export async function enrichRepo(repo: string, opts: GithubOpts = {}): Promise<{ languages: string[]; readme_excerpt: string | null }> {
+  const f = opts.fetchFn ?? fetch;
+  const base = opts.baseUrl ?? "https://api.github.com";
+  const headers = ghHeaders(opts);
+
+  let languages: string[] = [];
+  try {
+    const r = await f(`${base}/repos/${repo}/languages`, { headers });
+    if (r.ok) {
+      const j = await r.json();
+      languages = Object.entries(j as Record<string, number>).sort((a, b) => b[1] - a[1]).map(([k]) => k);
+    }
+  } catch { /* leave empty */ }
+
+  let readme_excerpt: string | null = null;
+  try {
+    const r = await f(`${base}/repos/${repo}/readme`, { headers: { ...headers, Accept: "application/vnd.github.raw+json" } });
+    if (r.ok) {
+      let text = await r.text();
+      // Tolerate either raw markdown or the base64-JSON envelope (depends on proxy honoring the raw accept).
+      if (text.startsWith("{")) { try { const j = JSON.parse(text); if (j?.content && j?.encoding === "base64") text = Buffer.from(j.content, "base64").toString("utf8"); } catch { /* keep raw */ } }
+      readme_excerpt = text.slice(0, README_MAX).trim() || null;
+    }
+  } catch { /* leave null */ }
+
+  return { languages, readme_excerpt };
 }
