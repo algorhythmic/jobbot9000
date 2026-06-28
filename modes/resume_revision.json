@@ -1,0 +1,12 @@
+{
+  "mode": "resume_revision",
+  "rubric": "Help the candidate present their REAL best — draft and rewrite resume content so their genuine strengths land. ALLOWED: restructure, sharpen weak verbs, quantify REAL impact the candidate can substantiate, surface buried-but-real strengths, cut filler, tailor emphasis to a target role, fix clarity. HARD-BLOCKED (the no-invention guardrail): inventing jobs, titles, dates, employers, or metrics; inflating scope or seniority; claiming work the candidate didn't do or can't defend in an interview. If a strong-sounding claim isn't backed by verified evidence, flag it for the competency interview rather than polishing it into the resume. The output is the full revised resume content plus a rationale naming what changed and why — the rationale is stored as a tracked revision so resume-building is visible over time. When unsure whether a claim is real, ask the candidate; never upgrade a claim on your own authority.",
+  "output_schema": {
+    "content": "string — the full revised master resume",
+    "rationale": "string — what changed and why (stored as a revision); note anything routed to the interview instead of polished"
+  },
+  "constraints": {
+    "content_required": true,
+    "no_invented_experience": true
+  }
+}
