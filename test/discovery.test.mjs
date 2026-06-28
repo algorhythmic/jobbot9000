@@ -377,7 +377,7 @@ const band = DB.deriveBand();
 eq(band.floor, "junior", "deriveBand: floor = lowest dimension");
 eq(band.confidence, "low", "deriveBand: overall confidence = lowest (skeptical)");
 eq(band.band, "mid", "deriveBand: band = floor of mean rank");
-eq(DB.getAssessmentSummary().band, "mid", "assessment_summary cached on assess");
+eq(DB.assessmentSummary().band, "mid", "assessmentSummary: band derived on read");
 eq(state.readJourneyState().dimensions.profiled, true, "state: profiled dimension flips");
 eq(state.readJourneyState().dimensions.verified, false, "state: unverified until an interview completes");
 
@@ -387,7 +387,7 @@ DB.addInterviewItems(ivId, [{ question: "explain X", answer_summary: "weak", sco
 eq(DB.getOpenInterview().id, ivId, "interview: open session resumable");
 eq(state.readJourneyState().open_interview.id, ivId, "state: surfaces open interview to resume");
 DB.completeInterview(ivId, "junior", "did not hold up");
-eq([DB.getInterview(ivId).status, DB.getAssessmentSummary().verified], ["complete", 1], "interview: complete flips verified");
+eq([DB.getInterview(ivId).status, DB.assessmentSummary().verified], ["complete", true], "interview: complete flips verified");
 eq(state.readJourneyState().dimensions.verified, true, "state: verified after interview completes");
 
 // ════════════════════ v2: upskilling plan (tracked, drives re-match) ════════════════════
@@ -403,10 +403,10 @@ const rfJob = DB.db.prepare("SELECT id FROM jobs LIMIT 1").get().id;
 DB.setRoleFit(rfJob, "under", { system_design: "needs scale" }, "mixed", ["distributed systems"], "a level under; remote-only conflict");
 eq([DB.getRoleFit(rfJob).band, DB.getRoleFit(rfJob).desire_alignment], ["under", "mixed"], "role_fit: stored band + desire alignment");
 
-// ════════════════════ v2: resume revision history (tracked) ════════════════════
-DB.setMasterResume("v1 resume");                            // initial: no rationale -> no revision
-DB.setMasterResume("v2 resume", "quantified real impact");  // coached: tracked
-eq([DB.getResumeRevisions().length, DB.getResumeRevisions()[0].rationale], [1, "quantified real impact"], "resume: coached revision tracked");
+// ════════════════════ v2: resume revision journaled (history via events) ════════════════════
+DB.setMasterResume("v1 resume");                            // initial: no rationale -> not journaled
+DB.setMasterResume("v2 resume", "quantified real impact");  // coached: journaled
+eq(DB.getEvents(50).some((e) => e.kind === "resume_revised" && e.summary === "quantified real impact"), true, "resume: coached revision journaled to events");
 
 // ════════════════════ v2: durability journal ════════════════════
 const evKinds = new Set(DB.getEvents(200).map((e) => e.kind));

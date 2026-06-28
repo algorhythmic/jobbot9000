@@ -4,8 +4,8 @@
 // session reads it (via orient) and resumes, including any open thread (an unfinished
 // interview, in-progress plan items).
 import {
-  getProfile, getMasterResume, getAssessmentSummary, getCompetencyProfile, getOpenInterview,
-  getMeta, counts, applicationCounts, planCounts, type Desires,
+  getProfile, getMasterResume, assessmentSummary, getCompetencyProfile, getOpenInterview,
+  counts, applicationCounts, planCounts, type Desires,
 } from "./db.js";
 
 // To add a dimension: extend this union and add its predicate in readJourneyState.
@@ -34,7 +34,7 @@ export interface JourneyState {
 export function readJourneyState(): JourneyState {
   const profile = getProfile();
   const resume = getMasterResume();
-  const summary = getAssessmentSummary();
+  const summary = assessmentSummary();
   const competency = getCompetencyProfile();
   const open = getOpenInterview();
   const c = counts();

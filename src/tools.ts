@@ -34,8 +34,7 @@ function loadMode(name: string): Mode {
 }
 const MODE = {
   competency: loadMode("competency_profile"),
-  interview: loadMode("competency_interview"),
-  roleInterview: loadMode("role_fit_interview"),
+  interview: loadMode("interview"),
   roleFit: loadMode("role_fit"),
   job: loadMode("job_intrinsic"),
   letter: loadMode("cover_letter"),
@@ -114,20 +113,6 @@ export function marketOverlay(s: State) {
     top_skills: demand.skills,
     note: "what the market asks for — the in-demand skills the user can't yet evidence are the gap to coach and to target with build/learn plan items.",
   };
-}
-
-// A coarse, mechanical desire score for SORTING relevant jobs before the agent judges fit. Honest
-// and rough (0–3): title↔role_types, location/remote↔work_style+locations, comp↔comp_floor. The
-// real desire judgment (with surfaced tension) is the agent's, via assess_role_fit.
-function desireHint(job: { title: string | null; location: string | null; remote: number | null; comp_min: number | null }, d: DB.Desires | null): { score: number; reasons: string[] } | null {
-  if (!d) return null;
-  let score = 0; const reasons: string[] = [];
-  const t = (job.title ?? "").toLowerCase();
-  if (d.role_types?.some((r) => t.includes(r.toLowerCase()))) { score++; reasons.push("title matches a desired role type"); }
-  const wantsRemote = (d.work_style ?? "").toLowerCase().includes("remote");
-  if ((wantsRemote && job.remote === 1) || d.locations?.some((l) => (job.location ?? "").toLowerCase().includes(l.toLowerCase()))) { score++; reasons.push("location/remote matches"); }
-  if (d.comp_floor != null && job.comp_min != null && job.comp_min >= d.comp_floor) { score++; reasons.push("meets comp floor"); }
-  return { score, reasons };
 }
 
 export interface JobFilterArgs { query?: string; titles_any?: string[]; location?: string; remote?: boolean }
@@ -227,8 +212,6 @@ export function registerTools(server: McpServer): void {
     if (s.dimensions.profiled) {
       base.competency_profile = s.competency;
       base.assessment = s.assessment;
-      const fit = DB.getFitnessHistory(2);
-      if (fit.length === 2 && fit[0].band !== fit[1].band) notes.push(`fitness moved: ${fit[1].band} → ${fit[0].band} (most recent first).`);
       if (!s.dimensions.verified) notes.push(`profile band '${s.assessed_level}' is UNVERIFIED (no interview) — confidence is capped low. Run a competency interview to establish it; treat the floor '${s.assessment?.floor}' as the honest read until then.`);
     } else {
       notes.push("no competency profile yet — assess_competency per dimension (then verify in an interview).");
@@ -244,7 +227,7 @@ export function registerTools(server: McpServer): void {
   // ── look: the one read door (never fetches, never writes) ──────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit + a coarse desire hint; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='resume' (+ revision history; with_market_overlay adds computed demand). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (latest session, or interview_id; its Q/A/exemplars/deltas). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='resume' (with_market_overlay adds computed demand; revision history is in at='history'). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (latest session, or interview_id; its Q/A/exemplars/deltas). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
     inputSchema: {
       at: enumOf(["jobs", "companies", "resume", "portfolio", "profile", "competency", "interview", "plan", "packet", "applications", "history"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
@@ -275,12 +258,11 @@ export function registerTools(server: McpServer): void {
 
     if (a.at === "resume") {
       const resume = DB.getMasterResume();
-      const revisions = DB.getResumeRevisions();
       if (!resume) {
-        if (s.profile?.no_resume) return json({ opted_out: true, note: "The user opted out of a resume — coach from the interview + described experience. Build one anytime via revise_resume." });
-        return json({ note: "no resume yet — capture via capture_profile, or build one via revise_resume." });
+        if (s.profile?.no_resume) return json({ opted_out: true, note: "The user opted out of a resume — coach from the interview + described experience. Build one anytime via set_resume." });
+        return json({ note: "no resume yet — capture via capture_profile, or build one via set_resume." });
       }
-      const out: Record<string, unknown> = { resume: resume.content, updated_at: resume.updated_at, revisions };
+      const out: Record<string, unknown> = { resume: resume.content, updated_at: resume.updated_at };
       if (a.with_market_overlay) out.market_overlay = marketOverlay(s);
       return json(out);
     }
@@ -316,7 +298,7 @@ export function registerTools(server: McpServer): void {
       const derived = DB.deriveBand(profile);
       const assessed = new Set(profile.map((p) => p.dimension));
       const missing = DIMENSION.filter((d) => !assessed.has(d));
-      const out: Record<string, unknown> = { profile, band: DB.getAssessmentSummary() ?? derived, dimensions_missing: missing };
+      const out: Record<string, unknown> = { profile, band: DB.assessmentSummary() ?? derived, dimensions_missing: missing };
       const notes: string[] = [];
       if (profile.length === 0) notes.push("no competency profile yet — assess each dimension with assess_competency (skeptically; absence ≠ low level).");
       else if (missing.length) notes.push(`${missing.join(", ")} not yet assessed.`);
@@ -402,10 +384,8 @@ export function registerTools(server: McpServer): void {
          WHERE j.still_live=1 AND j.grade_seniority IN (${band.map(() => "?").join(",")})${flt.where.length ? " AND " + flt.where.join(" AND ") : ""}
          ORDER BY j.last_seen_at DESC LIMIT ?`,
       ).all(...band, ...flt.args, limit) as any[];
-      const desires = s.profile?.desires ?? null;
-      const jobs = rows.map(({ fit_gaps_json, ...r }) => ({ ...r, fit_gaps: fit_gaps_json ? JSON.parse(fit_gaps_json) : null, desire_hint: desireHint(r, desires) }))
-        .sort((x, y) => (y.desire_hint?.score ?? 0) - (x.desire_hint?.score ?? 0));
-      return json({ band, jobs, note: "fit (over/exact/under) is your judgment via assess_role_fit; desire_hint is a coarse sort by stated desires. Grade fit to surface real tension (fitness vs. desire)." });
+      const jobs = rows.map(({ fit_gaps_json, ...r }) => ({ ...r, fit_gaps: fit_gaps_json ? JSON.parse(fit_gaps_json) : null }));
+      return json({ band, jobs, note: "fit (over/exact/under) + desire_alignment are your judgment via assess_role_fit — grade them to surface the real tension (fitness vs. desire). The user's desires are in look({ at: 'profile' })." });
     }
 
     if (scope === "worklist") {
@@ -470,17 +450,14 @@ export function registerTools(server: McpServer): void {
     return json({ ok: true, state: readJourneyState() });
   });
 
-  server.registerTool("replace_master_resume", {
-    description: "Replace the master resume wholesale (the user's own edit landing as-is). For a COACHED revision that should be tracked with a rationale, use revise_resume instead. Read back via look({ at: 'resume' }).",
-    inputSchema: { content: z.string().min(1) },
-  }, async (a) => { DB.setMasterResume(a.content); return json({ ok: true, updated: DB.getMasterResume()?.updated_at }); });
-
-  server.registerTool("revise_resume", {
-    description: `Draft/rewrite the master resume to present the user's REAL best, tracked as a revision. → personal. Mode: resume_revision. ALLOWED: restructure, sharpen, quantify REAL impact, surface buried strengths, tailor to a role. BLOCKED: invent jobs/titles/dates/metrics or inflate scope (the no-invention guardrail) — route unbacked-but-strong claims to the competency interview instead. content = the full revised resume; rationale = what changed (stored in the revision history).`,
-    inputSchema: { content: z.string().min(1), rationale: z.string().min(1) },
+  server.registerTool("set_resume", {
+    description: `Set the master resume. → personal. Without a rationale it's the user's own wholesale edit, landing as-is. WITH a rationale it's a COACHED revision (Mode: resume_revision) — journaled to the history (look at:'history'). ALLOWED when revising: restructure, sharpen, quantify REAL impact, surface buried strengths, tailor to a role. BLOCKED: invent jobs/titles/dates/metrics or inflate scope (the no-invention guardrail) — route unbacked-but-strong claims to the competency interview instead. Read back via look({ at: 'resume' }).`,
+    inputSchema: { content: z.string().min(1), rationale: z.string().optional() },
   }, async (a) => {
     DB.setMasterResume(a.content, a.rationale);
-    return json({ ok: true, updated: DB.getMasterResume()?.updated_at, note: "revision saved to history. Remember: only real, defensible claims — anything unbacked belongs in the interview, not the resume." });
+    const out: Record<string, unknown> = { ok: true, updated: DB.getMasterResume()?.updated_at };
+    if (a.rationale) out.note = "coached revision journaled. Only real, defensible claims — anything unbacked belongs in the interview, not the resume.";
+    return json(out);
   });
 
   server.registerTool("add_portfolio_project", {
@@ -514,7 +491,7 @@ export function registerTools(server: McpServer): void {
 
   // ── interview (the engine: assess + verify + upskill; repeatable, resumable) ─
   server.registerTool("record_interview", {
-    description: `Record a competency or role-fit interview — the engine that ASSESSES (primary evidence for no-portfolio candidates), VERIFIES (catches over-claiming), and UPSKILLS (each item carries a grounded exemplar — 'what a great candidate would have said' — and the delta). → personal. type: ${INTERVIEW_TYPE.join(" | ")} (role_fit needs job_id; its exemplars are anchored to that posting's bar). Resumable: appends to the open interview of this type, or starts one. Set done:true (with a summary) to complete it; verified_ceiling caps/establishes the level. Modes: competency_interview / role_fit_interview. After completing, re-run assess_competency with the now-demonstrated evidence and turn deltas into plan items (recommend_upskilling).`,
+    description: `Record a competency or role-fit interview — the engine that ASSESSES (primary evidence for no-portfolio candidates), VERIFIES (catches over-claiming), and UPSKILLS (each item carries a grounded exemplar — 'what a great candidate would have said' — and the delta). → personal. type: ${INTERVIEW_TYPE.join(" | ")} (role_fit needs job_id; its exemplars are anchored to that posting's bar). Resumable: appends to the open interview of this type, or starts one. Set done:true (with a summary) to complete it; verified_ceiling caps/establishes the level. Mode: interview. After completing, re-run assess_competency with the now-demonstrated evidence and turn deltas into plan items (recommend_upskilling).`,
     inputSchema: {
       type: enumOf(INTERVIEW_TYPE),
       job_id: z.number().int().optional(),
