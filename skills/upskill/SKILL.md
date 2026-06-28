@@ -18,7 +18,7 @@ This is the flywheel: the interview surfaced gaps and the bar; now turn them int
 - Keep it short and achievable — a plan that moves the needle, not a wish list.
 
 ## Rebuild the resume (real evidence only)
-- `revise_resume({ content, rationale })` drafts/rewrites the master resume and tracks the revision. ALLOWED: restructure, sharpen verbs, quantify REAL impact, surface buried strengths, tailor to a target role. **BLOCKED (the guardrail): invent jobs/titles/dates/metrics or inflate scope.** If a strong-sounding claim isn't backed, route it to the competency interview instead of polishing it in. When unsure a claim is real, ask the user.
+- `set_resume({ content, rationale })` drafts/rewrites the master resume; the rationale marks it a coached revision and journals it (history in `look({ at: 'history' })`). ALLOWED: restructure, sharpen verbs, quantify REAL impact, surface buried strengths, tailor to a target role. **BLOCKED (the guardrail): invent jobs/titles/dates/metrics or inflate scope.** If a strong-sounding claim isn't backed, route it to the competency interview instead of polishing it in. When unsure a claim is real, ask the user.
 
 ## Track progress → re-match (close the loop)
 - `update_plan_progress({ item_id, status })` — `suggested → in_progress → done`. Find ids via `look({ at: 'plan' })`.

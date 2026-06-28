@@ -54,12 +54,6 @@ CREATE TABLE IF NOT EXISTS master_resume (
   content    TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS resume_revisions (          -- append-only history: how the resume evolved
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  content    TEXT NOT NULL,
-  rationale  TEXT,                                     -- why this revision (the coaching applied)
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 CREATE TABLE IF NOT EXISTS portfolio_projects (
   repo       TEXT PRIMARY KEY,                         -- github: "owner/name"; manual: a bare name (no slash)
   facts_json TEXT,
@@ -84,21 +78,6 @@ CREATE TABLE IF NOT EXISTS competency_profile (
   evidence_json TEXT,                                   -- [{ claim, provenance, verified }]
   rationale     TEXT,
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS assessment_summary (        -- cached derived overall band/confidence/floor + verified flag
-  id         INTEGER PRIMARY KEY CHECK (id = 1),
-  band       TEXT,
-  confidence TEXT,
-  floor      TEXT,
-  verified   INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS fitness_snapshots (          -- append-only: band + per-dim levels over time → improvement
-  id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  band      TEXT,
-  confidence TEXT,
-  dims_json TEXT,                                        -- { dimension: level }
-  taken_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS interviews (                 -- a competency or role-fit interview SESSION (resumable)
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,21 +258,15 @@ export function upsertProfile(p: Partial<Omit<Profile, "desires">> & { desires?:
 
 export const getMasterResume = (): { content: string; updated_at: string } | undefined =>
   db.prepare("SELECT content, updated_at FROM master_resume WHERE id = 1").get() as { content: string; updated_at: string } | undefined;
-// Set the master resume and, when a rationale is given (a coached revision rather than the
-// initial capture), append it to the version history so resume-building is tracked over time.
+// Set the master resume. A `rationale` marks a COACHED revision (vs. the user's own wholesale
+// edit) and is journaled to events — that journal IS the resume-revision history.
 export const setMasterResume = (content: string, rationale?: string | null): void => {
   db.prepare(
     `INSERT INTO master_resume (id, content, updated_at) VALUES (1, ?, datetime('now'))
      ON CONFLICT(id) DO UPDATE SET content=excluded.content, updated_at=datetime('now')`,
   ).run(content);
-  if (rationale !== undefined) {
-    db.prepare("INSERT INTO resume_revisions (content, rationale) VALUES (?, ?)").run(content, rationale ?? null);
-    logEvent("resume_revised", rationale ?? "resume revised");
-  }
+  if (rationale !== undefined) logEvent("resume_revised", rationale ?? "resume revised");
 };
-export interface ResumeRevision { id: number; rationale: string | null; created_at: string }
-export const getResumeRevisions = (): ResumeRevision[] =>
-  db.prepare("SELECT id, rationale, created_at FROM resume_revisions ORDER BY id DESC").all() as ResumeRevision[];
 
 // ── portfolio ────────────────────────────────────────────────────────────────
 export interface PortfolioProject { repo: string; facts_json: string | null; source: string; fetched_at: string }
@@ -344,21 +317,16 @@ export const getCompetencyProfile = (): Competency[] =>
     { dimension: string; level: string; confidence: string; evidence_json: string | null; rationale: string | null; updated_at: string }[])
     .map((r) => ({ dimension: r.dimension, level: r.level, confidence: r.confidence, evidence: r.evidence_json ? JSON.parse(r.evidence_json) : [], rationale: r.rationale, updated_at: r.updated_at }));
 
-// Set one dimension's judgment, refresh the cached summary, and snapshot fitness so the
-// trajectory is preserved. Appends a journal event.
+// Set one dimension's judgment and journal it (the 'assessed' events ARE the fitness
+// trajectory — read them via look(history)). The overall band is derived, not cached.
 export function setCompetency(dimension: string, level: string, confidence: string, evidence: unknown, rationale: string): void {
-  const tx = db.transaction(() => {
-    db.prepare(
-      `INSERT INTO competency_profile (dimension, level, confidence, evidence_json, rationale, updated_at)
-       VALUES (?, ?, ?, ?, ?, datetime('now'))
-       ON CONFLICT(dimension) DO UPDATE SET level=excluded.level, confidence=excluded.confidence,
-         evidence_json=excluded.evidence_json, rationale=excluded.rationale, updated_at=datetime('now')`,
-    ).run(dimension, level, confidence, JSON.stringify(evidence ?? []), rationale);
-    refreshAssessmentSummary();
-    snapshotFitness();
-    logEvent("assessed", `${dimension} → ${level} (confidence ${confidence})`, dimension);
-  });
-  tx();
+  db.prepare(
+    `INSERT INTO competency_profile (dimension, level, confidence, evidence_json, rationale, updated_at)
+     VALUES (?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(dimension) DO UPDATE SET level=excluded.level, confidence=excluded.confidence,
+       evidence_json=excluded.evidence_json, rationale=excluded.rationale, updated_at=datetime('now')`,
+  ).run(dimension, level, confidence, JSON.stringify(evidence ?? []), rationale);
+  logEvent("assessed", `${dimension} → ${level} (confidence ${confidence})`, dimension);
 }
 
 // Derive the overall band from the dimensions: band = conservative (floor of the mean rank),
@@ -375,32 +343,16 @@ export function deriveBand(profile: Competency[] = getCompetencyProfile()): Deri
   return { band, floor, confidence: CONFIDENCE_ORDER[confIdx], dims: profile.length };
 }
 
-export interface AssessmentSummary { band: string | null; confidence: string | null; floor: string | null; verified: number; updated_at: string | null }
-export const getAssessmentSummary = (): AssessmentSummary | undefined =>
-  db.prepare("SELECT band, confidence, floor, verified, updated_at FROM assessment_summary WHERE id = 1").get() as AssessmentSummary | undefined;
-// Recompute the cached summary from the dimensions + interview state. `verified` is true once
-// at least one interview is complete (that's what earns the profile beyond self-report).
-function refreshAssessmentSummary(): void {
+// The overall assessment, DERIVED on read (no cache): band/floor/confidence from the
+// dimensions, `verified` true once any interview is complete (what earns the profile beyond
+// self-report). null until at least one dimension is assessed.
+export interface AssessmentSummary { band: string | null; confidence: string | null; floor: string | null; verified: boolean }
+export function assessmentSummary(): AssessmentSummary | null {
   const d = deriveBand();
-  const verified = (db.prepare("SELECT count(*) c FROM interviews WHERE status='complete'").get() as { c: number }).c > 0 ? 1 : 0;
-  db.prepare(
-    `INSERT INTO assessment_summary (id, band, confidence, floor, verified, updated_at)
-     VALUES (1, ?, ?, ?, ?, datetime('now'))
-     ON CONFLICT(id) DO UPDATE SET band=excluded.band, confidence=excluded.confidence, floor=excluded.floor,
-       verified=excluded.verified, updated_at=datetime('now')`,
-  ).run(d?.band ?? null, d?.confidence ?? null, d?.floor ?? null, verified);
+  if (!d) return null;
+  const verified = (db.prepare("SELECT count(*) c FROM interviews WHERE status='complete'").get() as { c: number }).c > 0;
+  return { band: d.band, confidence: d.confidence, floor: d.floor, verified };
 }
-
-export interface FitnessSnapshot { id: number; band: string | null; confidence: string | null; dims: Record<string, string>; taken_at: string }
-function snapshotFitness(): void {
-  const d = deriveBand();
-  const dims = Object.fromEntries(getCompetencyProfile().map((c) => [c.dimension, c.level]));
-  db.prepare("INSERT INTO fitness_snapshots (band, confidence, dims_json) VALUES (?, ?, ?)").run(d?.band ?? null, d?.confidence ?? null, JSON.stringify(dims));
-}
-export const getFitnessHistory = (limit = 50): FitnessSnapshot[] =>
-  (db.prepare("SELECT id, band, confidence, dims_json, taken_at FROM fitness_snapshots ORDER BY id DESC LIMIT ?").all(limit) as
-    { id: number; band: string | null; confidence: string | null; dims_json: string | null; taken_at: string }[])
-    .map((r) => ({ id: r.id, band: r.band, confidence: r.confidence, dims: r.dims_json ? JSON.parse(r.dims_json) : {}, taken_at: r.taken_at }));
 
 // ── interviews (resumable; the assess + verify + upskill engine) ─────────────
 export interface Interview { id: number; type: string; job_id: number | null; status: string; verified_ceiling: string | null; summary: string | null; started_at: string; updated_at: string }
@@ -436,7 +388,6 @@ export const getInterviewItems = (interviewId: number): InterviewItem[] =>
 export function completeInterview(interviewId: number, verifiedCeiling: string | null, summary: string): void {
   db.prepare("UPDATE interviews SET status='complete', verified_ceiling=?, summary=?, updated_at=datetime('now') WHERE id=?")
     .run(verifiedCeiling, summary, interviewId);
-  refreshAssessmentSummary(); // completing an interview flips `verified`
   logEvent("interviewed", `completed interview ${interviewId}${verifiedCeiling ? ` (verified_ceiling ${verifiedCeiling})` : ""}`, String(interviewId));
 }
 

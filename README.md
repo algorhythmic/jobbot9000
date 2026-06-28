@@ -38,7 +38,7 @@ flowchart LR
 
 - **The agent is the brain; the server is senses + memory.** It reads the live market straight from company ATS boards and public GitHub, holds the journey in an embedded SQLite DB, and coaches honestly against real demand. It does not think — your agent does.
 - **You bring the model; the server holds none** — no keys, tokens, or login. Single-tenant, local. That's why it's an MCP server, not a hosted app.
-- **Durable & resumable.** State and the full history live in SQLite under the plugin's persistent data dir (survives sessions *and* plugin updates). History is *kept*, not overwritten — versioned fitness/resume snapshots + an append-only journal — so a months-long search never loses progress. **Every session starts with `orient`, which rehydrates state and surfaces open threads to resume.**
+- **Durable & resumable.** State and the full history live in SQLite under the plugin's persistent data dir (survives sessions *and* plugin updates). An append-only **journal** records every meaningful step (assessments, interviews, plan changes, applications…), so a months-long search never loses progress and the whole timeline is reconstructable. **Every session starts with `orient`, which rehydrates state and surfaces open threads to resume.**
 
 Two rules hold everywhere:
 
@@ -49,7 +49,7 @@ Two rules hold everywhere:
 
 **Two data planes:** **Personal** (profile, desires, resume, competency profile, interviews, plan, applications, journal) is **always local, never shared.** **Catalog** (companies + their live jobs — public market data) is local. Nothing leaves the machine.
 
-## The surface — 16 tools
+## The surface — 15 tools
 
 **Three doors:**
 
@@ -57,18 +57,17 @@ Two rules hold everywhere:
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`market`/`relevant`/`worklist`), `companies`, `resume`, `portfolio`, `profile`, `competency`, `interview`, `plan`, `packet`, `applications`, `history`.
 - **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull live ATS boards), `ingest_portfolio` (public GitHub repos + verification signals).
 
-**Thirteen writes** — six mechanical, seven judgment (each governed by a mode):
+**Twelve writes** — five mechanical, seven judgment (each governed by a mode):
 
 | Tool | Plane | Mode |
 |---|---|---|
 | `capture_profile` | personal | — (identity + **desires**) |
-| `replace_master_resume` | personal | — (wholesale user edit) |
-| `revise_resume` | personal | `resume_revision` (draft from real evidence; tracked) |
+| `set_resume` | personal | `resume_revision` when a rationale is given (a coached revision, journaled); else a wholesale user edit |
 | `add_portfolio_project` | personal | — (a described/private project; added **unverified**) |
 | `record_application` | personal | — (reported status) |
 | `update_plan_progress` | personal | — (suggested → in_progress → done) |
 | `assess_competency` | personal | `competency_profile` (per-dimension; skeptical; absence ≠ low level) |
-| `record_interview` | personal | `competency_interview` / `role_fit_interview` |
+| `record_interview` | personal | `interview` (competency or role-fit) |
 | `grade_job` | catalog | `job_intrinsic` |
 | `assess_role_fit` | personal | `role_fit` (per-dimension + desire alignment) |
 | `grade_portfolio_project` | personal | `portfolio_relevance` |
@@ -100,7 +99,7 @@ claude --plugin-dir /path/to/jobbot9000
 /plugin install jobbot9000@jobbot9000
 ```
 
-Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 16 tools`.
+Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 15 tools`.
 
 On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir and builds it; it no-ops afterward. First-run setup compiles a native dependency, so it takes a moment.
 
