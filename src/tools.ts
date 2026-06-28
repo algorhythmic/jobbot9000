@@ -41,6 +41,7 @@ const MODE = {
   portfolio: loadMode("portfolio_relevance"),
   plan: loadMode("upskilling_plan"),
   resume: loadMode("resume_revision"),
+  outreach: loadMode("outreach"),
 };
 const vocab = (m: Mode, key: string): string[] => {
   const v = m.constraints[key];
@@ -179,6 +180,10 @@ export function registerTools(server: McpServer): void {
       const total = Object.values(s.pipeline).reduce((x, y) => x + y, 0);
       base.pipeline_summary = `${total} application(s): ${Object.entries(s.pipeline).map(([k, v]) => `${v} ${k}`).join(", ")}.`;
     }
+    if (s.dimensions.has_outreach) {
+      const total = Object.values(s.outreach).reduce((x, y) => x + y, 0);
+      base.outreach_summary = `${total} outreach message(s): ${Object.entries(s.outreach).map(([k, v]) => `${v} ${k}`).join(", ")}. The user sends; jobbot never does. See look({ at: 'outreach' }).`;
+    }
 
     if (detail === "recommend") {
       const conf = s.assessment?.confidence;
@@ -227,9 +232,9 @@ export function registerTools(server: McpServer): void {
   // ── look: the one read door (never fetches, never writes) ──────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='resume' (with_market_overlay adds computed demand; revision history is in at='history'). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (latest session, or interview_id; its Q/A/exemplars/deltas). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='resume' (with_market_overlay adds computed demand; revision history is in at='history'). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (latest session, or interview_id; its Q/A/exemplars/deltas). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='outreach' (drafted warm-outreach messages by status — draft/sent). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
     inputSchema: {
-      at: enumOf(["jobs", "companies", "resume", "portfolio", "profile", "competency", "interview", "plan", "packet", "applications", "history"]),
+      at: enumOf(["jobs", "companies", "resume", "portfolio", "profile", "competency", "interview", "plan", "packet", "applications", "outreach", "history"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
       query: z.string().optional(),
       titles_any: z.array(z.string()).optional(),
@@ -362,6 +367,13 @@ export function registerTools(server: McpServer): void {
       const applications = DB.getApplications();
       const out: Record<string, unknown> = { pipeline: DB.applicationCounts(), applications };
       if (applications.length === 0) out.note = "no applications tracked yet — record one after the user applies.";
+      return json(out);
+    }
+
+    if (a.at === "outreach") {
+      const outreach = DB.getOutreach();
+      const out: Record<string, unknown> = { counts: DB.outreachCounts(), outreach };
+      if (outreach.length === 0) out.note = "no outreach drafted yet — for a target company, draft a warm 'problem + project' message with record_outreach (the user sends it; jobbot never does).";
       return json(out);
     }
 
@@ -627,6 +639,37 @@ export function registerTools(server: McpServer): void {
     if (!DB.getJob(a.job_id)) return noJob(a.job_id);
     DB.recordApplication(a.job_id, { status: a.status, applied_at: a.applied_at, next_action: a.next_action, next_action_at: a.next_action_at, notes: a.notes });
     return json({ ok: true, job_id: a.job_id, status: a.status, pipeline: DB.applicationCounts() });
+  });
+
+  // ── outreach (personal, mode-governed) — DRAFT-ONLY warm messages ──────────
+  server.registerTool("record_outreach", {
+    description: `Draft a WARM outreach message to a person at a target company — DRAFT ONLY; jobbot NEVER sends, the user sends it themselves. → personal. Mode: outreach (lead with a specific problem/initiative at the company you can help with + ONE project from the graded portfolio as evidence; customized, grounded, ${MODE.outreach.constraints.no_invented_experience ? "no invented experience" : "stay grounded"}). Needs company_id (from look({ at: 'companies' })); contact_name/role/url, job_id, angle, anchor_repo optional. Pass outreach_id to revise a draft or mark it status:'sent' after the user sends. Read drafts via look({ at: 'outreach' }).`,
+    inputSchema: {
+      company_id: z.number().int(),
+      message: z.string().min(1).optional(), // required for a new draft; optional when updating (outreach_id) e.g. to mark sent
+      contact_name: z.string().optional(),
+      contact_role: z.string().optional(),
+      contact_url: z.string().optional(),
+      job_id: z.number().int().optional(),
+      angle: z.string().optional(),
+      anchor_repo: z.string().optional(),
+      status: enumOf(["draft", "sent"]).optional(),
+      outreach_id: z.number().int().optional(),
+    },
+  }, async (a) => {
+    if (a.outreach_id === undefined && !a.message) return json({ ok: false, error: "message is required to draft new outreach (it's the message body). Pass outreach_id to update an existing draft." });
+    const company = DB.db.prepare("SELECT name FROM companies WHERE id=?").get(a.company_id) as { name: string } | undefined;
+    if (!company) return json({ ok: false, error: `no company ${a.company_id} — list companies via look({ at: 'companies' }).` });
+    if (a.job_id !== undefined && !DB.getJob(a.job_id)) return noJob(a.job_id);
+    const id = DB.recordOutreach(a.outreach_id, {
+      company_id: a.company_id, message: a.message, job_id: a.job_id, contact_name: a.contact_name,
+      contact_role: a.contact_role, contact_url: a.contact_url, angle: a.angle, anchor_repo: a.anchor_repo, status: a.status,
+    });
+    const out: Record<string, unknown> = { ok: true, outreach_id: id, company: company.name, status: a.status ?? "draft", outreach: DB.outreachCounts() };
+    if (a.anchor_repo && !DB.getPortfolio().some((p) => p.repo === a.anchor_repo))
+      out.note = `anchor_repo '${a.anchor_repo}' isn't in the portfolio — feature a real project (look at:'portfolio'); don't cite work that isn't there.`;
+    else out.next = "draft saved — the USER sends it (jobbot never does). After they send, call again with this outreach_id and status:'sent'.";
+    return json(out);
   });
 
   // ── gather: the one door to the outside world (sync cut in v2) ─────────────

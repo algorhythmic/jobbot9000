@@ -49,7 +49,7 @@ Two rules hold everywhere:
 
 **Two data planes:** **Personal** (profile, desires, resume, competency profile, interviews, plan, applications, journal) is **always local, never shared.** **Catalog** (companies + their live jobs — public market data) is local. Nothing leaves the machine.
 
-## The surface — 15 tools
+## The surface — 16 tools
 
 **Three doors:**
 
@@ -57,7 +57,7 @@ Two rules hold everywhere:
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`market`/`relevant`/`worklist`), `companies`, `resume`, `portfolio`, `profile`, `competency`, `interview`, `plan`, `packet`, `applications`, `history`.
 - **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull live ATS boards), `ingest_portfolio` (public GitHub repos + verification signals).
 
-**Twelve writes** — five mechanical, seven judgment (each governed by a mode):
+**Thirteen writes** — five mechanical, eight judgment (each governed by a mode):
 
 | Tool | Plane | Mode |
 |---|---|---|
@@ -73,12 +73,13 @@ Two rules hold everywhere:
 | `grade_portfolio_project` | personal | `portfolio_relevance` |
 | `recommend_upskilling` | personal | `upskilling_plan` (learn/resume/build, market-grounded) |
 | `record_cover_letter` | personal | `cover_letter` (gated on verified confidence) |
+| `record_outreach` | personal | `outreach` (draft-only warm message; jobbot never sends) |
 
 The competency profile is **multi-dimensional** — `technical_depth`, `system_design`, `communication`, `ownership` — each with a level, confidence, and provenance-tagged evidence; the overall band is derived.
 
 ## The skills
 
-Five playbooks, invoked automatically by their `description` (and as `/jobbot9000:<name>`): **coach** (onboard + assess), **verify** (the competency interview), **upskill** (plan + resume + projects), **job-search** (discover + grade + match), **application** (rehearse + apply + track). Each opens with `orient`, so any session resumes the loop.
+Six playbooks, invoked automatically by their `description` (and as `/jobbot9000:<name>`): **coach** (onboard + assess), **verify** (the competency interview), **upskill** (plan + resume + projects), **job-search** (discover + grade + match), **application** (rehearse + apply + track), and **outreach** (draft a warm "problem + project" message the user sends themselves — jobbot never sends). Each opens with `orient`, so any session resumes the loop.
 
 Company discovery and live job fetching are **keyless and free by default**; TheirStack is an **opt-in paid accelerator** (`THEIRSTACK_API_KEY`, count-first, credit-ceiling-gated). Greenhouse / Ashby / Lever are verified against live boards; Workable is best-effort.
 
@@ -99,7 +100,7 @@ claude --plugin-dir /path/to/jobbot9000
 /plugin install jobbot9000@jobbot9000
 ```
 
-Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 15 tools`.
+Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 16 tools`.
 
 On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir and builds it; it no-ops afterward. First-run setup compiles a native dependency, so it takes a moment.
 
@@ -134,7 +135,7 @@ src/
   ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
   github.ts                  keyless GitHub sense — public repos + verification signals (authorship/traction/badges)
 seeds/                       curated company roster (free default for find_companies); ships empty
-skills/                      bundled skills: coach / verify / upskill / job-search / application
+skills/                      bundled skills: coach / verify / upskill / job-search / application / outreach
 modes/                       grading modes (rubric + schema) for the judgment writes
 hooks/, scripts/             SessionStart bootstrap (install + build on first run)
 ```
