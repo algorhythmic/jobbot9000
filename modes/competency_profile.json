@@ -1,0 +1,18 @@
+{
+  "mode": "competency_profile",
+  "rubric": "Judge ONE competency dimension on the ladder intern < junior < mid < senior < staff < principal — skeptically and per dimension, so ability is a profile, not a single number. Dimensions: technical_depth (depth + correctness of what they build), system_design (decomposition, tradeoffs, operating at scale), communication (explaining decisions, written + verbal clarity), ownership (driving work end-to-end, autonomy, judgment). A resume/portfolio is a CLAIM; weight evidence by provenance: 'corroborated' (third party — real users, external contributors, a named employer) > 'demonstrated' (verified — explained under questioning in an interview, authorship confirmed, the thing runs) > 'self_published' (README/site/vanity metrics) > 'claimed' (bare assertion). CRITICAL: absence of public evidence is NOT evidence of weakness — a strong engineer may simply have no public portfolio. When you have little evidence for a dimension, set CONFIDENCE low and let the interview establish the level; do NOT default the LEVEL down for lack of artifacts. Only CONTRADICTED claims (the candidate couldn't defend it, or it isn't their work) lower a level. confidence='high' requires demonstrated/corroborated evidence (normally an interview); documents or absence alone cap at 'low'.",
+  "output_schema": {
+    "dimension": "one of: technical_depth | system_design | communication | ownership",
+    "level": "one of the ladder — the best-supported estimate for THIS dimension",
+    "confidence": "low | medium | high — high needs demonstrated/corroborated evidence",
+    "evidence": "[{ claim, provenance: claimed|self_published|demonstrated|corroborated, verified: boolean }]",
+    "rationale": "string — name what is verified vs. merely claimed for this dimension"
+  },
+  "constraints": {
+    "dimension_must_be_one_of": ["technical_depth", "system_design", "communication", "ownership"],
+    "level_must_be_one_of": ["intern", "junior", "mid", "senior", "staff", "principal"],
+    "confidence_must_be_one_of": ["low", "medium", "high"],
+    "provenance_must_be_one_of": ["claimed", "self_published", "demonstrated", "corroborated"],
+    "rationale_required": true
+  }
+}

@@ -1,11 +1,12 @@
-// tools.ts — the MCP surface (see the README). The agent calls these in any order.
-// Nine tools: three doors over uniform data (orient / look / gather) plus six
-// named writes. Invariants: the agent never writes the DB (tools do, via db.ts);
-// judgment enters only through a named structured-write tool whose closed
-// vocabularies are z.enums built from a grading mode, so the agent sees the valid
-// values and the mode is the single source of truth. No tool uses a union input
-// schema (max client compatibility); conditional requirements degrade with an
-// honest note rather than throwing, so every tool is safe in any call order.
+// tools.ts — the MCP surface (v2: the readiness loop). The agent calls these in any order.
+// Three doors over uniform data (orient / look / gather) plus the writes. Invariants hold:
+// the agent never writes the DB (db.ts does); judgment enters only through a named write whose
+// closed vocabularies are z.enums built from a grading mode (the mode is the single source of
+// truth); no union input schemas; every tool degrades with an honest note rather than throwing.
+// New in v2: a multi-dimensional competency profile (fair to no-portfolio candidates — absence
+// lowers CONFIDENCE, not the level), a repeatable interview that assesses + verifies + upskills,
+// fitness×desire matching, a tracked upskilling plan, resume-building, and a durable journal so a
+// months-long search resumes from the DB after any session ends.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readFileSync } from "node:fs";
@@ -13,111 +14,59 @@ import * as DB from "./db.js";
 import { readJourneyState } from "./state.js";
 import { resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
 import { fetchUserRepos, enrichRepo, type RepoFacts } from "./github.js";
-import { getPool, type PoolAdapter } from "./pool.js";
-import type { CatalogSnapshot, SnapshotJob, SnapshotCompany } from "./db.js";
 import { PROVIDERS, type DiscoverQuery, type DiscoveredCompany, type ProviderContext } from "./providers.js";
 
 type State = ReturnType<typeof readJourneyState>;
 
-// Per-run spend ceiling for paid discovery — the confirmation gate the TheirStack API
-// itself doesn't provide (handoff §6). A run estimates cost (records × rate) for free
-// first; above this it returns the estimate and waits for confirm:true rather than spend.
+// Per-run spend ceiling for paid discovery (the gate TheirStack itself doesn't provide).
 const MAX_CREDITS_PER_RUN = Number(process.env.THEIRSTACK_MAX_CREDITS_PER_RUN ?? 150);
-// Discovery providers read their key from the local env (a data-source sense — NOT the
-// model key, which never enters this passive server). Auto-recharge is never touched.
 const providerContext = (): ProviderContext => ({ apiKey: process.env.THEIRSTACK_API_KEY });
 
-// Capability flags — flip these on as the external integrations land, and replace
-// the matching gather() step's planned() with the real persister. They keep every
-// tool honest about what isn't available yet instead of pointing at inert stubs.
-// WHEN YOU ENABLE A STEP (any flag): also update the "Availability"/"Next"
-// notes in the three skills (skills/{coach,job-search,application}/SKILL.md). The
-// runtime self-corrects (pending_tools drops the step), but the skill prose — which
-// says the step is "next/pending" — does not, so refresh it to match.
-// Discovery splits into two steps with opposite cost profiles (see the dev handoff
-// §5): find_companies (lead-gen → ATS-slug resolution) is the priced/built arm;
-// fetch_jobs (keyless per-slug ATS pull) lands next. They flip independently.
-const FIND_COMPANIES_AVAILABLE = true;    // gather: find_companies — lead-gen + ATS-slug resolution
-const FETCH_JOBS_AVAILABLE = true;        // gather: fetch_jobs — live ATS board → raw jobs
-const PORTFOLIO_INGEST_AVAILABLE = true;  // gather: ingest_portfolio — public GitHub repos
-const SYNC_AVAILABLE = true;              // gather: sync_catalog — bidirectional pool sync
-const pendingSteps = (): string[] => [
-  ...(!FIND_COMPANIES_AVAILABLE ? ["find_companies"] : []),
-  ...(!FETCH_JOBS_AVAILABLE ? ["fetch_jobs"] : []),
-  ...(!PORTFOLIO_INGEST_AVAILABLE ? ["ingest_portfolio"] : []),
-  ...(!SYNC_AVAILABLE ? ["sync_catalog"] : []),
-];
-const pendingTools = (): string[] => pendingSteps().map((s) => `gather(${s})`);
+// All three gather steps are wired and keyless-by-default; sync was cut in v2. pendingTools
+// stays so a future gated step can re-use the honest "not yet" plumbing.
+const pendingTools = (): string[] => [];
 
-// Only the prep steps the user hasn't done yet — so a fully-prepped (or opted-out)
-// user is never told to redo onboarding/assessment/resume.
-const prepHint = (s: State) => {
-  const steps: string[] = [];
-  if (!s.dimensions.onboarded) steps.push("onboard");
-  if (!s.dimensions.level_assessed) steps.push("assess your level");
-  if (s.profile?.no_resume) steps.push("prep from your self-described projects");
-  else if (!s.has_resume) steps.push("prep your resume");
-  return steps.length ? steps.join(", ") : "sharpen your resume and portfolio against real demand";
-};
-// The job catalog can be empty for two different reasons: no companies discovered yet,
-// or companies discovered but their boards not pulled yet. Say which, and the next step.
-const emptyCatalogNote = (s: State) =>
-  s.catalog.companies === 0
-    ? `no jobs yet — discover target companies with gather({ step: 'find_companies' }), then pull their boards with gather({ step: 'fetch_jobs' }). You can also ${prepHint(s)} now.`
-    : `${s.catalog.companies} companies discovered but no jobs pulled yet — run gather({ step: 'fetch_jobs' }) to fetch their live boards${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} have no ATS slug yet and can't be fetched until resolved)` : ""}. You can also ${prepHint(s)} now.`;
-// The market-demand overlay: the COMPUTED skill demand from graded jobs (the agent then
-// derives the delta vs. the resume/portfolio). Honest when nothing's gradeable yet.
-export function marketOverlay(s: State) {
-  if (s.catalog.jobs === 0)
-    return { computed: false, note: "no market data yet — discover companies via gather 'find_companies' and pull boards via gather 'fetch_jobs'; until then coach on resume structure/clarity/impact and don't fabricate demand." };
-  if (s.catalog.jobs - s.catalog.ungraded_jobs === 0)
-    return { computed: false, note: `${s.catalog.jobs} jobs but none graded — run grade_job (look scope:'worklist') so demand can be computed from each job's required/preferred skills.` };
-  const band = bandFor(s.assessed_level);
-  const demand = DB.marketSkillDemand(band, 20);
-  return {
-    computed: true,
-    basis: band
-      ? `${demand.total_jobs} graded job(s) in your level±1 band (${band.join("/")})`
-      : `${demand.total_jobs} graded job(s) (whole catalog — assess your level for a banded view)`,
-    top_skills: demand.skills,
-    note: "what the market asks for — compare it against the resume/portfolio; the in-demand skills the user can't evidence are the gap to coach. Don't invent demand beyond this.",
-  };
-}
-
-// Modes are the single source of truth for the closed vocabularies. loadMode does
-// NOT swallow errors: a missing/corrupt mode fails the server at startup (loud),
-// rather than silently drifting from a hardcoded fallback. cover_letter is loaded
-// too so record_cover_letter is a genuinely mode-governed judgment write.
-interface ModeConstraints {
-  level_must_be_one_of?: string[];
-  market_signal_must_be_one_of?: string[];
-  band_must_be_one_of?: string[];
-  relevance_must_be_one_of?: string[];
-  [key: string]: unknown;
-}
-interface Mode { mode: string; rubric?: string; output_schema?: Record<string, string>; constraints: ModeConstraints }
+// ── grading modes — the single source of truth for the closed vocabularies ──
+interface ModeConstraints { [key: string]: unknown }
+interface Mode { mode: string; rubric?: string; output_schema?: Record<string, unknown>; constraints: ModeConstraints }
 function loadMode(name: string): Mode {
   return JSON.parse(readFileSync(new URL(`../modes/${name}.json`, import.meta.url), "utf8")) as Mode;
 }
 const MODE = {
-  level: loadMode("level_assessment"),
+  competency: loadMode("competency_profile"),
+  interview: loadMode("competency_interview"),
+  roleInterview: loadMode("role_fit_interview"),
+  roleFit: loadMode("role_fit"),
   job: loadMode("job_intrinsic"),
-  fit: loadMode("user_fit"),
   letter: loadMode("cover_letter"),
   portfolio: loadMode("portfolio_relevance"),
+  plan: loadMode("upskilling_plan"),
+  resume: loadMode("resume_revision"),
 };
-// The `!` asserts the closed-vocabulary key exists in the mode file; if it's missing,
-// the z.enum built from it throws at startup — the intended loud failure.
-const SENIORITY: string[] = MODE.level.constraints.level_must_be_one_of!;
-const MARKET: string[] = MODE.job.constraints.market_signal_must_be_one_of!;
-const FIT: string[] = MODE.fit.constraints.band_must_be_one_of!;
-const RELEVANCE: string[] = MODE.portfolio.constraints.relevance_must_be_one_of!;
+const vocab = (m: Mode, key: string): string[] => {
+  const v = m.constraints[key];
+  if (!Array.isArray(v)) throw new Error(`mode ${m.mode}: missing closed vocabulary '${key}'`); // loud startup failure
+  return v as string[];
+};
+const SENIORITY = vocab(MODE.competency, "level_must_be_one_of");
+const DIMENSION = vocab(MODE.competency, "dimension_must_be_one_of");
+const CONFIDENCE = vocab(MODE.competency, "confidence_must_be_one_of");
+const PROVENANCE = vocab(MODE.competency, "provenance_must_be_one_of");
+const SCORE = vocab(MODE.interview, "score_must_be_one_of");
+const OWNERSHIP = vocab(MODE.interview, "ownership_must_be_one_of");
+const UNDERSTANDING = vocab(MODE.interview, "understanding_must_be_one_of");
+const FITBAND = vocab(MODE.roleFit, "band_must_be_one_of");
+const DESIRE_ALIGN = vocab(MODE.roleFit, "desire_alignment_must_be_one_of");
+const MARKET = vocab(MODE.job, "market_signal_must_be_one_of");
+const RELEVANCE = vocab(MODE.portfolio, "relevance_must_be_one_of");
+const PLAN_TYPE = vocab(MODE.plan, "type_must_be_one_of");
+const PLAN_STATUS = ["suggested", "in_progress", "done"];
+const APP_STATUS = ["interested", "applied", "interviewing", "offer", "rejected", "withdrawn"];
+const INTERVIEW_TYPE = ["competency", "role_fit"];
 const enumOf = (v: string[]) => z.enum(v as [string, ...string[]]);
 const ladder = SENIORITY.join(" → ");
 
-// The user's level ±1 band, or null if no (valid) level is assessed. Shared by
-// orient('dashboard') and look(at:'jobs', scope:'relevant') so the band math lives
-// in one place.
+// The user's level ±1 band (around the derived overall band), or null if unassessed.
 function bandFor(level: string | null): string[] | null {
   if (!level) return null;
   const r = SENIORITY.indexOf(level);
@@ -126,12 +75,9 @@ function bandFor(level: string | null): string[] | null {
 }
 
 const json = (o: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(o, null, 2) }] });
-const planned = (note: string) => json({ status: "planned", note: `${note} (external integration — implemented in a later pass).` });
 const noJob = (id: number) => json({ ok: false, error: `no job ${id} — find a valid job_id via look({ at: 'jobs' })` });
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-// Extract a clean, ATS-agnostic posting description from the stored raw_json and truncate
-// it — so worklist/packet return gradeable TEXT instead of the bulky nested ATS payload (the
-// agent shouldn't have to jq it). Prefers plain-text fields, else strips HTML.
 const DESC_MAX = 1000;
 export function compactDescription(rawJson: string | null): string | null {
   if (!rawJson) return null;
@@ -142,13 +88,8 @@ export function compactDescription(rawJson: string | null): string | null {
   return text ? text.slice(0, DESC_MAX) : null;
 }
 
-// Application pipeline statuses — a reported fact (not a graded judgment), so a flat enum
-// here rather than a grading mode. interested → applied → interviewing → offer/rejected/withdrawn.
-const APP_STATUS = ["interested", "applied", "interviewing", "offer", "rejected", "withdrawn"];
-
-// Portfolio repos enriched with their relevance judgment, ordered strong→moderate→weak→
-// ungraded (RELEVANCE order, ungraded last) — shared by look(at:'portfolio') and the packet
-// so "which project to feature" is the same ranked view everywhere.
+// Portfolio repos + relevance, ranked strong→moderate→weak→ungraded; spreads facts (incl. the
+// verify signals + source) so the skeptical picture travels everywhere it's read.
 export function rankedPortfolio(): Array<Record<string, unknown> & { relevance: { band: string; demonstrates: unknown[]; gaps: unknown[]; rationale: string | null } | null }> {
   const rank = (b?: string | null) => (b ? RELEVANCE.indexOf(b) : RELEVANCE.length);
   return DB.getPortfolio().map((r) => {
@@ -158,12 +99,37 @@ export function rankedPortfolio(): Array<Record<string, unknown> & { relevance: 
   }).sort((a, b) => rank(a.relevance?.band) - rank(b.relevance?.band));
 }
 
-// Shared job filters for look(at:'jobs'), applied across all three scopes so the agent can
-// triage a large pull (thousands of postings) down to its lanes in one call: titles_any
-// OR-matches keywords against the title, location is a substring match, remote keeps only
-// remote-flagged rows, query matches title-or-company. Returns parameterized clauses (no
-// string interpolation of user input → injection-safe). Assumes the query joins jobs j and
-// companies c. Exported for direct testing.
+// The market-demand overlay — computed skill demand from graded jobs in the band. Grounds both
+// the resume/portfolio coaching and the upskilling plan's 'build'/'learn' items.
+export function marketOverlay(s: State) {
+  if (s.catalog.jobs === 0)
+    return { computed: false, note: "no market data yet — discover companies (gather 'find_companies') and pull boards (gather 'fetch_jobs'); until then coach on resume structure/clarity and don't fabricate demand." };
+  if (s.catalog.jobs - s.catalog.ungraded_jobs === 0)
+    return { computed: false, note: `${s.catalog.jobs} jobs but none graded — run grade_job (look scope:'worklist') so demand can be computed.` };
+  const band = bandFor(s.assessed_level);
+  const demand = DB.marketSkillDemand(band, 20);
+  return {
+    computed: true,
+    basis: band ? `${demand.total_jobs} graded job(s) in your band (${band.join("/")})` : `${demand.total_jobs} graded job(s) (whole catalog — assess your level for a banded view)`,
+    top_skills: demand.skills,
+    note: "what the market asks for — the in-demand skills the user can't yet evidence are the gap to coach and to target with build/learn plan items.",
+  };
+}
+
+// A coarse, mechanical desire score for SORTING relevant jobs before the agent judges fit. Honest
+// and rough (0–3): title↔role_types, location/remote↔work_style+locations, comp↔comp_floor. The
+// real desire judgment (with surfaced tension) is the agent's, via assess_role_fit.
+function desireHint(job: { title: string | null; location: string | null; remote: number | null; comp_min: number | null }, d: DB.Desires | null): { score: number; reasons: string[] } | null {
+  if (!d) return null;
+  let score = 0; const reasons: string[] = [];
+  const t = (job.title ?? "").toLowerCase();
+  if (d.role_types?.some((r) => t.includes(r.toLowerCase()))) { score++; reasons.push("title matches a desired role type"); }
+  const wantsRemote = (d.work_style ?? "").toLowerCase().includes("remote");
+  if ((wantsRemote && job.remote === 1) || d.locations?.some((l) => (job.location ?? "").toLowerCase().includes(l.toLowerCase()))) { score++; reasons.push("location/remote matches"); }
+  if (d.comp_floor != null && job.comp_min != null && job.comp_min >= d.comp_floor) { score++; reasons.push("meets comp floor"); }
+  return { score, reasons };
+}
+
 export interface JobFilterArgs { query?: string; titles_any?: string[]; location?: string; remote?: boolean }
 export function jobFilters(a: JobFilterArgs): { where: string[]; args: (string | number)[] } {
   const where: string[] = []; const args: (string | number)[] = [];
@@ -177,68 +143,110 @@ export function jobFilters(a: JobFilterArgs): { where: string[]; args: (string |
   return { where, args };
 }
 
+// Prep steps the user hasn't done — so a prepped/opted-out user is never told to redo them.
+const prepHint = (s: State) => {
+  const steps: string[] = [];
+  if (!s.dimensions.onboarded) steps.push("onboard");
+  if (!s.dimensions.profiled) steps.push("assess your competency profile");
+  else if (!s.dimensions.verified) steps.push("verify it in a competency interview");
+  if (s.profile?.no_resume) steps.push("build a resume from your real experience");
+  else if (!s.has_resume) steps.push("capture your resume");
+  return steps.length ? steps.join(", ") : "sharpen your resume and portfolio against real demand";
+};
+const emptyCatalogNote = (s: State) =>
+  s.catalog.companies === 0
+    ? `no jobs yet — discover companies with gather({ step: 'find_companies' }), then pull boards with gather({ step: 'fetch_jobs' }). You can also ${prepHint(s)} now.`
+    : `${s.catalog.companies} companies discovered but no jobs pulled — run gather({ step: 'fetch_jobs' })${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} unresolved)` : ""}. You can also ${prepHint(s)} now.`;
+
+// Open threads a fresh session should resume (the durability payoff): an unfinished interview,
+// in-progress plan items, applications with a pending next action.
+function openThreads(s: State): string[] {
+  const t: string[] = [];
+  if (s.open_interview) t.push(`an unfinished ${s.open_interview.type} interview (id ${s.open_interview.id}) — resume it with record_interview, then complete it.`);
+  if ((s.plan.in_progress ?? 0) > 0) t.push(`${s.plan.in_progress} upskilling item(s) in progress — see look({ at: 'plan' }); mark progress with update_plan_progress.`);
+  const nextActions = DB.getApplications().filter((a) => a.next_action && !["offer", "rejected", "withdrawn"].includes(a.status));
+  if (nextActions.length) t.push(`${nextActions.length} application(s) with a pending next action — see look({ at: 'applications' }).`);
+  return t;
+}
+
 export function registerTools(server: McpServer): void {
-  // ── orient: the one state door ────────────────────────────────────────────
+  // ── orient: the one state door (loop-aware + resume-first) ─────────────────
   server.registerTool("orient", {
     description:
-      "Start here. Where the user is in the journey, which skill fits right now, and which tools aren't built yet in this build. detail: 'recommend' (default) adds the skill to use now; 'raw' returns the journey state (+ pending_tools) for rehydrating after a reset; 'dashboard' adds the relevant-vs-whole-market gap and honest next-step notes. Safe as the first call; takes no required args.",
-    inputSchema: { detail: enumOf(["recommend", "raw", "dashboard"]).optional() },
+      "Start EVERY session here. Where the user is in the readiness loop, the single next best action, and OPEN THREADS to resume (an unfinished interview, in-progress plan items) — because the whole journey persists in the DB and spans weeks/months, this is how a fresh session picks up where the last left off. detail: 'recommend' (default; + the skill to use now), 'raw' (bare state), 'resume' (full rehydration bundle: state + open threads + recent journal), 'dashboard' (fitness profile, market gap, upskilling plan, notes). Safe as the first call; no required args.",
+    inputSchema: { detail: enumOf(["recommend", "raw", "resume", "dashboard"]).optional() },
   }, async (a) => {
     const detail = a.detail ?? "recommend";
     const s = readJourneyState();
-    if (detail === "raw") return json({ ...s, pending_tools: pendingTools() }); // rehydrate blackboard + what's pending
+    if (detail === "raw") return json({ ...s, pending_tools: pendingTools() });
 
-    const base: Record<string, unknown> = { server: "jobbot9000", state: s, pending_tools: pendingTools() };
+    if (detail === "resume") {
+      return json({
+        state: s,
+        open_threads: openThreads(s),
+        recent_history: DB.getEvents(20),
+        note: "rehydration bundle — resume open threads first, then continue the loop. The DB holds everything; nothing was lost between sessions.",
+      });
+    }
+
+    const base: Record<string, unknown> = { server: "jobbot9000", state: s, open_threads: openThreads(s) };
     if (s.dimensions.has_applications) {
       const total = Object.values(s.pipeline).reduce((x, y) => x + y, 0);
-      base.pipeline_summary = `${total} application(s) tracked — ${Object.entries(s.pipeline).map(([k, v]) => `${v} ${k}`).join(", ")}. Review/update via look({ at: 'applications' }).`;
+      base.pipeline_summary = `${total} application(s): ${Object.entries(s.pipeline).map(([k, v]) => `${v} ${k}`).join(", ")}.`;
     }
+
     if (detail === "recommend") {
-      base.recommended_skill = !s.dimensions.onboarded ? "coach — onboard first"
-        : !s.dimensions.level_assessed ? "coach — assess the user's level (the keystone)"
-        : s.catalog.jobs === 0 ? (s.catalog.companies === 0
-            ? `coach — ${prepHint(s)}; then build your target list with gather('find_companies') and pull boards with gather('fetch_jobs')`
-            : `job-search — you have ${s.catalog.companies} companies but no jobs yet; run gather('fetch_jobs') to populate them, then grade`)
+      const conf = s.assessment?.confidence;
+      base.recommended_skill = !s.dimensions.onboarded ? "coach — onboard (profile + desires) first"
+        : s.open_interview ? `verify — resume the open ${s.open_interview.type} interview (record_interview), then complete it`
+        : !s.dimensions.profiled ? "coach — assess the competency profile (skeptically; absence ≠ low level)"
+        : !s.dimensions.verified ? "verify — run a competency interview to establish/verify the profile (this is also how no-portfolio candidates are assessed)"
+        : s.catalog.jobs === 0 ? `job-search — ${prepHint(s)}; then gather('find_companies') + gather('fetch_jobs') to populate the market`
+        : (s.plan.in_progress ?? 0) > 0 ? "upskill — work the in-progress plan items; closing them raises fitness and re-opens roles"
         : "job-search or application";
-      base.tool_discovery = "your client already has the full tool list; pending_tools above are the gather steps not yet functional in this build.";
-      base.pending_note = "pending tools are integrations that ship later — nothing is broken; coaching + prep is the full first-run experience.";
+      base.loop_note = "the loop: profile⇅desires → match → interview (assess+verify+upskill) → plan (learn/resume/build) → apply → re-match. Closing gaps re-opens higher-band roles.";
       return json(base);
     }
+
     // dashboard
-    let gap: Record<string, unknown> = { note: "assess the level to compute the relevant band" };
     const band = bandFor(s.assessed_level);
+    let gap: Record<string, unknown> = { note: "assess the competency profile to compute the relevant band" };
     if (band) {
       const relevant = (DB.db.prepare(
         `SELECT count(*) c FROM jobs WHERE still_live=1 AND grade_seniority IN (${band.map(() => "?").join(",")})`,
       ).get(...band) as { c: number }).c;
       gap = { relevant_in_band: relevant, whole_market: s.catalog.jobs, ungraded: s.catalog.ungraded_jobs, band };
-      if (s.catalog.jobs === 0) gap.note = "zeros reflect an unpopulated catalog (discover companies, then gather 'fetch_jobs'), not measured market demand";
-      else if (s.catalog.ungraded_jobs > 0) gap.note = `${s.catalog.ungraded_jobs} jobs ungraded — grade them (look scope:'worklist') before reading the band count as final`;
+      if (s.catalog.jobs === 0) gap.note = "zeros reflect an unpopulated catalog, not measured demand";
+      else if (s.catalog.ungraded_jobs > 0) gap.note = `${s.catalog.ungraded_jobs} jobs ungraded — grade them before reading the band count as final`;
     }
     const notes: string[] = [];
-    if (s.catalog.jobs === 0)
-      notes.push(s.catalog.companies === 0
-        ? `no companies discovered yet — run gather({ step: 'find_companies' }) to build the target catalog, then gather({ step: 'fetch_jobs' }) to pull their boards. You can ${prepHint(s)} now.`
-        : `${s.catalog.companies} companies discovered${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} still unresolved — no ATS slug yet)` : ""} but no jobs pulled — run gather({ step: 'fetch_jobs' }) to fetch their live boards. You can also ${prepHint(s)} now.`);
-    if (s.profile?.no_resume || s.profile?.no_github)
-      notes.push("the user opted out of a resume/GitHub — coach from their self-described projects and self-reported level (mark it as self-reported).");
-    if (s.profile?.github_handle && !s.dimensions.portfolio_fetched && !s.profile.no_github)
-      notes.push(PORTFOLIO_INGEST_AVAILABLE ? "GitHub handle on file — run gather({ step: 'ingest_portfolio' }) to enable portfolio coaching." : "GitHub handle on file, but GitHub ingestion isn't available in this build yet.");
-    if (s.dimensions.portfolio_fetched && !s.dimensions.portfolio_graded)
-      notes.push("portfolio fetched but ungraded — score each project's relevance to the target role with grade_portfolio_project so the cover letter features the right ones.");
+    if (s.catalog.jobs === 0) notes.push(emptyCatalogNote(s));
+    if (s.profile?.no_resume || s.profile?.no_github) notes.push("the user opted out of a resume/GitHub — the interview is the primary evidence; assess from it, don't penalize absence.");
+    if (s.dimensions.portfolio_fetched && !s.dimensions.portfolio_graded) notes.push("portfolio fetched but ungraded — score each project's relevance with grade_portfolio_project.");
+    // Assessment integrity — the profile, its confidence, and whether it's verified.
+    if (s.dimensions.profiled) {
+      base.competency_profile = s.competency;
+      base.assessment = s.assessment;
+      const fit = DB.getFitnessHistory(2);
+      if (fit.length === 2 && fit[0].band !== fit[1].band) notes.push(`fitness moved: ${fit[1].band} → ${fit[0].band} (most recent first).`);
+      if (!s.dimensions.verified) notes.push(`profile band '${s.assessed_level}' is UNVERIFIED (no interview) — confidence is capped low. Run a competency interview to establish it; treat the floor '${s.assessment?.floor}' as the honest read until then.`);
+    } else {
+      notes.push("no competency profile yet — assess_competency per dimension (then verify in an interview).");
+    }
+    if (Object.keys(s.plan).length) base.upskilling_plan = s.plan;
     base.market_readiness_gap = gap;
-    base.market_demand = marketOverlay(s); // computed skill demand (or an honest note if nothing's gradeable yet)
+    base.market_demand = marketOverlay(s);
     base.notes = notes;
-    base.summary_note = "the honest read is yours to deliver — this only surfaces the numbers";
+    base.summary_note = "the honest read is yours to deliver — this surfaces the numbers.";
     return json(base);
   });
 
-  // ── look: the one read door (never fetches, never writes) ─────────────────
+  // ── look: the one read door (never fetches, never writes) ──────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists jobs by scope: 'market' (default, whole catalog), 'relevant' (your level ±1 band with fit; levels ${ladder}), 'worklist' (the canonical grading queue — ungraded/stale rows). All three scopes accept the same filters — use them to TRIAGE a big pull down to your lanes in ONE call instead of many: titles_any (string[], OR-match any keyword against the job title), location (substring, e.g. 'US' or 'Remote'), remote (true = only remote-flagged), query (title OR company substring); grading_status filters market/worklist. e.g. look({at:'jobs',scope:'worklist',titles_any:['Applied AI','Forward Deployed','Data Engineer'],remote:true}) → the gradeable shortlist. Results carry location/remote/comp so you can geo-filter without opening a packet. 'relevant' vs 'market' is a deliberate pair — the gap is the signal (for a precomputed gap use orient detail:'dashboard'). at='companies' lists discovered companies. at='resume' / 'portfolio' read your materials (portfolio is ranked by each repo's graded relevance to the target role — score them via grade_portfolio_project); with_market_overlay adds the computed market skill demand (top required/preferred skills across graded jobs in your band) so you can coach the delta. at='packet' (needs job_id) gathers job + grade + skills + resume + fit + relevance-ranked portfolio + any saved letter + application status. at='applications' is the pipeline funnel (counts by status + the tracked list). Returns JSON for you to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit + a coarse desire hint; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='resume' (+ revision history; with_market_overlay adds computed demand). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (latest session, or interview_id; its Q/A/exemplars/deltas). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
     inputSchema: {
-      at: enumOf(["jobs", "companies", "resume", "portfolio", "packet", "applications"]),
+      at: enumOf(["jobs", "companies", "resume", "portfolio", "profile", "competency", "interview", "plan", "packet", "applications", "history"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
       query: z.string().optional(),
       titles_any: z.array(z.string()).optional(),
@@ -246,6 +254,7 @@ export function registerTools(server: McpServer): void {
       remote: z.boolean().optional(),
       grading_status: enumOf(["ungraded", "graded", "any"]).optional(),
       job_id: z.number().int().optional(),
+      interview_id: z.number().int().optional(),
       with_market_overlay: z.boolean().optional(),
       limit: z.number().int().positive().optional(),
     },
@@ -253,102 +262,150 @@ export function registerTools(server: McpServer): void {
     const s = readJourneyState();
 
     if (a.at === "companies") {
-      // Surface the comma-delimited `tags` column as an array, and `resolved` as a
-      // readable status, so the agent reads structured fields rather than raw storage.
-      const companies = DB.getCompanies(a.limit ?? 200).map((c) => ({
-        ...c,
-        tags: c.tags ? c.tags.split(",").filter(Boolean) : [],
-        ats_status: c.resolved ? "resolved" : "unresolved",
-      }));
+      const companies = DB.getCompanies(a.limit ?? 200).map((c) => ({ ...c, tags: c.tags ? c.tags.split(",").filter(Boolean) : [], ats_status: c.resolved ? "resolved" : "unresolved" }));
       const out: Record<string, unknown> = { companies };
-      if (companies.length === 0) out.note = FIND_COMPANIES_AVAILABLE ? "no companies yet — run gather({ step: 'find_companies' })." : "no companies discovered yet — automated discovery isn't available in this build yet.";
+      if (companies.length === 0) out.note = "no companies yet — run gather({ step: 'find_companies' }).";
       return json(out);
+    }
+
+    if (a.at === "profile") {
+      if (!s.profile) return json({ note: "not onboarded — capture identity + desires via capture_profile." });
+      return json({ profile: s.profile, note: s.profile.desires ? undefined : "no desires captured — capture_profile({ desires: {...} }) so matching can weigh what the user WANTS, not just what they can do." });
     }
 
     if (a.at === "resume") {
       const resume = DB.getMasterResume();
-      if (!a.with_market_overlay) return json(resume ?? { content: null, note: "no resume captured yet" });
+      const revisions = DB.getResumeRevisions();
       if (!resume) {
-        if (s.profile?.no_resume) return json({ opted_out: true, note: "The user opted out of a resume — coach on their self-reported level + (once available) market data. They can add one anytime via replace_master_resume (or re-run capture_onboarding_profile)." });
-        return json({ note: "no resume yet — capture one via capture_onboarding_profile (or replace_master_resume)" });
+        if (s.profile?.no_resume) return json({ opted_out: true, note: "The user opted out of a resume — coach from the interview + described experience. Build one anytime via revise_resume." });
+        return json({ note: "no resume yet — capture via capture_profile, or build one via revise_resume." });
       }
-      return json({ resume: resume.content, market_overlay: marketOverlay(s) });
+      const out: Record<string, unknown> = { resume: resume.content, updated_at: resume.updated_at, revisions };
+      if (a.with_market_overlay) out.market_overlay = marketOverlay(s);
+      return json(out);
     }
 
     if (a.at === "portfolio") {
       const repos = DB.getPortfolio();
       if (repos.length === 0) {
-        if (s.profile?.no_github) return json({ opted_out: true, note: "The user opted out of GitHub — coach from projects they describe in chat." });
-        return json({ note: PORTFOLIO_INGEST_AVAILABLE ? "no portfolio yet — run gather({ step: 'ingest_portfolio' })" : "no portfolio captured yet, and GitHub ingestion isn't available in this build yet — ask the user to describe their projects and coach from that." });
+        if (s.profile?.no_github) return json({ opted_out: true, note: "The user opted out of GitHub — no portfolio penalty; the interview is the evidence. Coach from projects they describe." });
+        return json({ note: "no portfolio yet — run gather({ step: 'ingest_portfolio' }), or add described work via add_portfolio_project." });
       }
-      // Parsed facts + relevance judgment, ranked strong→weak→ungraded.
       const portfolio = rankedPortfolio();
       const ungraded = portfolio.filter((p) => !p.relevance).length;
-      const out: Record<string, unknown> = { portfolio, market_overlay: marketOverlay(s) };
+      const withV = portfolio.filter((p) => (p as any).verify) as any[];
+      const manual = portfolio.filter((p) => p.source === "manual");
+      const verification = {
+        competency_interview: s.dimensions.verified ? "on file" : "NONE — claims unverified",
+        solo_projects: withV.filter((p) => p.verify.solo).length,
+        max_stars: portfolio.reduce((m, p) => Math.max(m, (p as any).stars ?? 0), 0),
+        self_applied_badges: withV.reduce((n, p) => n + (p.verify.self_applied_badges ?? 0), 0),
+        claimed_no_repo: manual.length,
+      };
+      const out: Record<string, unknown> = { portfolio, verification, market_overlay: marketOverlay(s) };
       const notes: string[] = [];
-      if (ungraded) notes.push(`${ungraded}/${portfolio.length} project(s) ungraded — score relevance to the target role with grade_portfolio_project so you know which to feature, anchor, or deep-dive.`);
-      // Reconciliation nudge: ingest only sees public repos. Flagship/private work on the
-      // resume (with no public repo) is invisible to packets until added manually.
-      if (s.has_resume) notes.push("cross-reference the resume — projects it features with no matching repo here (private/flagship work) won't reach packets until you add them via add_portfolio_project. Conversely, repos here the resume omits may be evidence worth surfacing.");
+      if (ungraded) notes.push(`${ungraded}/${portfolio.length} ungraded — score relevance to the target role with grade_portfolio_project.`);
+      if (s.has_resume) notes.push("a resume flagship with no repo here can be added via add_portfolio_project, but as an UNVERIFIED claim — probe it in the interview before featuring.");
+      if (!s.dimensions.verified && (manual.length || verification.solo_projects > 0)) notes.push("no competency interview yet — solo/claimed projects are unverified; verify ownership + understanding before treating them as senior evidence.");
       if (notes.length) out.note = notes.join(" ");
       return json(out);
     }
 
+    if (a.at === "competency") {
+      const profile = DB.getCompetencyProfile();
+      const derived = DB.deriveBand(profile);
+      const assessed = new Set(profile.map((p) => p.dimension));
+      const missing = DIMENSION.filter((d) => !assessed.has(d));
+      const out: Record<string, unknown> = { profile, band: DB.getAssessmentSummary() ?? derived, dimensions_missing: missing };
+      const notes: string[] = [];
+      if (profile.length === 0) notes.push("no competency profile yet — assess each dimension with assess_competency (skeptically; absence ≠ low level).");
+      else if (missing.length) notes.push(`${missing.join(", ")} not yet assessed.`);
+      if (profile.length && !s.dimensions.verified) notes.push("profile is UNVERIFIED — confidence is capped low until a competency interview demonstrates it. Run one (record_interview).");
+      if (notes.length) out.note = notes.join(" ");
+      return json(out);
+    }
+
+    if (a.at === "interview") {
+      const iv = a.interview_id ? DB.getInterview(a.interview_id) : (DB.getOpenInterview() ?? DB.getInterviews()[0]);
+      if (!iv) return json({ note: "no interviews yet — run a competency interview (record_interview) to assess + verify + learn the bar." });
+      return json({ interview: iv, items: DB.getInterviewItems(iv.id), all_sessions: DB.getInterviews().map((x) => ({ id: x.id, type: x.type, status: x.status, job_id: x.job_id })) });
+    }
+
+    if (a.at === "plan") {
+      const plan = DB.getPlan();
+      const out: Record<string, unknown> = { plan, counts: DB.planCounts() };
+      if (plan.length === 0) out.note = "no upskilling plan yet — after an interview/assessment, turn the gaps into items with recommend_upskilling (learn/resume/build, market-grounded).";
+      else out.note = "mark progress with update_plan_progress; closing items raises fitness and re-opens higher-band roles (re-match).";
+      return json(out);
+    }
+
+    if (a.at === "history") {
+      return json({ history: DB.getEvents(a.limit ?? 50), note: "the journal — append-only, persists across sessions. The full timeline of the search." });
+    }
+
     if (a.at === "packet") {
-      if (a.job_id === undefined) return json({ ok: false, error: "look({ at: 'packet' }) needs a job_id — find one via look({ at: 'jobs' })." });
+      if (a.job_id === undefined) return json({ ok: false, error: "look({ at: 'packet' }) needs a job_id." });
       const job = DB.getJob(a.job_id);
       if (!job) return noJob(a.job_id);
       const master_resume = DB.getMasterResume()?.content ?? null;
-      const fitRow = DB.db.prepare("SELECT band, gaps_json, rationale FROM job_fit WHERE job_id=?").get(a.job_id) as { band: string; gaps_json: string | null; rationale: string | null } | undefined;
-      const fit = fitRow ? { band: fitRow.band, gaps: fitRow.gaps_json ? JSON.parse(fitRow.gaps_json) : [], rationale: fitRow.rationale } : null;
+      const fit = DB.getRoleFit(a.job_id) ?? null;
       const saved = DB.getCoverLetter(a.job_id);
       const missing: string[] = [];
       if (!master_resume) missing.push("master_resume");
-      if (!fit) missing.push("fit");
+      if (!fit) missing.push("role_fit");
       if (job.grade_seniority == null) missing.push("job_grade");
-      // Swap the bulky raw_json for a clean description excerpt.
+      const conf = s.assessment?.confidence ?? null;
+      const verified = s.dimensions.verified;
+      const featuredUnverified = rankedPortfolio()
+        .filter((p) => p.relevance?.band === "strong" && p.source === "manual"
+          && !DB.getInterviews().some((iv) => DB.getInterviewItems(iv.id).some((it) => (it.claim ?? "").toLowerCase().includes(String(p.repo).toLowerCase()))))
+        .map((p) => p.repo);
       const { raw_json, ...jobLean } = job;
+      const honesty: string[] = [];
+      if (!verified || (conf && conf !== "high")) honesty.push(`the assessment is ${conf ?? "unrecorded"}${verified ? "" : "/unverified"} — write to the floor (${s.assessment?.floor ?? "?"}); don't assert seniority the user hasn't demonstrated.`);
+      if (featuredUnverified.length) honesty.push(`do NOT feature ${featuredUnverified.join(", ")} — graded 'strong' but unverified. Verify in an interview first or leave out.`);
+      const slotBase = missing.length
+        ? `write the cover letter, then record_cover_letter — generic/ungrounded without: ${missing.join(", ")}.`
+        : saved ? "a letter is saved — refine only if the packet changed." : "write the cover letter, then record_cover_letter.";
       return json({
         job: { ...jobLean, description: compactDescription(raw_json) },
-        job_skills: DB.getJobSkills(a.job_id), master_resume, fit, portfolio: rankedPortfolio(),
+        job_skills: DB.getJobSkills(a.job_id), master_resume, role_fit: fit, portfolio: rankedPortfolio(),
         saved_cover_letter: saved, application: DB.getApplication(a.job_id) ?? null, missing,
-        cover_letter_slot: missing.length
-          ? `write the cover letter, then persist via record_cover_letter — but note it will be generic/ungrounded without: ${missing.join(", ")}. Don't fabricate the missing inputs.`
-          : saved
-            ? "a cover letter is already saved — refine it only if the packet changed, then persist via record_cover_letter."
-            : "write the cover letter, then persist via record_cover_letter.",
+        readiness: { assessment_confidence: conf, assessment_floor: s.assessment?.floor ?? null, competency_verified: verified, featured_unverified_projects: featuredUnverified },
+        cover_letter_slot: honesty.length ? `${slotBase} HONESTY: ${honesty.join(" ")}` : slotBase,
       });
     }
 
     if (a.at === "applications") {
       const applications = DB.getApplications();
       const out: Record<string, unknown> = { pipeline: DB.applicationCounts(), applications };
-      if (applications.length === 0) out.note = "no applications tracked yet — after the user applies to a role, record it with record_application.";
+      if (applications.length === 0) out.note = "no applications tracked yet — record one after the user applies.";
       return json(out);
     }
 
     // a.at === "jobs"
     const scope = a.scope ?? "market";
-
     if (scope === "relevant") {
       const limit = a.limit ?? 25;
       if (s.catalog.jobs === 0) return json({ band: bandFor(s.assessed_level), jobs: [], catalog_empty: true, note: emptyCatalogNote(s) });
       const band = bandFor(s.assessed_level);
       if (!band) {
         const rows = DB.db.prepare("SELECT j.id, c.name AS company, j.title, j.grade_seniority FROM jobs j JOIN companies c ON c.id=j.company_id WHERE j.still_live=1 ORDER BY j.last_seen_at DESC LIMIT ?").all(limit);
-        return json({ band: null, low_confidence: true, jobs: rows, note: "level not assessed yet — returning a recent slice (low confidence). Assess via record_level_assessment for an accurate band." });
+        return json({ band: null, low_confidence: true, jobs: rows, note: "no competency profile yet — assess it for a real band." });
       }
       const flt = jobFilters(a);
       const rows = DB.db.prepare(
         `SELECT j.id, c.name AS company, j.title, j.location, j.remote, j.comp_min, j.comp_max, j.grade_seniority, j.grade_market_signal,
-                f.band AS fit, f.gaps_json AS fit_gaps_json, f.rationale AS fit_rationale
+                f.band AS fit, f.desire_alignment, f.gaps_json AS fit_gaps_json
          FROM jobs j JOIN companies c ON c.id=j.company_id
-         LEFT JOIN job_fit f ON f.job_id=j.id
+         LEFT JOIN role_fit f ON f.job_id=j.id
          WHERE j.still_live=1 AND j.grade_seniority IN (${band.map(() => "?").join(",")})${flt.where.length ? " AND " + flt.where.join(" AND ") : ""}
          ORDER BY j.last_seen_at DESC LIMIT ?`,
       ).all(...band, ...flt.args, limit) as any[];
-      const jobs = rows.map(({ fit_gaps_json, ...rest }) => ({ ...rest, fit_gaps: fit_gaps_json ? JSON.parse(fit_gaps_json) : null }));
-      return json({ band, jobs });
+      const desires = s.profile?.desires ?? null;
+      const jobs = rows.map(({ fit_gaps_json, ...r }) => ({ ...r, fit_gaps: fit_gaps_json ? JSON.parse(fit_gaps_json) : null, desire_hint: desireHint(r, desires) }))
+        .sort((x, y) => (y.desire_hint?.score ?? 0) - (x.desire_hint?.score ?? 0));
+      return json({ band, jobs, note: "fit (over/exact/under) is your judgment via assess_role_fit; desire_hint is a coarse sort by stated desires. Grade fit to surface real tension (fitness vs. desire)." });
     }
 
     if (scope === "worklist") {
@@ -360,14 +417,13 @@ export function registerTools(server: McpServer): void {
          FROM jobs j JOIN companies c ON c.id=j.company_id
          WHERE ${where.join(" AND ")} ORDER BY j.fetched_at ASC LIMIT ?`,
       ).all(...flt.args, a.limit ?? 25) as any[];
-      // Return a clean description excerpt, not the bulky raw_json — enough to grade from.
       const jobs = rows.map(({ raw_json, ...r }) => ({ ...r, description: compactDescription(raw_json) }));
       const out: Record<string, unknown> = { count: jobs.length, jobs };
-      if (jobs.length === 0) out.note = s.catalog.jobs === 0 ? emptyCatalogNote(s) : "no ungraded jobs match (all graded, or the filter is too narrow).";
+      if (jobs.length === 0) out.note = s.catalog.jobs === 0 ? emptyCatalogNote(s) : "no ungraded jobs match.";
       return json(out);
     }
 
-    // scope === "market" — whole-market view + general catalog search
+    // market
     const limit = a.limit ?? 100;
     const flt = jobFilters(a);
     const where = ["j.still_live=1", ...flt.where];
@@ -377,102 +433,197 @@ export function registerTools(server: McpServer): void {
     const total = (DB.db.prepare(`SELECT count(*) c FROM jobs j JOIN companies c ON c.id=j.company_id WHERE ${whereSql}`).get(...flt.args) as { c: number }).c;
     const rows = DB.db.prepare(
       `SELECT j.id, c.name AS company, j.title, j.location, j.remote, j.comp_min, j.comp_max, j.grade_seniority
-       FROM jobs j JOIN companies c ON c.id=j.company_id
-       WHERE ${whereSql} ORDER BY j.last_seen_at DESC LIMIT ?`,
+       FROM jobs j JOIN companies c ON c.id=j.company_id WHERE ${whereSql} ORDER BY j.last_seen_at DESC LIMIT ?`,
     ).all(...flt.args, limit);
     const out: Record<string, unknown> = { count: rows.length, total, jobs: rows };
     if (s.catalog.jobs === 0) out.note = emptyCatalogNote(s);
-    else if (rows.length < total) out.note = `showing ${rows.length} of ${total} matching jobs (most-recent first) — raise limit, or narrow with titles_any / location / remote / query.`;
+    else if (rows.length < total) out.note = `showing ${rows.length} of ${total} — raise limit or narrow with filters.`;
     return json(out);
   });
 
-  // ── onboarding & profile (personal, mechanical writes) ────────────────────
-  server.registerTool("capture_onboarding_profile", {
-    description: "Front door: capture resume, GitHub handle, and target work. Idempotent; partial input ('no resume'/'no github') is fine.",
+  // ── onboarding & profile (personal, mechanical) ────────────────────────────
+  server.registerTool("capture_profile", {
+    description: "Front door: capture identity, the resume, GitHub, the target work, and DESIRES (what the user WANTS — the other half of matching). Idempotent; partial is fine; desires merge (pass only what changed). Record 'no resume'/'no github' explicitly — absence is never penalized.",
     inputSchema: {
       resume: z.string().optional(), no_resume: z.boolean().optional(),
       github_handle: z.string().optional(), no_github: z.boolean().optional(),
       target_role: z.string().optional(), target_niche: z.string().optional(), location_pref: z.string().optional(),
+      desires: z.object({
+        role_types: z.array(z.string()).optional(),
+        domains: z.array(z.string()).optional(),
+        locations: z.array(z.string()).optional(),
+        comp_floor: z.number().optional(),
+        work_style: z.string().optional(),
+        freetext: z.string().optional(),
+        priorities: z.array(z.string()).optional(),
+      }).optional(),
     },
   }, async (a) => {
     if (a.resume) DB.setMasterResume(a.resume);
     const patch: any = {};
-    for (const k of ["target_role", "target_niche", "location_pref", "github_handle"] as const)
-      if (a[k] !== undefined) patch[k] = a[k];
+    for (const k of ["target_role", "target_niche", "location_pref", "github_handle"] as const) if (a[k] !== undefined) patch[k] = a[k];
     if (a.no_resume !== undefined) patch.no_resume = a.no_resume ? 1 : 0;
     if (a.no_github !== undefined) patch.no_github = a.no_github ? 1 : 0;
+    if (a.desires !== undefined) patch.desires = a.desires;
     DB.upsertProfile(patch);
+    DB.logEvent("profile", "profile/desires updated");
     return json({ ok: true, state: readJourneyState() });
   });
 
   server.registerTool("replace_master_resume", {
-    description: "Replace the master resume wholesale. There is only one resume; the user's edits land here. Read it back via look({ at: 'resume' }).",
+    description: "Replace the master resume wholesale (the user's own edit landing as-is). For a COACHED revision that should be tracked with a rationale, use revise_resume instead. Read back via look({ at: 'resume' }).",
     inputSchema: { content: z.string().min(1) },
   }, async (a) => { DB.setMasterResume(a.content); return json({ ok: true, updated: DB.getMasterResume()?.updated_at }); });
 
-  // ── structured writes (judgment, vocab enforced by the grading mode) ──────
-  server.registerTool("record_level_assessment", {
-    description: `Set the user's level + rationale. → personal. The keystone judgment — it shapes every later return. Mode: level_assessment. Ladder: ${ladder}.`,
-    inputSchema: { level: enumOf(SENIORITY), rationale: z.string().min(1), evidence: z.array(z.string()).optional() },
-  }, async (a) => { DB.setAssessment(a.level, a.rationale, a.evidence ?? []); return json({ ok: true, assessed_level: a.level }); });
+  server.registerTool("revise_resume", {
+    description: `Draft/rewrite the master resume to present the user's REAL best, tracked as a revision. → personal. Mode: resume_revision. ALLOWED: restructure, sharpen, quantify REAL impact, surface buried strengths, tailor to a role. BLOCKED: invent jobs/titles/dates/metrics or inflate scope (the no-invention guardrail) — route unbacked-but-strong claims to the competency interview instead. content = the full revised resume; rationale = what changed (stored in the revision history).`,
+    inputSchema: { content: z.string().min(1), rationale: z.string().min(1) },
+  }, async (a) => {
+    DB.setMasterResume(a.content, a.rationale);
+    return json({ ok: true, updated: DB.getMasterResume()?.updated_at, note: "revision saved to history. Remember: only real, defensible claims — anything unbacked belongs in the interview, not the resume." });
+  });
 
-  server.registerTool("grade_job", {
-    description: `A job's intrinsic grade: seniority (${ladder}), market signal, required-vs-preferred skills. → catalog (shareable — the ONLY write to the synced plane). Mode: job_intrinsic.`,
+  server.registerTool("add_portfolio_project", {
+    description: "Add a project ingest_portfolio can't see — a private/absent repo the user describes. → personal. With no public code there's nothing to inspect, so it's an UNVERIFIED CLAIM (could be someone else's product, a clone, or aspirational): added as 'claimed', and must NOT be featured as strong until a competency interview confirms ownership + understanding. A missing flagship lowers confidence; it doesn't auto-promote.",
+    inputSchema: { name: z.string(), description: z.string().min(1), languages: z.array(z.string()).optional(), url: z.string().optional() },
+  }, async (a) => {
+    DB.addPortfolioProject(a.name, { repo: a.name, name: a.name, description: a.description, languages: a.languages ?? [], url: a.url ?? null, source: "manual", provenance: "claimed" });
+    return json({ ok: true, repo: a.name, provenance: "claimed", note: "added as an UNVERIFIED claim — probe ownership + understanding in a competency interview before grading 'strong' or featuring it." });
+  });
+
+  // ── competency profile (judgment, mode-governed) ───────────────────────────
+  server.registerTool("assess_competency", {
+    description: `Assess ONE competency dimension (${DIMENSION.join(" | ")}) on the ladder ${ladder}. → personal. The keystone, multi-dimensional and SKEPTICAL: a resume/portfolio is a CLAIM (tag evidence with provenance ${PROVENANCE.join(" | ")}). CRITICAL: absence of public evidence is NOT weakness — set confidence low and let the interview establish the level; do NOT default the level down for a missing portfolio. confidence='high' needs demonstrated/corroborated evidence (an interview). Call once per dimension; the overall band is derived. Mode: competency_profile.`,
     inputSchema: {
-      job_id: z.number().int(), seniority: enumOf(SENIORITY), market_signal: enumOf(MARKET),
-      skills: z.array(z.object({ skill: z.string(), kind: enumOf(["required", "preferred"]) })),
+      dimension: enumOf(DIMENSION),
+      level: enumOf(SENIORITY),
+      confidence: enumOf(CONFIDENCE),
+      evidence: z.array(z.object({ claim: z.string(), provenance: enumOf(PROVENANCE), verified: z.boolean().optional() })).optional(),
+      rationale: z.string().min(1),
     },
+  }, async (a) => {
+    DB.setCompetency(a.dimension, a.level, a.confidence, a.evidence ?? [], a.rationale);
+    const out: Record<string, unknown> = { ok: true, dimension: a.dimension, level: a.level, confidence: a.confidence, derived_band: DB.deriveBand() };
+    const s = readJourneyState();
+    if (a.confidence === "high" && !s.dimensions.verified) out.note = "confidence='high' without a competency interview on file — high confidence needs demonstrated/corroborated evidence. Run record_interview or lower confidence.";
+    const ev = a.evidence ?? [];
+    if (ev.length && ev.every((e) => e.provenance === "claimed" || e.provenance === "self_published") && !s.dimensions.verified)
+      out.note = "all evidence is claimed/self-published (unverified) — fine to set the level low-confidence, but verify in an interview before trusting it. Absence of proof ≠ low ability; don't over- OR under-rate.";
+    return json(out);
+  });
+
+  // ── interview (the engine: assess + verify + upskill; repeatable, resumable) ─
+  server.registerTool("record_interview", {
+    description: `Record a competency or role-fit interview — the engine that ASSESSES (primary evidence for no-portfolio candidates), VERIFIES (catches over-claiming), and UPSKILLS (each item carries a grounded exemplar — 'what a great candidate would have said' — and the delta). → personal. type: ${INTERVIEW_TYPE.join(" | ")} (role_fit needs job_id; its exemplars are anchored to that posting's bar). Resumable: appends to the open interview of this type, or starts one. Set done:true (with a summary) to complete it; verified_ceiling caps/establishes the level. Modes: competency_interview / role_fit_interview. After completing, re-run assess_competency with the now-demonstrated evidence and turn deltas into plan items (recommend_upskilling).`,
+    inputSchema: {
+      type: enumOf(INTERVIEW_TYPE),
+      job_id: z.number().int().optional(),
+      items: z.array(z.object({
+        dimension: enumOf(DIMENSION).optional(),
+        claim: z.string().optional(),
+        question: z.string(),
+        answer_summary: z.string().optional(),
+        exemplar: z.string().optional(),
+        score: enumOf(SCORE).optional(),
+        ownership: enumOf(OWNERSHIP).optional(),
+        understanding: enumOf(UNDERSTANDING).optional(),
+        delta_notes: z.string().optional(),
+      })).min(1),
+      verified_ceiling: enumOf(SENIORITY).optional(),
+      summary: z.string().optional(),
+      done: z.boolean().optional(),
+    },
+  }, async (a) => {
+    if (a.type === "role_fit" && a.job_id !== undefined && !DB.getJob(a.job_id)) return noJob(a.job_id);
+    const open = DB.getOpenInterview();
+    const id = open && open.type === a.type && (open.job_id ?? null) === (a.job_id ?? null) ? open.id : DB.startInterview(a.type, a.job_id);
+    DB.addInterviewItems(id, a.items);
+    const out: Record<string, unknown> = { ok: true, interview_id: id, items_recorded: a.items.length };
+    if (a.done) {
+      if (!a.summary) return json({ ok: false, error: "completing an interview (done:true) needs a summary — the honest read after questioning." });
+      DB.completeInterview(id, a.verified_ceiling ?? null, a.summary);
+      const weak = a.items.filter((i) => i.score === "weak" || i.understanding === "shallow" || i.understanding === "cannot_explain" || i.ownership === "observer").length;
+      out.completed = true;
+      out.note = `completed. ${weak}/${a.items.length} item(s) were weak/unverified. Now: re-run assess_competency per dimension with the demonstrated evidence (level ≤ verified_ceiling ${a.verified_ceiling ?? "?"}), and recommend_upskilling for each delta.`;
+    } else {
+      out.note = "appended. Continue the interview, or call again with done:true + a summary to complete it (the session persists, so you can resume it in a later turn).";
+    }
+    return json(out);
+  });
+
+  // ── job grade (catalog) ─────────────────────────────────────────────────────
+  server.registerTool("grade_job", {
+    description: `A job's intrinsic grade: seniority (${ladder}), market signal (${MARKET.join(" | ")}), required-vs-preferred skills. → catalog. Mode: job_intrinsic.`,
+    inputSchema: { job_id: z.number().int(), seniority: enumOf(SENIORITY), market_signal: enumOf(MARKET), skills: z.array(z.object({ skill: z.string(), kind: enumOf(["required", "preferred"]) })) },
   }, async (a) => {
     if (!DB.getJob(a.job_id)) return noJob(a.job_id);
     DB.setJobGrade(a.job_id, a.seniority, a.market_signal, a.skills);
     return json({ ok: true, job_id: a.job_id });
   });
 
-  server.registerTool("grade_job_fit", {
-    description: "The user's fit on a job (over/exactly/under-qualified + gaps), measured against the assessed level. → personal (never shared). Mode: user_fit. Requires a level assessment first.",
-    inputSchema: { job_id: z.number().int(), band: enumOf(FIT), gaps: z.array(z.string()).optional(), rationale: z.string().min(1) },
-  }, async (a) => {
-    if (!DB.getJob(a.job_id)) return noJob(a.job_id);
-    if (!readJourneyState().assessed_level)
-      return json({ ok: false, error: "assess the user's level first via record_level_assessment — fit is measured relative to it (see the user_fit mode's must_reference_assessed_level)." });
-    DB.setJobFit(a.job_id, a.band, a.gaps ?? [], a.rationale);
-    return json({ ok: true, job_id: a.job_id, band: a.band });
-  });
-
-  server.registerTool("grade_portfolio_project", {
-    description: `A portfolio project's relevance to the user's TARGET ROLE — the join point that grounds which projects to feature (cover letter), anchor (outreach), or deep-dive (interview). → personal. Mode: portfolio_relevance (${RELEVANCE.join(" | ")}). repo is the full_name from look({ at: 'portfolio' }). Reads best after ingest_portfolio + a target role on file.`,
+  // ── role fit (judgment, per-dimension + desire alignment) ──────────────────
+  server.registerTool("assess_role_fit", {
+    description: `The user's fit on a job: band (${FITBAND.join(" | ")}) PER DIMENSION + desire_alignment (${DESIRE_ALIGN.join(" | ")}) vs. their stated desires. → personal. This is the hermeneutic join: surface the tension (fitness vs. desire — e.g. 'a fit but onsite when you want remote', or 'you want it but you're a level under'). Mode: role_fit. Requires a competency profile.`,
     inputSchema: {
-      repo: z.string(),
-      relevance: enumOf(RELEVANCE),
-      demonstrates: z.array(z.string()),
+      job_id: z.number().int(),
+      band: enumOf(FITBAND),
+      dim_deltas: z.object({ technical_depth: z.string().optional(), system_design: z.string().optional(), communication: z.string().optional(), ownership: z.string().optional() }).optional(),
+      desire_alignment: enumOf(DESIRE_ALIGN),
       gaps: z.array(z.string()).optional(),
       rationale: z.string().min(1),
     },
   }, async (a) => {
-    if (!DB.getPortfolio().some((p) => p.repo === a.repo))
-      return json({ ok: false, error: `no repo '${a.repo}' in the portfolio — list them via look({ at: 'portfolio' }), or run gather({ step: 'ingest_portfolio' }) first.` });
+    if (!DB.getJob(a.job_id)) return noJob(a.job_id);
+    if (!readJourneyState().dimensions.profiled) return json({ ok: false, error: "assess the competency profile first (assess_competency) — role fit is measured against it." });
+    DB.setRoleFit(a.job_id, a.band, a.dim_deltas ?? null, a.desire_alignment, a.gaps ?? [], a.rationale);
+    return json({ ok: true, job_id: a.job_id, band: a.band, desire_alignment: a.desire_alignment });
+  });
+
+  // ── portfolio relevance (judgment) ─────────────────────────────────────────
+  server.registerTool("grade_portfolio_project", {
+    description: `A portfolio project's relevance to the TARGET ROLE (${RELEVANCE.join(" | ")}). → personal. Grounds which projects to feature/anchor/deep-dive. Mode: portfolio_relevance. repo = full_name from look({ at: 'portfolio' }).`,
+    inputSchema: { repo: z.string(), relevance: enumOf(RELEVANCE), demonstrates: z.array(z.string()), gaps: z.array(z.string()).optional(), rationale: z.string().min(1) },
+  }, async (a) => {
+    const proj = DB.getPortfolio().find((p) => p.repo === a.repo);
+    if (!proj) return json({ ok: false, error: `no repo '${a.repo}' — list via look({ at: 'portfolio' }).` });
     const out: Record<string, unknown> = { ok: true, repo: a.repo, relevance: a.relevance };
-    if (!readJourneyState().profile?.target_role)
-      out.note = "no target_role on file — grade against the role the user described; capture it via capture_onboarding_profile so the judgment is anchored (the mode wants must_reference_target_role).";
+    const notes: string[] = [];
+    if (!readJourneyState().profile?.target_role) notes.push("no target_role on file — capture it via capture_profile so the judgment is anchored.");
+    const verifiedInInterview = DB.getInterviews().some((iv) => DB.getInterviewItems(iv.id).some((it) => (it.claim ?? "").toLowerCase().includes(a.repo.toLowerCase())));
+    if (a.relevance === "strong" && !verifiedInInterview) {
+      if (proj.source === "manual") notes.push(`'${a.repo}' is a manual/claimed project with no public code and no interview finding — grading it 'strong' features an UNVERIFIED claim. Verify in an interview first, or grade lower.`);
+      else {
+        const v = proj.facts_json ? (JSON.parse(proj.facts_json).verify ?? null) : null;
+        if (v && v.solo === true && v.authored_share != null && v.authored_share < 0.5) notes.push(`'${a.repo}' shows low authored_share (${v.authored_share}) — confirm it's the user's work before featuring 'strong'.`);
+      }
+    }
+    if (notes.length) out.note = notes.join(" ");
     DB.setPortfolioRelevance(a.repo, a.relevance, a.demonstrates, a.gaps ?? [], a.rationale);
     return json(out);
   });
 
-  server.registerTool("add_portfolio_project", {
-    description: "Add a project to the portfolio that ingest_portfolio can't see — a private or flagship project the user describes (e.g. one on the resume with no public repo). → personal; persists across re-ingest (unlike fetched repos). name is the key (a bare name, not 'owner/name'); describe what it is and its stack. Then grade_portfolio_project scores it like any repo and it flows into packets. Use it when reconciling the resume against the fetched repos and a key project is missing.",
-    inputSchema: {
-      name: z.string(),
-      description: z.string().min(1),
-      languages: z.array(z.string()).optional(),
-      url: z.string().optional(),
-    },
+  // ── upskilling plan (judgment) ─────────────────────────────────────────────
+  server.registerTool("recommend_upskilling", {
+    description: `Turn assessed gaps into a tracked plan that raises REAL fitness. → personal. Mode: upskilling_plan. Each item: gap (a dimension or skill), type (${PLAN_TYPE.join(" | ")}), spec (concrete — 'learn' = what to do, 'resume' = a specific honest change, 'build' = a project to ship), market_demand (which in-demand skill it closes — ground 'build'/'learn' in the market overlay). Tracked suggested→in_progress→done; closing items re-opens higher-band roles.`,
+    inputSchema: { items: z.array(z.object({ gap: z.string(), type: enumOf(PLAN_TYPE), spec: z.string().min(1), market_demand: z.string().optional() })).min(1) },
   }, async (a) => {
-    DB.addPortfolioProject(a.name, { repo: a.name, name: a.name, description: a.description, languages: a.languages ?? [], url: a.url ?? null, source: "manual" });
-    return json({ ok: true, repo: a.name, note: "added (manual) — grade its relevance with grade_portfolio_project so it ranks into packets alongside the fetched repos." });
+    const ids = a.items.map((it) => DB.addPlanItem(it.gap, it.type, it.spec, it.market_demand));
+    return json({ ok: true, added: ids.length, item_ids: ids, note: "tracked. Mark progress with update_plan_progress; when items close, re-match (look jobs scope:'relevant') — the band may have moved." });
   });
 
+  server.registerTool("update_plan_progress", {
+    description: `Update an upskilling-plan item's status (${PLAN_STATUS.join(" | ")}) and/or notes. → personal, mechanical. Marking items 'done' raises fitness — re-assess the relevant dimension (assess_competency) and re-match. Find item ids via look({ at: 'plan' }).`,
+    inputSchema: { item_id: z.number().int(), status: enumOf(PLAN_STATUS).optional(), progress_notes: z.string().optional() },
+  }, async (a) => {
+    if (!DB.updatePlanItem(a.item_id, a.status ?? null, a.progress_notes ?? null)) return json({ ok: false, error: `no plan item ${a.item_id} — list via look({ at: 'plan' }).` });
+    const out: Record<string, unknown> = { ok: true, item_id: a.item_id, plan: DB.planCounts() };
+    if (a.status === "done") out.note = "closed — re-assess the dimension it addressed (assess_competency) and re-run look({ at: 'jobs', scope: 'relevant' }); a higher band may now be in reach.";
+    return json(out);
+  });
+
+  // ── cover letter (judgment) ────────────────────────────────────────────────
   server.registerTool("record_cover_letter", {
-    description: `Persist the agent-authored cover letter + talking points for a role. → personal. Mode: cover_letter (lead with a real angle; ${MODE.letter.constraints.no_invented_experience ? "no invented experience" : "stay grounded in the packet"}). The end-state deliverable; read it back via look({ at: 'packet' }).`,
+    description: "Persist the cover letter + talking points for a role. → personal. Mode: cover_letter — lead with a real angle, no invented experience. Gated on the verified assessment: write to the floor, don't assert seniority the user hasn't demonstrated. Read back via look({ at: 'packet' }).",
     inputSchema: { job_id: z.number().int(), content: z.string().min(1), talking_points: z.array(z.string()).optional() },
   }, async (a) => {
     const job = DB.getJob(a.job_id);
@@ -480,149 +631,88 @@ export function registerTools(server: McpServer): void {
     DB.recordCoverLetter(a.job_id, a.content, a.talking_points ?? []);
     const missing: string[] = [];
     if (!DB.getMasterResume()?.content) missing.push("master_resume");
-    if (!DB.db.prepare("SELECT 1 FROM job_fit WHERE job_id=?").get(a.job_id)) missing.push("fit");
+    if (!DB.getRoleFit(a.job_id)) missing.push("role_fit");
     if (job.grade_seniority == null) missing.push("job_grade");
+    const s = readJourneyState();
+    const notes: string[] = [];
+    if (missing.length) notes.push(`missing ${missing.join(", ")} — the letter may be ungrounded; don't fabricate.`);
+    if (!s.dimensions.verified || (s.assessment?.confidence && s.assessment.confidence !== "high")) notes.push(`the assessment is ${s.assessment?.confidence ?? "unrecorded"}${s.dimensions.verified ? "" : "/unverified"} — claim only what's demonstrated (write to floor ${s.assessment?.floor ?? "?"}).`);
     const out: Record<string, unknown> = { ok: true, job_id: a.job_id, next: "when the user applies, track it with record_application." };
-    if (missing.length) out.note = `saved — but this job is missing ${missing.join(", ")}, so the letter may be ungrounded. The cover_letter mode forbids inventing experience — don't fabricate those inputs.`;
+    if (notes.length) out.note = "saved — " + notes.join(" ");
     return json(out);
   });
 
-  // ── application tracking (personal, mechanical) — the apply→…→offer pipeline ──
+  // ── application tracking (personal, mechanical) ────────────────────────────
   server.registerTool("record_application", {
-    description: `Track the user's application to a job (they apply themselves; this records it). → personal. status: ${APP_STATUS.join(" | ")}. Idempotent per job — updating the status preserves the fields you don't pass (applied_at, notes, next_action). Optional applied_at / next_action / next_action_at / notes. Read the funnel via look({ at: 'applications' }); a job's status also shows in look({ at: 'packet' }).`,
-    inputSchema: {
-      job_id: z.number().int(),
-      status: enumOf(APP_STATUS),
-      applied_at: z.string().optional(),
-      next_action: z.string().optional(),
-      next_action_at: z.string().optional(),
-      notes: z.string().optional(),
-    },
+    description: `Track the user's application (they apply; this records it). → personal. status: ${APP_STATUS.join(" | ")}. Idempotent; a status update preserves fields you don't pass. Optional applied_at / next_action / next_action_at / notes. Read the funnel via look({ at: 'applications' }).`,
+    inputSchema: { job_id: z.number().int(), status: enumOf(APP_STATUS), applied_at: z.string().optional(), next_action: z.string().optional(), next_action_at: z.string().optional(), notes: z.string().optional() },
   }, async (a) => {
     if (!DB.getJob(a.job_id)) return noJob(a.job_id);
     DB.recordApplication(a.job_id, { status: a.status, applied_at: a.applied_at, next_action: a.next_action, next_action_at: a.next_action_at, notes: a.notes });
     return json({ ok: true, job_id: a.job_id, status: a.status, pipeline: DB.applicationCounts() });
   });
 
-  // ── gather: the one door to the outside world ─────────────────────────────
-  const pending = pendingSteps();
-  const gatherDesc =
-    `${pending.length ? `[NOT YET AVAILABLE IN THIS BUILD: ${pending.join(", ")}] ` : ""}` +
-    "The one door to the outside world — reach out and persist new data, then return it. step selects the integration: " +
-    "'find_companies' (lead-gen → ATS-slug resolution; FREE by default. Lightest: pass companies:[{name,domain}] to resolve specific companies on demand, no key — and for a board whose slug isn't derivable from name/domain, PIN it directly: companies:[{name, ats_platform, ats_slug}] (slug-complete, skips resolution). Or build a query from the resume — titles/technologies/seniority/locations — for the free curated roster; pass provider:'theirstack' (+ THEIRSTACK_API_KEY) for paid targeted discovery, count-first and credit-ceiling-gated), " +
-    "'fetch_jobs' (pull live ATS boards → raw, ungraded jobs; keyless. Target one board with ats_platform+ats_slug or company_id, or pass none to refresh all resolved companies (stalest first, bounded by limit). A liveness pass closes postings that vanished; grade the new jobs next), " +
-    "'ingest_portfolio' (the user's public GitHub repos → portfolio facts for coaching; keyless. Each kept repo is enriched with its language breakdown + a README excerpt so grade_portfolio_project reads real substance, not a one-liner. Uses the profile's github_handle, or pass one; forks skipped unless include_forks; enrich_max bounds enrichment, GITHUB_TOKEN raises the rate limit), " +
-    "'sync_catalog' (bidirectional sync of PUBLIC catalog data only — companies + jobs + grades — with a shared pool; personal data never leaves. Opt-in: needs JOBBOT_POOL_URL configured. dry_run shows the push/pull diff without sending or writing anything). " +
-    "Persistence is a side effect of gathering — the agent still never writes the DB itself.";
+  // ── gather: the one door to the outside world (sync cut in v2) ─────────────
   server.registerTool("gather", {
-    description: gatherDesc,
+    description:
+      "The one door to the outside world — reach out, persist, return findings. step: " +
+      "'find_companies' (lead-gen → ATS-slug resolution; FREE. Pass companies:[{name,domain}] to resolve on demand, or companies:[{name,ats_platform,ats_slug}] to PIN a board; or a query from the resume for the curated roster; provider:'theirstack' (+THEIRSTACK_API_KEY) for paid targeted discovery, count-first + credit-gated), " +
+      "'fetch_jobs' (pull live ATS boards → raw ungraded jobs; keyless. ats_platform+ats_slug or company_id, or none = refresh all resolved, stalest-first), " +
+      "'ingest_portfolio' (public GitHub repos → portfolio facts + VERIFICATION signals (authorship/traction/age/vanity-badges); keyless. github_handle or the profile's; enrich_max bounds enrichment). " +
+      "Persistence is a side effect; the agent still never writes the DB itself.",
     inputSchema: {
-      step: enumOf(["find_companies", "fetch_jobs", "ingest_portfolio", "sync_catalog"]),
-      // find_companies — on-demand (free, zero-config): name companies to resolve directly.
-      companies: z.array(z.object({
-        name: z.string(),
-        domain: z.string().optional(),
-        ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(),
-        ats_slug: z.string().optional(),
-      })).optional(),
-      // find_companies query (you build this from the resume — stages 1–2 are yours):
-      titles: z.array(z.string()).optional(),
-      technologies: z.array(z.string()).optional(),
+      step: enumOf(["find_companies", "fetch_jobs", "ingest_portfolio"]),
+      companies: z.array(z.object({ name: z.string(), domain: z.string().optional(), ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(), ats_slug: z.string().optional() })).optional(),
+      titles: z.array(z.string()).optional(), technologies: z.array(z.string()).optional(),
       seniority: enumOf(["junior", "mid_level", "senior", "staff", "c_level"]).optional(),
-      locations: z.array(z.string()).optional(),
-      posted_within_days: z.number().int().positive().optional(),
-      provider: z.string().optional(),     // default: 'curated' (free); 'theirstack' opt-in
-      max_credits: z.number().int().positive().optional(), // override the per-run ceiling
-      confirm: z.boolean().optional(),     // proceed with a paid pull above the ceiling
-      niche: z.string().optional(),
-      // fetch_jobs targets (all optional — none = refresh every resolved company):
-      ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(),
-      ats_slug: z.string().optional(),
-      company_id: z.number().int().optional(),
-      github_handle: z.string().optional(),
-      include_forks: z.boolean().optional(), // ingest_portfolio: keep forked repos (default: skip)
-      enrich_max: z.number().int().nonnegative().optional(), // ingest_portfolio: how many repos to enrich with languages+README (default 20; 0 = metadata only)
-      dry_run: z.boolean().optional(),     // free count-first only — never spends
-      limit: z.number().int().positive().optional(),
+      locations: z.array(z.string()).optional(), posted_within_days: z.number().int().positive().optional(),
+      provider: z.string().optional(), max_credits: z.number().int().positive().optional(), confirm: z.boolean().optional(), niche: z.string().optional(),
+      ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(), ats_slug: z.string().optional(), company_id: z.number().int().optional(),
+      github_handle: z.string().optional(), include_forks: z.boolean().optional(), enrich_max: z.number().int().nonnegative().optional(),
+      dry_run: z.boolean().optional(), limit: z.number().int().positive().optional(),
     },
   }, async (a) => {
     switch (a.step) {
-      case "find_companies":
-        return FIND_COMPANIES_AVAILABLE ? findCompanies(a) : planned("lead-gen + ATS-slug resolution");
-      case "fetch_jobs":
-        return FETCH_JOBS_AVAILABLE ? fetchJobs(a) : planned("fetch + normalize a live ATS board");
-      case "ingest_portfolio":
-        return PORTFOLIO_INGEST_AVAILABLE ? ingestPortfolio(a) : planned("fetch the user's public GitHub repos");
-      case "sync_catalog":
-        return SYNC_AVAILABLE ? syncCatalog(a) : planned("bidirectional catalog sync with an external pool");
+      case "find_companies": return findCompanies(a);
+      case "fetch_jobs": return fetchJobs(a);
+      case "ingest_portfolio": return ingestPortfolio(a);
       default: return json({ ok: false, error: `unknown gather step '${a.step}'` });
     }
   });
 }
 
-// ── find_companies orchestration (gather step 'find_companies') ──────────────
-// Stages 3–4: discovery (a sense) → free ATS resolution → persist via db.ts (the sole
-// writer). Stages 1–2 (resume → query) are the agent's; this receives the built query.
-// DEFAULT IS FREE: no provider arg → the free curated roster; the zero-config on-demand
-// path ('companies') is free too. TheirStack is opt-in (provider:'theirstack' + key).
-// Cost-disciplined: count-first is free, paid pulls gate on a per-run credit ceiling,
-// and persistence is idempotent (re-runs dedup on domain, never re-pay). `deps` is
-// injectable so the whole path is testable offline against a mocked fetch.
+// ── find_companies orchestration ─────────────────────────────────────────────
 interface FindArgs {
-  titles?: string[]; technologies?: string[]; seniority?: string;
-  locations?: string[]; posted_within_days?: number;
-  // on-demand: resolve these directly (free). A company carrying ats_platform + ats_slug is
-  // PINNED — taken slug-complete, skipping resolution (for boards whose slug isn't derivable
-  // from name/domain, e.g. Greenhouse token 'gleanwork' for Glean).
+  titles?: string[]; technologies?: string[]; seniority?: string; locations?: string[]; posted_within_days?: number;
   companies?: { name: string; domain?: string; ats_platform?: string; ats_slug?: string }[];
   provider?: string; max_credits?: number; confirm?: boolean; dry_run?: boolean; limit?: number;
 }
 interface FindDeps { ctx?: ProviderContext; resolve?: typeof resolveAts }
-const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-// Resolve + persist a batch of discovered companies. Slug-complete entries skip
-// resolution; name/domain entries resolve for free; unresolved-but-domained rows persist
-// as candidates (dedupable on re-run); a row with neither slug nor domain is unfetchable
-// and undedupable, so it's skipped rather than persisted as a re-inserting orphan.
 async function persistDiscovered(companies: DiscoveredCompany[], resolve: typeof resolveAts) {
   let inserted = 0, resolved = 0, unresolved = 0, skipped = 0;
   for (const c of companies) {
     if (c.ats_platform && c.ats_slug) {
       const up = DB.upsertCompany({ name: c.name, domain: c.domain, source: c.source, tags: c.tags, ats_platform: c.ats_platform, ats_slug: c.ats_slug });
-      if (up.inserted) inserted++;
-      resolved++;
-      continue;
+      if (up.inserted) inserted++; resolved++; continue;
     }
     const hit = await resolve({ name: c.name, domain: c.domain });
     if (hit) {
       const up = DB.upsertCompany({ name: c.name, domain: c.domain, source: c.source, tags: c.tags, ats_platform: hit.platform, ats_slug: hit.slug });
-      if (up.inserted) inserted++;
-      resolved++;
+      if (up.inserted) inserted++; resolved++;
     } else if (c.domain) {
-      const up = DB.upsertCompany({ name: c.name, domain: c.domain, source: c.source, tags: c.tags }); // resolved=0
-      if (up.inserted) inserted++;
-      DB.bumpResolveAttempt(up.id);
-      unresolved++;
-    } else {
-      skipped++;
-    }
+      const up = DB.upsertCompany({ name: c.name, domain: c.domain, source: c.source, tags: c.tags });
+      if (up.inserted) inserted++; DB.bumpResolveAttempt(up.id); unresolved++;
+    } else skipped++;
   }
   return { inserted, resolved, unresolved, skipped };
 }
 
-const nextNote = () => FETCH_JOBS_AVAILABLE
-  ? "resolved companies are ready — pull their live boards with gather({ step: 'fetch_jobs', ats_platform, ats_slug })."
-  : "companies are in the catalog; pulling their live jobs (gather 'fetch_jobs') ships next. Unresolved rows have no ATS slug yet.";
+const nextNote = () => "resolved companies are ready — pull their live boards with gather({ step: 'fetch_jobs' }).";
 
 export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
   const resolve = deps.resolve ?? resolveAts;
-
-  // ── On-demand path (free, zero-config): the user named specific companies. Resolve and
-  // persist them directly — no provider, no count, no key. The lightest free path.
   if (a.companies?.length) {
-    // A company with both ats_platform + ats_slug is PINNED (slug-complete → skips
-    // resolution); name/domain-only entries resolve normally. Pinning needs both halves —
-    // a lone ats_platform or ats_slug is ignored and the entry resolves by name/domain.
     const discovered: DiscoveredCompany[] = a.companies.map((c) => ({
       name: c.name, domain: c.domain ?? null, tags: [], source: "manual",
       ats_platform: (c.ats_platform && c.ats_slug) ? c.ats_platform : null,
@@ -631,242 +721,111 @@ export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
     const persisted = await persistDiscovered(discovered, resolve);
     const pinned = a.companies.filter((c) => c.ats_platform && c.ats_slug).length;
     const out: Record<string, unknown> = { ok: true, mode: "on_demand", credits_spent: 0, discovered: discovered.length, persisted, catalog: readJourneyState().catalog, next: nextNote() };
-    if (pinned) out.note = `${pinned} board(s) pinned by explicit ats_platform/ats_slug (slug-complete, not re-verified — gather('fetch_jobs') confirms them when it pulls).`;
+    if (pinned) out.note = `${pinned} board(s) pinned (slug-complete; gather('fetch_jobs') confirms them).`;
     return json(out);
   }
-
-  // ── Provider discovery path. Default provider is the free curated roster.
   const providerName = a.provider ?? Object.keys(PROVIDERS)[0];
   const provider = PROVIDERS[providerName];
-  if (!provider) return json({ ok: false, error: `unknown provider '${providerName}' — available: ${Object.keys(PROVIDERS).join(", ") || "(none)"}` });
-
+  if (!provider) return json({ ok: false, error: `unknown provider '${providerName}' — available: ${Object.keys(PROVIDERS).join(", ")}` });
   const ctx = deps.ctx ?? providerContext();
-  if (!provider.available(ctx))
-    return json({ ok: false, error: `provider '${provider.name}' is unavailable${provider.requiresKey ? " — set THEIRSTACK_API_KEY in the local env to opt into paid targeting (a data-source key; the model key never enters the server). The free 'curated' provider and the 'companies' on-demand path need no key." : "."}` });
-
-  const q: DiscoverQuery = {
-    titles: a.titles, technologies: a.technologies, seniority: a.seniority ?? null,
-    locations: a.locations, posted_within_days: a.posted_within_days, limit: a.limit,
-  };
-
-  let est;
-  try { est = await provider.estimate(q, ctx); }            // FREE count-first
-  catch (e) { return json({ ok: false, error: `discovery pre-flight failed: ${errMsg(e)}` }); }
-
+  if (!provider.available(ctx)) return json({ ok: false, error: `provider '${provider.name}' is unavailable${provider.requiresKey ? " — set THEIRSTACK_API_KEY to opt into paid targeting. The free 'curated' provider and the 'companies' on-demand path need no key." : "."}` });
+  const q: DiscoverQuery = { titles: a.titles, technologies: a.technologies, seniority: a.seniority ?? null, locations: a.locations, posted_within_days: a.posted_within_days, limit: a.limit };
+  let est; try { est = await provider.estimate(q, ctx); } catch (e) { return json({ ok: false, error: `discovery pre-flight failed: ${errMsg(e)}` }); }
   const ceiling = a.max_credits ?? MAX_CREDITS_PER_RUN;
-  if (a.dry_run)
-    return json({ ok: true, dry_run: true, provider: provider.name, estimate: est, ceiling, note: est.projected_credits === 0 ? "free provider — no spend; re-run without dry_run to persist." : "free count only — re-run without dry_run to pull (paid)." });
-  if (est.projected_credits > ceiling && !a.confirm)
-    return json({ ok: false, confirmation_required: true, provider: provider.name, estimate: est, ceiling,
-      note: `projected ~${est.projected_credits} credits exceeds the per-run ceiling (${ceiling}). Re-run with confirm:true to proceed, or lower limit / raise max_credits.` });
-
-  let result;
-  try { result = await provider.discover(q, ctx); }
-  catch (e) { return json({ ok: false, error: `discovery failed: ${errMsg(e)}` }); }
-
+  if (a.dry_run) return json({ ok: true, dry_run: true, provider: provider.name, estimate: est, ceiling, note: est.projected_credits === 0 ? "free provider — re-run without dry_run to persist." : "free count only — re-run without dry_run to pull (paid)." });
+  if (est.projected_credits > ceiling && !a.confirm) return json({ ok: false, confirmation_required: true, provider: provider.name, estimate: est, ceiling, note: `projected ~${est.projected_credits} credits exceeds the ceiling (${ceiling}). Re-run with confirm:true, or lower limit / raise max_credits.` });
+  let result; try { result = await provider.discover(q, ctx); } catch (e) { return json({ ok: false, error: `discovery failed: ${errMsg(e)}` }); }
   const persisted = await persistDiscovered(result.companies, resolve);
-  const out: Record<string, unknown> = {
-    ok: true, provider: provider.name, estimate: est, credits_spent: result.records_billed,
-    discovered: result.companies.length, persisted, catalog: readJourneyState().catalog, next: nextNote(),
-  };
-  // Honest guidance when the default free roster is empty — point at the paths that work now.
-  if (result.companies.length === 0 && provider.name === "curated")
-    out.note = "the curated seed roster is empty. Name companies directly to add them now — gather({ step: 'find_companies', companies: [{ name, domain }] }) — or add entries to seeds/companies.json, or set THEIRSTACK_API_KEY and pass provider:'theirstack' for paid targeted discovery.";
+  const out: Record<string, unknown> = { ok: true, provider: provider.name, estimate: est, credits_spent: result.records_billed, discovered: result.companies.length, persisted, catalog: readJourneyState().catalog, next: nextNote() };
+  if (result.companies.length === 0 && provider.name === "curated") out.note = "the curated seed roster is empty. Name companies directly — gather({ step: 'find_companies', companies: [{ name, domain }] }) — or add to seeds/companies.json, or set THEIRSTACK_API_KEY.";
   return json(out);
 }
 
-// ── fetch_jobs orchestration (gather step 'fetch_jobs') ──────────────────────
-// Keyless: pull one or many ATS boards, normalize, and persist via db.ts (the sole
-// writer). Targets: ats_platform+ats_slug (one board; auto-creates a minimal resolved
-// company if that slug is new), company_id (one known company), or none (refresh all
-// resolved companies, stalest-first, bounded by limit). An UNREACHABLE board (null) is
-// reported and skipped — never persisted, so a transient 404 never closes a whole
-// company; a valid EMPTY board ([]) closes that company's stale postings via the liveness
-// pass. `deps` is injectable so the whole path is testable offline against a mocked fetch.
+// ── fetch_jobs orchestration ──────────────────────────────────────────────────
 interface FetchArgs { ats_platform?: string; ats_slug?: string; company_id?: number; limit?: number }
 interface FetchTarget { company_id: number; platform: AtsPlatform; slug: string; name: string }
-interface FetchDeps {
-  fetchBoardFn?: typeof fetchBoard;
-  sleep?: (ms: number) => Promise<void>;
-  politeDelayMs?: number; // between consecutive boards (Lever asks ~1s); 0 in tests
-}
+interface FetchDeps { fetchBoardFn?: typeof fetchBoard; sleep?: (ms: number) => Promise<void>; politeDelayMs?: number }
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
   const fetchBoardFn = deps.fetchBoardFn ?? fetchBoard;
   const sleep = deps.sleep ?? realSleep;
   const politeDelayMs = deps.politeDelayMs ?? 1000;
-
-  // ── resolve the target list ────────────────────────────────────────────────
   const targets: FetchTarget[] = [];
   if (a.ats_platform && a.ats_slug) {
-    const platform = a.ats_platform as AtsPlatform; // constrained by the gather enum
+    const platform = a.ats_platform as AtsPlatform;
     const existing = DB.getCompanyByAts(platform, a.ats_slug);
     const id = existing?.id ?? DB.upsertCompany({ name: a.ats_slug, ats_platform: platform, ats_slug: a.ats_slug, source: "manual" }).id;
     targets.push({ company_id: id, platform, slug: a.ats_slug, name: existing?.name ?? a.ats_slug });
   } else if (a.company_id !== undefined) {
-    const c = DB.db.prepare("SELECT id, name, ats_platform, ats_slug FROM companies WHERE id=?").get(a.company_id) as
-      { id: number; name: string; ats_platform: string | null; ats_slug: string | null } | undefined;
-    if (!c) return json({ ok: false, error: `no company ${a.company_id} — list companies via look({ at: 'companies' }).` });
-    if (!c.ats_platform || !c.ats_slug) return json({ ok: false, error: `company ${a.company_id} (${c.name}) has no ATS slug yet — resolve it via gather('find_companies') first.` });
+    const c = DB.db.prepare("SELECT id, name, ats_platform, ats_slug FROM companies WHERE id=?").get(a.company_id) as { id: number; name: string; ats_platform: string | null; ats_slug: string | null } | undefined;
+    if (!c) return json({ ok: false, error: `no company ${a.company_id}.` });
+    if (!c.ats_platform || !c.ats_slug) return json({ ok: false, error: `company ${a.company_id} (${c.name}) has no ATS slug — resolve via gather('find_companies') first.` });
     targets.push({ company_id: c.id, platform: c.ats_platform as AtsPlatform, slug: c.ats_slug, name: c.name });
   } else {
-    for (const c of DB.getResolvedCompanies(a.limit ?? 25))
-      targets.push({ company_id: c.id, platform: c.ats_platform as AtsPlatform, slug: c.ats_slug!, name: c.name });
+    for (const c of DB.getResolvedCompanies(a.limit ?? 25)) targets.push({ company_id: c.id, platform: c.ats_platform as AtsPlatform, slug: c.ats_slug!, name: c.name });
   }
-  if (targets.length === 0)
-    return json({ ok: true, boards_fetched: 0, note: "no resolved companies to fetch — discover and resolve some via gather('find_companies'), or target a board with ats_platform + ats_slug." });
+  if (targets.length === 0) return json({ ok: true, boards_fetched: 0, note: "no resolved companies — discover some via gather('find_companies'), or target a board with ats_platform + ats_slug." });
 
-  // ── fetch each board, persist via db.ts ────────────────────────────────────
   const totals = { inserted: 0, updated: 0, closed: 0 };
   const per_company: Record<string, unknown>[] = [];
   let unreachable = 0;
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i];
-    if (i > 0 && politeDelayMs > 0) await sleep(politeDelayMs); // be polite between boards
-    let board;
-    try { board = await fetchBoardFn(t.platform, t.slug); }
-    catch { board = null; }
-    if (board === null) { // unreachable — skip, do NOT touch liveness
-      unreachable++;
-      per_company.push({ company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true });
-      continue;
-    }
+    if (i > 0 && politeDelayMs > 0) await sleep(politeDelayMs);
+    let board; try { board = await fetchBoardFn(t.platform, t.slug); } catch { board = null; }
+    if (board === null) { unreachable++; per_company.push({ company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true }); continue; }
     const r = DB.upsertJobs(t.company_id, board);
     totals.inserted += r.inserted; totals.updated += r.updated; totals.closed += r.closed;
     per_company.push({ company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, ...r });
   }
-
   return json({
-    ok: true,
-    boards_fetched: targets.length - unreachable,
-    unreachable,
-    jobs: totals,
-    per_company,
-    catalog: readJourneyState().catalog,
-    next: totals.inserted + totals.updated > 0
-      ? "grade the new jobs — look({ at: 'jobs', scope: 'worklist' }) for the queue, then grade_job + grade_job_fit."
-      : "no live postings found on these boards (or all unreachable). Try other companies, or coach from the resume.",
+    ok: true, boards_fetched: targets.length - unreachable, unreachable, jobs: totals, per_company, catalog: readJourneyState().catalog,
+    next: totals.inserted + totals.updated > 0 ? "grade the new jobs — look({ at: 'jobs', scope: 'worklist' }), then grade_job." : "no live postings found (or all unreachable).",
   });
 }
 
-// ── ingest_portfolio orchestration (gather step 'ingest_portfolio') ──────────
-// Keyless: fetch the user's public GitHub repos as structured facts and store a fresh
-// snapshot via db.ts (the sole writer). A SENSE only — the agent reads the facts via
-// look({ at: 'portfolio' }) and does the judging (which to feature, architecture read).
-// Honors the no_github opt-out; persists a passed handle to the profile. `deps` is
-// injectable so the path is testable offline against a mocked fetch.
-const ENRICH_MAX_DEFAULT = 20; // cap per-repo enrichment (~2 calls each) — bound the rate-limit hit
+// ── ingest_portfolio orchestration (with verification signals) ────────────────
+const ENRICH_MAX_DEFAULT = 20;
 interface IngestArgs { github_handle?: string; include_forks?: boolean; enrich_max?: number }
 interface IngestDeps { fetchReposFn?: typeof fetchUserRepos; enrichFn?: typeof enrichRepo; token?: string }
 
 export async function ingestPortfolio(a: IngestArgs, deps: IngestDeps = {}) {
   const s = readJourneyState();
-  if (s.profile?.no_github)
-    return json({ ok: false, error: "the user opted out of GitHub (no_github) — clear it via capture_onboarding_profile to ingest, or coach from projects they describe in chat." });
+  if (s.profile?.no_github) return json({ ok: false, error: "the user opted out of GitHub (no_github) — coach from the interview + described projects; absence is not penalized." });
   const handle = a.github_handle ?? s.profile?.github_handle ?? undefined;
-  if (!handle)
-    return json({ ok: false, error: "no github_handle — pass one, or capture it via capture_onboarding_profile first." });
-
+  if (!handle) return json({ ok: false, error: "no github_handle — pass one, or capture it via capture_profile." });
   const token = deps.token ?? process.env.GITHUB_TOKEN;
   const fetchReposFn = deps.fetchReposFn ?? fetchUserRepos;
   let repos: RepoFacts[];
-  try { repos = await fetchReposFn(handle, { token }); }
-  catch (e) { return json({ ok: false, error: `GitHub fetch failed: ${errMsg(e)}` }); }
-
+  try { repos = await fetchReposFn(handle, { token }); } catch (e) { return json({ ok: false, error: `GitHub fetch failed: ${errMsg(e)}` }); }
   const kept = a.include_forks ? repos : repos.filter((r) => !r.is_fork);
-  // Enrich the kept repos (most-recently-pushed first) with languages + README so the
-  // relevance grade reads real substance, not a one-line description. Bounded by enrich_max
-  // (0 = skip for a fast metadata-only pull); each enrichment degrades to basic facts on error.
   const enrichFn = deps.enrichFn ?? enrichRepo;
   const enrichMax = a.enrich_max ?? ENRICH_MAX_DEFAULT;
   const toEnrich = kept.slice(0, enrichMax);
   for (const r of toEnrich) {
-    const e = await enrichFn(r.repo, { token });
-    r.languages = e.languages;
-    r.readme_excerpt = e.readme_excerpt;
+    const e = await enrichFn(r.repo, { token, handle });
+    r.languages = e.languages; r.readme_excerpt = e.readme_excerpt; r.verify = e.verify;
   }
-
   DB.replacePortfolio(kept.map((r) => ({ repo: r.repo, facts: r })));
-  // Persist a freshly-supplied handle so later calls (and orient) know it.
   if (a.github_handle && a.github_handle !== s.profile?.github_handle) DB.upsertProfile({ github_handle: a.github_handle });
-
-  return json({
-    ok: true,
-    github_handle: handle,
-    fetched: repos.length,
-    kept: kept.length,
-    enriched: toEnrich.length,
-    forks_skipped: a.include_forks ? 0 : repos.length - kept.length,
-    top_by_recent: kept.slice(0, 5).map((r) => ({ repo: r.repo, languages: r.languages ?? (r.language ? [r.language] : []), stars: r.stars, pushed_at: r.pushed_at })),
-    portfolio_count: DB.counts().portfolio,
-    next: kept.length === 0
-      ? "no public repos found (or all forks). Coach from projects the user describes in chat instead."
-      : `coach the portfolio against demand and grade each repo's relevance to the target role with grade_portfolio_project — the enriched facts (languages + README excerpt) are in look({ at: 'portfolio' })${toEnrich.length < kept.length ? `; ${kept.length - toEnrich.length} repo(s) beyond enrich_max kept at basic facts` : ""}.`,
-  });
-}
-
-// ── sync_catalog orchestration (gather step 'sync_catalog') ──────────────────
-// The egress boundary. Bidirectional sync of PUBLIC catalog data only (the snapshot is
-// built from the catalog plane in db.ts — personal data is structurally excluded). Opt-in:
-// with no pool configured nothing leaves and we just report the local catalog. dry_run
-// computes the push/pull diff in memory and writes/sends nothing. A real run pulls first
-// (merge, newer-wins), then pushes local. Merge policy is the provisional default; see
-// db.applyCatalogSnapshot (handoff §4 lists conflict resolution as an open question).
-interface SyncArgs { dry_run?: boolean }
-interface SyncDeps { pool?: PoolAdapter | null }
-
-// Cross-instance natural keys (local ids are meaningless across the pool).
-const companyKey = (c: SnapshotCompany) => (c.ats_platform && c.ats_slug ? `ats:${c.ats_platform}/${c.ats_slug}` : `dom:${c.domain ?? c.name}`);
-const jobKey = (j: SnapshotJob) => `${j.ats_platform && j.ats_slug ? `ats:${j.ats_platform}/${j.ats_slug}` : `dom:${j.domain}`}|${j.source_url}`;
-const jobNewer = (a: SnapshotJob, b: SnapshotJob) => a.last_seen_at > b.last_seen_at || (!!a.grade_seniority && !b.grade_seniority);
-
-// Pure, in-memory diff between two snapshots — what a pull would add/refresh locally and
-// what a push would contribute to the pool. No DB reads, no mutation; drives dry_run.
-function diffCatalog(local: CatalogSnapshot, remote: CatalogSnapshot) {
-  const lJobs = new Map(local.jobs.map((j) => [jobKey(j), j]));
-  const rJobs = new Map(remote.jobs.map((j) => [jobKey(j), j]));
-  const lCos = new Set(local.companies.map(companyKey));
-  const rCos = new Set(remote.companies.map(companyKey));
-  let pull_new = 0, pull_updated = 0, push_new = 0, push_updated = 0;
-  for (const [k, rj] of rJobs) { const lj = lJobs.get(k); if (!lj) pull_new++; else if (jobNewer(rj, lj)) pull_updated++; }
-  for (const [k, lj] of lJobs) { const rj = rJobs.get(k); if (!rj) push_new++; else if (jobNewer(lj, rj)) push_updated++; }
-  return {
-    pull: { companies_new: [...rCos].filter((k) => !lCos.has(k)).length, jobs_new: pull_new, jobs_updated: pull_updated },
-    push: { companies_new: [...lCos].filter((k) => !rCos.has(k)).length, jobs_new: push_new, jobs_updated: push_updated },
+  const verified = toEnrich.filter((r) => r.verify);
+  const max_stars = kept.reduce((m, r) => Math.max(m, r.stars), 0);
+  const verification = {
+    enriched_with_signals: verified.length,
+    solo_projects: verified.filter((r) => r.verify!.solo).length,
+    low_traction: kept.filter((r) => r.stars < 2 && r.forks < 2).length,
+    self_applied_badges: verified.reduce((n, r) => n + r.verify!.self_applied_badges, 0),
+    max_stars,
+    not_sole_author: verified.filter((r) => r.verify!.authored_share != null && r.verify!.authored_share < 0.5).length,
   };
-}
-
-export async function syncCatalog(a: SyncArgs, deps: SyncDeps = {}) {
-  const local = DB.catalogSnapshot();
-  const pool = deps.pool !== undefined
-    ? deps.pool
-    : getPool({ url: process.env.JOBBOT_POOL_URL, token: process.env.JOBBOT_POOL_TOKEN });
-
-  if (!pool)
-    return json({
-      ok: false, pool_configured: false,
-      local_catalog: { companies: local.companies.length, jobs: local.jobs.length },
-      note: "no shared catalog pool is configured — set JOBBOT_POOL_URL (and optionally JOBBOT_POOL_TOKEN) to enable sync. Only PUBLIC catalog data (companies + jobs + grades) would ever leave; personal data (resume, fit, cover letters) never syncs. No hosted pool ships with this build.",
-    });
-
-  let remote: CatalogSnapshot;
-  try { remote = await pool.pull(); }
-  catch (e) { return json({ ok: false, error: `pool pull failed: ${errMsg(e)}` }); }
-
-  const diff = diffCatalog(local, remote);
-  if (a.dry_run)
-    return json({ ok: true, dry_run: true, pool: pool.name, diff, note: "dry run — nothing was sent or written. Re-run without dry_run to sync (pull-then-push). Only public catalog data is shared." });
-
-  const pulled = DB.applyCatalogSnapshot(remote);   // pull + merge (newer-wins) first
-  let pushed;
-  try { pushed = await pool.push(local); }          // then push local (public catalog only)
-  catch (e) { return json({ ok: false, error: `pool push failed (pull already applied locally): ${errMsg(e)}`, pulled }); }
-  DB.setMeta("last_synced", DB.nowStr());
-
   return json({
-    ok: true, pool: pool.name, pulled, pushed: pushed.accepted,
-    catalog: readJourneyState().catalog,
-    note: "synced — only public catalog data (companies + jobs + grades) was shared; personal data never left.",
+    ok: true, github_handle: handle, fetched: repos.length, kept: kept.length, enriched: toEnrich.length,
+    forks_skipped: a.include_forks ? 0 : repos.length - kept.length,
+    top_by_recent: kept.slice(0, 5).map((r) => ({ repo: r.repo, languages: r.languages ?? (r.language ? [r.language] : []), stars: r.stars, pushed_at: r.pushed_at, solo: r.verify?.solo ?? null })),
+    verification, portfolio_count: DB.counts().portfolio,
+    next: kept.length === 0
+      ? "no public repos found (or all forks). Coach from the interview + described projects — no portfolio penalty."
+      : `read look({ at: 'portfolio' }) — but VERIFY before grading: mostly-solo, low-traction repos (max_stars=${max_stars}) are UNVERIFIED until a competency interview confirms the user built and understands them. Assess skeptically; claimed ≠ demonstrated.${toEnrich.length < kept.length ? ` (${kept.length - toEnrich.length} beyond enrich_max kept at basic facts.)` : ""}`,
   });
 }

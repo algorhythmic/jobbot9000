@@ -1,18 +1,18 @@
 // db.ts — the SQLite layer and the ONLY code that writes the database.
-// Two planes live here: `personal` (local always, never shared) and `catalog`
-// (public market data, the only plane sync touches). Tools call these helpers;
-// the agent never issues a raw write.
+// Two planes: `personal` (local always, never shared) and `catalog` (public market
+// data). Tools call these helpers; the agent never issues a raw write. v2: the model is
+// the readiness LOOP (profile⇅desires → match → interview → upskill → apply → re-match),
+// state is multi-dimensional and DURABLE — versioned history + an append-only journal so a
+// search that spans months never loses progress and any new session resumes from the DB.
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-// STATE_DIR is set by the plugin to ${CLAUDE_PLUGIN_DATA}/state — a persistent,
-// per-plugin directory (~/.claude/plugins/data/<id>/) that survives updates. If the
-// host didn't expand that variable (it arrives unset, or as a literal "${...}" — see
-// claude-code issue #9427 for plugin-root .mcp.json), fall back to a STABLE absolute
-// path under the home dir, NEVER a cwd-relative one (which would fragment the DB
-// across sessions that start in different directories).
+// STATE_DIR is set by the plugin to ${CLAUDE_PLUGIN_DATA}/state — a persistent, per-plugin
+// directory (~/.claude/plugins/data/<id>/) that survives sessions AND plugin updates. If the
+// host didn't expand that variable (unset, or a literal "${...}"), fall back to a STABLE
+// absolute path under the home dir, NEVER a cwd-relative one (which would fragment the DB).
 function resolveStateDir(): string {
   const v = process.env.STATE_DIR;
   if (!v || v.includes("${")) {
@@ -29,14 +29,22 @@ db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 db.pragma("busy_timeout = 5000"); // wait (don't throw SQLITE_BUSY) if another session holds the write lock
 
+// The competency/seniority ladder — the single canonical order, mirrored by the grading
+// modes (modes/*.json). Index = rank. Kept here too because db derives the overall band.
+export const LADDER = ["intern", "junior", "mid", "senior", "staff", "principal"] as const;
+const CONFIDENCE_ORDER = ["low", "medium", "high"] as const;
+// The four competency dimensions (Leaner-4). The profile carries one row per dimension.
+export const DIMENSIONS = ["technical_depth", "system_design", "communication", "ownership"] as const;
+
 db.exec(`
--- ── personal plane — local always; never shared / synced ──────────────────
+-- ── personal plane — local always; never shared ──────────────────────────
 CREATE TABLE IF NOT EXISTS profile (
   id            INTEGER PRIMARY KEY CHECK (id = 1),
   target_role   TEXT,
   target_niche  TEXT,
   location_pref TEXT,
   github_handle TEXT,
+  desires_json  TEXT,                                 -- {role_types, domains, locations, comp_floor, work_style, freetext, priorities} — evolvable
   no_resume     INTEGER NOT NULL DEFAULT 0,
   no_github     INTEGER NOT NULL DEFAULT 0,
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
@@ -46,92 +54,159 @@ CREATE TABLE IF NOT EXISTS master_resume (
   content    TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS resume_revisions (          -- append-only history: how the resume evolved
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  content    TEXT NOT NULL,
+  rationale  TEXT,                                     -- why this revision (the coaching applied)
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS portfolio_projects (
-  repo       TEXT PRIMARY KEY,                       -- github: "owner/name"; manual: a bare name (no slash)
+  repo       TEXT PRIMARY KEY,                         -- github: "owner/name"; manual: a bare name (no slash)
   facts_json TEXT,
-  source     TEXT NOT NULL DEFAULT 'github',         -- 'github' (ingested) | 'manual' (described, e.g. a private/flagship project)
+  source     TEXT NOT NULL DEFAULT 'github',           -- 'github' (ingested) | 'manual' (described, unverified)
   fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS portfolio_relevance (     -- a project's relevance to the target role (judgment, personal)
-  repo              TEXT PRIMARY KEY,                 -- not FK-cascaded: re-ingest PRUNES grades for dropped repos but KEEPS them for repos that persist
-  relevance         TEXT NOT NULL,                    -- strong | moderate | weak (mode: portfolio_relevance)
+CREATE TABLE IF NOT EXISTS portfolio_relevance (       -- a project's relevance to the target role (judgment)
+  repo              TEXT PRIMARY KEY,
+  relevance         TEXT NOT NULL,                      -- strong | moderate | weak
   demonstrates_json TEXT,
   gaps_json         TEXT,
   rationale         TEXT,
   graded_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS assessment (              -- the user's level (judgment)
-  id            INTEGER PRIMARY KEY CHECK (id = 1),
-  level         TEXT NOT NULL,
+-- The multi-dimensional competency profile (replaces the single-ladder assessment). One row
+-- per dimension; the overall band is DERIVED (deriveBand). Absence of evidence → low
+-- CONFIDENCE, never a low level (fair to candidates with no public portfolio).
+CREATE TABLE IF NOT EXISTS competency_profile (
+  dimension     TEXT PRIMARY KEY,                       -- one of DIMENSIONS
+  level         TEXT NOT NULL,                          -- one of LADDER
+  confidence    TEXT NOT NULL,                          -- low | medium | high (high needs demonstrated/corroborated)
+  evidence_json TEXT,                                   -- [{ claim, provenance, verified }]
   rationale     TEXT,
-  evidence_json TEXT,
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS job_fit (                 -- the user's fit on a job (judgment, personal)
-  job_id     INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-  band       TEXT NOT NULL,
-  gaps_json  TEXT,
-  rationale  TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+CREATE TABLE IF NOT EXISTS assessment_summary (        -- cached derived overall band/confidence/floor + verified flag
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  band       TEXT,
+  confidence TEXT,
+  floor      TEXT,
+  verified   INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS cover_letters (           -- the per-role deliverable
+CREATE TABLE IF NOT EXISTS fitness_snapshots (          -- append-only: band + per-dim levels over time → improvement
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  band      TEXT,
+  confidence TEXT,
+  dims_json TEXT,                                        -- { dimension: level }
+  taken_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS interviews (                 -- a competency or role-fit interview SESSION (resumable)
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  type             TEXT NOT NULL,                        -- competency | role_fit
+  job_id           INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+  status           TEXT NOT NULL DEFAULT 'in_progress',  -- in_progress | complete
+  verified_ceiling TEXT,                                 -- highest level the interview supports (caps an over-claim)
+  summary          TEXT,
+  started_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS interview_items (            -- per-question: answer + grounded exemplar + the delta
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  interview_id  INTEGER NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+  dimension     TEXT,                                    -- which competency (or null)
+  claim         TEXT,                                    -- claim probed (or null)
+  question      TEXT NOT NULL,
+  answer_summary TEXT,
+  exemplar      TEXT,                                    -- role+rubric-grounded "what a great candidate would say"
+  score         TEXT,                                    -- weak | adequate | strong
+  ownership     TEXT,                                    -- sole_author | contributor | user | observer
+  understanding TEXT,                                    -- deep | working | shallow | cannot_explain
+  delta_notes   TEXT,                                    -- the gap → upskilling target
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS upskilling_plan (            -- the tracked plan: learn / resume / build
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  gap            TEXT NOT NULL,                           -- dimension or skill being closed
+  type           TEXT NOT NULL,                           -- learn | resume | build
+  spec           TEXT NOT NULL,                           -- the concrete recommendation
+  market_demand  TEXT,                                    -- which in-demand skill it closes (grounding)
+  status         TEXT NOT NULL DEFAULT 'suggested',       -- suggested | in_progress | done
+  progress_notes TEXT,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS role_fit (                   -- the user's fit on a job (judgment, personal)
+  job_id           INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  band             TEXT NOT NULL,                         -- over | exact | under
+  dim_deltas_json  TEXT,                                  -- per-dimension gap vs the role
+  desire_alignment TEXT,                                  -- strong | mixed | weak (vs the user's desires)
+  gaps_json        TEXT,
+  rationale        TEXT,
+  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS cover_letters (              -- the per-role deliverable
   job_id              INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
   content             TEXT NOT NULL,
   talking_points_json TEXT,
   created_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS applications (            -- the user's application to a job (personal)
+CREATE TABLE IF NOT EXISTS applications (               -- the user's application to a job (personal)
   job_id         INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-  status         TEXT NOT NULL,                      -- interested | applied | interviewing | offer | rejected | withdrawn
-  applied_at     TEXT,                               -- the user's report of when they applied
-  next_action    TEXT,                               -- e.g. "follow up", "prep system-design round"
+  status         TEXT NOT NULL,                           -- interested | applied | interviewing | offer | rejected | withdrawn
+  applied_at     TEXT,
+  next_action    TEXT,
   next_action_at TEXT,
   notes          TEXT,
   updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS events (                     -- APPEND-ONLY journal — the narrative timeline; never mutated/pruned
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      TEXT NOT NULL DEFAULT (datetime('now')),
+  kind    TEXT NOT NULL,                                  -- assessed | interviewed | graded_job | role_fit | planned | plan_progress | resume_revised | applied | profile | matched
+  summary TEXT NOT NULL,
+  ref     TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT
 );
 
--- ── catalog plane — public market data; the only plane sync touches ───────
+-- ── catalog plane — public market data (no longer synced) ─────────────────
 CREATE TABLE IF NOT EXISTS companies (
   id                      INTEGER PRIMARY KEY AUTOINCREMENT,
   name                    TEXT NOT NULL,
   domain                  TEXT,
-  tags                    TEXT,                              -- delimited namespaced tags, e.g. "funding:series_b,size:51-200"
-  source                  TEXT,                              -- provenance: 'theirstack' | 'common_crawl' | 'manual' | ...
+  tags                    TEXT,
+  source                  TEXT,
   ats_platform            TEXT,
   ats_slug                TEXT,
-  resolved                INTEGER NOT NULL DEFAULT 1,         -- 1 = slug-complete; 0 = discovered, ATS not yet resolved
-  resolve_attempts        INTEGER NOT NULL DEFAULT 0,         -- stage-4 resolution tries (skip/deprioritise repeat failures)
+  resolved                INTEGER NOT NULL DEFAULT 1,
+  resolve_attempts        INTEGER NOT NULL DEFAULT 0,
   last_resolve_attempt_at TEXT,
   added_at                TEXT NOT NULL DEFAULT (datetime('now')),
   last_fetched_at         TEXT,
   UNIQUE (ats_platform, ats_slug)
 );
--- domain is the fallback dedup key for unresolved rows (whose ats_slug is NULL, and SQLite
--- treats every NULL as distinct, so UNIQUE(ats_platform, ats_slug) can't dedup them).
 CREATE INDEX IF NOT EXISTS idx_companies_domain ON companies(domain);
 CREATE TABLE IF NOT EXISTS jobs (
-  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-  company_id         INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  source_url         TEXT NOT NULL,
-  title              TEXT,
-  location           TEXT,
-  remote             INTEGER,
-  comp_min           REAL,
-  comp_max           REAL,
-  raw_json           TEXT,
-  grade_seniority    TEXT,                            -- judgment, set by grade_job
-  grade_market_signal TEXT,                           -- judgment, set by grade_job
-  graded_at          TEXT,
-  fetched_at         TEXT NOT NULL DEFAULT (datetime('now')),
-  last_seen_at       TEXT NOT NULL DEFAULT (datetime('now')),
-  still_live         INTEGER NOT NULL DEFAULT 1,
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id          INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  source_url          TEXT NOT NULL,
+  title               TEXT,
+  location            TEXT,
+  remote              INTEGER,
+  comp_min            REAL,
+  comp_max            REAL,
+  raw_json            TEXT,
+  grade_seniority     TEXT,
+  grade_market_signal TEXT,
+  graded_at           TEXT,
+  fetched_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  still_live          INTEGER NOT NULL DEFAULT 1,
   UNIQUE (company_id, source_url)
 );
-CREATE TABLE IF NOT EXISTS job_skills (              -- intrinsic, set by grade_job
+CREATE TABLE IF NOT EXISTS job_skills (
   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   skill  TEXT NOT NULL,
   kind   TEXT NOT NULL CHECK (kind IN ('required','preferred')),
@@ -139,72 +214,97 @@ CREATE TABLE IF NOT EXISTS job_skills (              -- intrinsic, set by grade_
 );
 `);
 
-// ── guarded migrations — additive columns for databases created before they existed.
-// No-ops on a fresh DB (CREATE TABLE above already has them). ALTER ADD COLUMN is the
-// only safe in-place change: CREATE TABLE IF NOT EXISTS won't alter a table that exists.
+// ── guarded migrations — additive columns for DBs created before they existed. No-ops on a
+// fresh DB. ALTER ADD COLUMN is the only safe in-place change.
 function ensureColumn(table: string, column: string, ddl: string): void {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 }
 ensureColumn("companies", "resolve_attempts", "resolve_attempts INTEGER NOT NULL DEFAULT 0");
 ensureColumn("companies", "last_resolve_attempt_at", "last_resolve_attempt_at TEXT");
-ensureColumn("portfolio_projects", "source", "source TEXT NOT NULL DEFAULT 'github'"); // 'github' (ingested) | 'manual' (added)
+ensureColumn("portfolio_projects", "source", "source TEXT NOT NULL DEFAULT 'github'");
+ensureColumn("profile", "desires_json", "desires_json TEXT");
+
+// ── the journal (durability) ────────────────────────────────────────────────
+// Every meaningful step appends here so the months-long journey is always reconstructable.
+// Judgment writes call this internally; it's also the timeline look(at:'history') reads.
+export interface EventRow { id: number; ts: string; kind: string; summary: string; ref: string | null }
+export const logEvent = (kind: string, summary: string, ref?: string | null): void => {
+  db.prepare("INSERT INTO events (kind, summary, ref) VALUES (?, ?, ?)").run(kind, summary, ref ?? null);
+};
+export const getEvents = (limit = 50): EventRow[] =>
+  db.prepare("SELECT id, ts, kind, summary, ref FROM events ORDER BY id DESC LIMIT ?").all(limit) as EventRow[];
 
 // ── personal accessors ─────────────────────────────────────────────────────
+export interface Desires {
+  role_types?: string[]; domains?: string[]; locations?: string[];
+  comp_floor?: number | null; work_style?: string | null; freetext?: string | null; priorities?: string[];
+}
 export interface Profile {
   target_role: string | null; target_niche: string | null; location_pref: string | null;
-  github_handle: string | null; no_resume: number; no_github: number;
+  github_handle: string | null; desires: Desires | null; no_resume: number; no_github: number;
 }
-export const getProfile = (): Profile | undefined =>
-  db.prepare("SELECT * FROM profile WHERE id = 1").get() as Profile | undefined;
+export const getProfile = (): Profile | undefined => {
+  const r = db.prepare("SELECT target_role, target_niche, location_pref, github_handle, desires_json, no_resume, no_github FROM profile WHERE id = 1")
+    .get() as (Omit<Profile, "desires"> & { desires_json: string | null }) | undefined;
+  if (!r) return undefined;
+  const { desires_json, ...rest } = r;
+  return { ...rest, desires: desires_json ? JSON.parse(desires_json) : null };
+};
 
-export function upsertProfile(p: Partial<Profile>): void {
-  const cur = (getProfile() ?? {}) as Partial<Profile>;
-  const m = { ...cur, ...p };
+export function upsertProfile(p: Partial<Omit<Profile, "desires">> & { desires?: Desires | null }): void {
+  const cur = getProfile();
+  const desires = p.desires !== undefined
+    ? (p.desires ? { ...(cur?.desires ?? {}), ...p.desires } : null) // merge desires, don't clobber
+    : (cur?.desires ?? null);
+  const m = {
+    target_role: p.target_role !== undefined ? p.target_role : cur?.target_role ?? null,
+    target_niche: p.target_niche !== undefined ? p.target_niche : cur?.target_niche ?? null,
+    location_pref: p.location_pref !== undefined ? p.location_pref : cur?.location_pref ?? null,
+    github_handle: p.github_handle !== undefined ? p.github_handle : cur?.github_handle ?? null,
+    no_resume: p.no_resume !== undefined ? p.no_resume : cur?.no_resume ?? 0,
+    no_github: p.no_github !== undefined ? p.no_github : cur?.no_github ?? 0,
+    desires_json: desires ? JSON.stringify(desires) : null,
+  };
   db.prepare(
-    `INSERT INTO profile (id, target_role, target_niche, location_pref, github_handle, no_resume, no_github, updated_at)
-     VALUES (1, @target_role, @target_niche, @location_pref, @github_handle, @no_resume, @no_github, datetime('now'))
+    `INSERT INTO profile (id, target_role, target_niche, location_pref, github_handle, desires_json, no_resume, no_github, updated_at)
+     VALUES (1, @target_role, @target_niche, @location_pref, @github_handle, @desires_json, @no_resume, @no_github, datetime('now'))
      ON CONFLICT(id) DO UPDATE SET
        target_role=excluded.target_role, target_niche=excluded.target_niche,
        location_pref=excluded.location_pref, github_handle=excluded.github_handle,
-       no_resume=excluded.no_resume, no_github=excluded.no_github, updated_at=datetime('now')`,
-  ).run({
-    target_role: m.target_role ?? null, target_niche: m.target_niche ?? null,
-    location_pref: m.location_pref ?? null, github_handle: m.github_handle ?? null,
-    no_resume: m.no_resume ?? 0, no_github: m.no_github ?? 0,
-  });
+       desires_json=excluded.desires_json, no_resume=excluded.no_resume, no_github=excluded.no_github,
+       updated_at=datetime('now')`,
+  ).run(m);
 }
 
 export const getMasterResume = (): { content: string; updated_at: string } | undefined =>
   db.prepare("SELECT content, updated_at FROM master_resume WHERE id = 1").get() as { content: string; updated_at: string } | undefined;
-export const setMasterResume = (content: string): void => {
+// Set the master resume and, when a rationale is given (a coached revision rather than the
+// initial capture), append it to the version history so resume-building is tracked over time.
+export const setMasterResume = (content: string, rationale?: string | null): void => {
   db.prepare(
     `INSERT INTO master_resume (id, content, updated_at) VALUES (1, ?, datetime('now'))
      ON CONFLICT(id) DO UPDATE SET content=excluded.content, updated_at=datetime('now')`,
   ).run(content);
+  if (rationale !== undefined) {
+    db.prepare("INSERT INTO resume_revisions (content, rationale) VALUES (?, ?)").run(content, rationale ?? null);
+    logEvent("resume_revised", rationale ?? "resume revised");
+  }
 };
+export interface ResumeRevision { id: number; rationale: string | null; created_at: string }
+export const getResumeRevisions = (): ResumeRevision[] =>
+  db.prepare("SELECT id, rationale, created_at FROM resume_revisions ORDER BY id DESC").all() as ResumeRevision[];
 
-export const getAssessment = (): { level: string; rationale: string | null; evidence: unknown } | undefined => {
-  const r = db.prepare("SELECT level, rationale, evidence_json FROM assessment WHERE id = 1")
-    .get() as { level: string; rationale: string | null; evidence_json: string | null } | undefined;
-  return r ? { level: r.level, rationale: r.rationale, evidence: r.evidence_json ? JSON.parse(r.evidence_json) : null } : undefined;
-};
-
+// ── portfolio ────────────────────────────────────────────────────────────────
 export interface PortfolioProject { repo: string; facts_json: string | null; source: string; fetched_at: string }
 export const getPortfolio = (): PortfolioProject[] =>
   db.prepare("SELECT repo, facts_json, source, fetched_at FROM portfolio_projects ORDER BY fetched_at DESC, repo").all() as PortfolioProject[];
 
-// Replace the GITHUB-sourced portfolio with a fresh snapshot (gather('ingest_portfolio')
-// calls this — db.ts is the sole writer). Manual projects (added via addPortfolioProject,
-// e.g. a private/flagship repo) are NOT touched — they persist across re-ingest. A re-ingest
-// reflects the user's CURRENT public repos, so deleted/renamed github repos drop out.
 export function replacePortfolio(projects: { repo: string; facts: unknown }[]): number {
   const tx = db.transaction((): number => {
     db.prepare("DELETE FROM portfolio_projects WHERE source='github'").run();
     const ins = db.prepare("INSERT INTO portfolio_projects (repo, facts_json, source) VALUES (?, ?, 'github')");
     for (const p of projects) ins.run(p.repo, JSON.stringify(p.facts ?? null));
-    // Prune relevance grades for projects no longer present. Keep set = the new github repos
-    // PLUS surviving manual projects (whose grades must not be pruned).
     const keep = [...projects.map((p) => p.repo), ...(db.prepare("SELECT repo FROM portfolio_projects WHERE source='manual'").all() as { repo: string }[]).map((r) => r.repo)];
     if (keep.length === 0) db.prepare("DELETE FROM portfolio_relevance").run();
     else db.prepare(`DELETE FROM portfolio_relevance WHERE repo NOT IN (${keep.map(() => "?").join(",")})`).run(...keep);
@@ -213,8 +313,6 @@ export function replacePortfolio(projects: { repo: string; facts: unknown }[]): 
   return tx();
 }
 
-// Add/replace a MANUAL portfolio project — work the agent should be able to feature that
-// ingest can't see (a private/flagship repo on the resume). Persists across re-ingest.
 export function addPortfolioProject(name: string, facts: unknown): void {
   db.prepare(
     `INSERT INTO portfolio_projects (repo, facts_json, source, fetched_at) VALUES (?, ?, 'manual', datetime('now'))
@@ -222,7 +320,6 @@ export function addPortfolioProject(name: string, facts: unknown): void {
   ).run(name, JSON.stringify(facts ?? null));
 }
 
-// ── portfolio relevance (judgment, personal) — how each repo maps to the target role ──
 export interface PortfolioRelevance {
   repo: string; relevance: string; demonstrates: unknown[]; gaps: unknown[]; rationale: string | null; graded_at: string;
 }
@@ -240,33 +337,163 @@ export const setPortfolioRelevance = (repo: string, relevance: string, demonstra
   ).run(repo, relevance, JSON.stringify(demonstrates ?? []), JSON.stringify(gaps ?? []), rationale);
 };
 
+// ── competency profile + derived band (the assessment, multi-dimensional) ────
+export interface Competency { dimension: string; level: string; confidence: string; evidence: unknown; rationale: string | null; updated_at: string }
+export const getCompetencyProfile = (): Competency[] =>
+  (db.prepare("SELECT dimension, level, confidence, evidence_json, rationale, updated_at FROM competency_profile").all() as
+    { dimension: string; level: string; confidence: string; evidence_json: string | null; rationale: string | null; updated_at: string }[])
+    .map((r) => ({ dimension: r.dimension, level: r.level, confidence: r.confidence, evidence: r.evidence_json ? JSON.parse(r.evidence_json) : [], rationale: r.rationale, updated_at: r.updated_at }));
+
+// Set one dimension's judgment, refresh the cached summary, and snapshot fitness so the
+// trajectory is preserved. Appends a journal event.
+export function setCompetency(dimension: string, level: string, confidence: string, evidence: unknown, rationale: string): void {
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO competency_profile (dimension, level, confidence, evidence_json, rationale, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(dimension) DO UPDATE SET level=excluded.level, confidence=excluded.confidence,
+         evidence_json=excluded.evidence_json, rationale=excluded.rationale, updated_at=datetime('now')`,
+    ).run(dimension, level, confidence, JSON.stringify(evidence ?? []), rationale);
+    refreshAssessmentSummary();
+    snapshotFitness();
+    logEvent("assessed", `${dimension} → ${level} (confidence ${confidence})`, dimension);
+  });
+  tx();
+}
+
+// Derive the overall band from the dimensions: band = conservative (floor of the mean rank),
+// floor = the lowest dimension, overall confidence = the LOWEST (skeptical — a profile is only
+// as trustworthy as its weakest-supported part). null until at least one dimension is set.
+export interface DerivedBand { band: string; floor: string; confidence: string; dims: number }
+export function deriveBand(profile: Competency[] = getCompetencyProfile()): DerivedBand | null {
+  if (profile.length === 0) return null;
+  const idxs = profile.map((d) => LADDER.indexOf(d.level as typeof LADDER[number])).filter((i) => i >= 0);
+  if (idxs.length === 0) return null;
+  const band = LADDER[Math.floor(idxs.reduce((a, b) => a + b, 0) / idxs.length)];
+  const floor = LADDER[Math.min(...idxs)];
+  const confIdx = Math.min(...profile.map((d) => Math.max(0, CONFIDENCE_ORDER.indexOf(d.confidence as typeof CONFIDENCE_ORDER[number]))));
+  return { band, floor, confidence: CONFIDENCE_ORDER[confIdx], dims: profile.length };
+}
+
+export interface AssessmentSummary { band: string | null; confidence: string | null; floor: string | null; verified: number; updated_at: string | null }
+export const getAssessmentSummary = (): AssessmentSummary | undefined =>
+  db.prepare("SELECT band, confidence, floor, verified, updated_at FROM assessment_summary WHERE id = 1").get() as AssessmentSummary | undefined;
+// Recompute the cached summary from the dimensions + interview state. `verified` is true once
+// at least one interview is complete (that's what earns the profile beyond self-report).
+function refreshAssessmentSummary(): void {
+  const d = deriveBand();
+  const verified = (db.prepare("SELECT count(*) c FROM interviews WHERE status='complete'").get() as { c: number }).c > 0 ? 1 : 0;
+  db.prepare(
+    `INSERT INTO assessment_summary (id, band, confidence, floor, verified, updated_at)
+     VALUES (1, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET band=excluded.band, confidence=excluded.confidence, floor=excluded.floor,
+       verified=excluded.verified, updated_at=datetime('now')`,
+  ).run(d?.band ?? null, d?.confidence ?? null, d?.floor ?? null, verified);
+}
+
+export interface FitnessSnapshot { id: number; band: string | null; confidence: string | null; dims: Record<string, string>; taken_at: string }
+function snapshotFitness(): void {
+  const d = deriveBand();
+  const dims = Object.fromEntries(getCompetencyProfile().map((c) => [c.dimension, c.level]));
+  db.prepare("INSERT INTO fitness_snapshots (band, confidence, dims_json) VALUES (?, ?, ?)").run(d?.band ?? null, d?.confidence ?? null, JSON.stringify(dims));
+}
+export const getFitnessHistory = (limit = 50): FitnessSnapshot[] =>
+  (db.prepare("SELECT id, band, confidence, dims_json, taken_at FROM fitness_snapshots ORDER BY id DESC LIMIT ?").all(limit) as
+    { id: number; band: string | null; confidence: string | null; dims_json: string | null; taken_at: string }[])
+    .map((r) => ({ id: r.id, band: r.band, confidence: r.confidence, dims: r.dims_json ? JSON.parse(r.dims_json) : {}, taken_at: r.taken_at }));
+
+// ── interviews (resumable; the assess + verify + upskill engine) ─────────────
+export interface Interview { id: number; type: string; job_id: number | null; status: string; verified_ceiling: string | null; summary: string | null; started_at: string; updated_at: string }
+export const getInterview = (id: number): Interview | undefined =>
+  db.prepare("SELECT * FROM interviews WHERE id = ?").get(id) as Interview | undefined;
+export const getOpenInterview = (): Interview | undefined =>
+  db.prepare("SELECT * FROM interviews WHERE status='in_progress' ORDER BY id DESC LIMIT 1").get() as Interview | undefined;
+export const getInterviews = (): Interview[] =>
+  db.prepare("SELECT * FROM interviews ORDER BY id DESC").all() as Interview[];
+export function startInterview(type: string, jobId?: number | null): number {
+  const info = db.prepare("INSERT INTO interviews (type, job_id) VALUES (?, ?)").run(type, jobId ?? null);
+  logEvent("interviewed", `started ${type} interview${jobId ? ` for job ${jobId}` : ""}`, String(info.lastInsertRowid));
+  return Number(info.lastInsertRowid);
+}
+export interface InterviewItemInput { dimension?: string | null; claim?: string | null; question: string; answer_summary?: string | null; exemplar?: string | null; score?: string | null; ownership?: string | null; understanding?: string | null; delta_notes?: string | null }
+export function addInterviewItems(interviewId: number, items: InterviewItemInput[]): void {
+  const tx = db.transaction(() => {
+    const ins = db.prepare(
+      `INSERT INTO interview_items (interview_id, dimension, claim, question, answer_summary, exemplar, score, ownership, understanding, delta_notes)
+       VALUES (@interview_id, @dimension, @claim, @question, @answer_summary, @exemplar, @score, @ownership, @understanding, @delta_notes)`);
+    for (const it of items) ins.run({
+      interview_id: interviewId, dimension: it.dimension ?? null, claim: it.claim ?? null, question: it.question,
+      answer_summary: it.answer_summary ?? null, exemplar: it.exemplar ?? null, score: it.score ?? null,
+      ownership: it.ownership ?? null, understanding: it.understanding ?? null, delta_notes: it.delta_notes ?? null,
+    });
+    db.prepare("UPDATE interviews SET updated_at=datetime('now') WHERE id=?").run(interviewId);
+  });
+  tx();
+}
+export interface InterviewItem extends InterviewItemInput { id: number; interview_id: number; created_at: string }
+export const getInterviewItems = (interviewId: number): InterviewItem[] =>
+  db.prepare("SELECT * FROM interview_items WHERE interview_id = ? ORDER BY id").all(interviewId) as InterviewItem[];
+export function completeInterview(interviewId: number, verifiedCeiling: string | null, summary: string): void {
+  db.prepare("UPDATE interviews SET status='complete', verified_ceiling=?, summary=?, updated_at=datetime('now') WHERE id=?")
+    .run(verifiedCeiling, summary, interviewId);
+  refreshAssessmentSummary(); // completing an interview flips `verified`
+  logEvent("interviewed", `completed interview ${interviewId}${verifiedCeiling ? ` (verified_ceiling ${verifiedCeiling})` : ""}`, String(interviewId));
+}
+
+// ── upskilling plan (learn / resume / build — tracked, drives re-match) ──────
+export interface PlanItem { id: number; gap: string; type: string; spec: string; market_demand: string | null; status: string; progress_notes: string | null; created_at: string; updated_at: string }
+export const getPlan = (status?: string): PlanItem[] =>
+  status
+    ? db.prepare("SELECT * FROM upskilling_plan WHERE status = ? ORDER BY id").all(status) as PlanItem[]
+    : db.prepare("SELECT * FROM upskilling_plan ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'suggested' THEN 1 ELSE 2 END, id").all() as PlanItem[];
+export function addPlanItem(gap: string, type: string, spec: string, marketDemand?: string | null): number {
+  const info = db.prepare("INSERT INTO upskilling_plan (gap, type, spec, market_demand) VALUES (?, ?, ?, ?)").run(gap, type, spec, marketDemand ?? null);
+  logEvent("planned", `${type} · ${gap}: ${spec}`, String(info.lastInsertRowid));
+  return Number(info.lastInsertRowid);
+}
+export function updatePlanItem(id: number, status?: string | null, progressNotes?: string | null): boolean {
+  const cur = db.prepare("SELECT id, gap, type FROM upskilling_plan WHERE id = ?").get(id) as { id: number; gap: string; type: string } | undefined;
+  if (!cur) return false;
+  db.prepare(
+    `UPDATE upskilling_plan SET status = COALESCE(?, status), progress_notes = COALESCE(?, progress_notes), updated_at = datetime('now') WHERE id = ?`,
+  ).run(status ?? null, progressNotes ?? null, id);
+  if (status) logEvent("plan_progress", `${cur.type} · ${cur.gap} → ${status}`, String(id));
+  return true;
+}
+export const planCounts = (): Record<string, number> =>
+  Object.fromEntries((db.prepare("SELECT status, count(*) c FROM upskilling_plan GROUP BY status").all() as { status: string; c: number }[]).map((r) => [r.status, r.c]));
+
+// ── role fit (the user's fit on a specific job) ──────────────────────────────
+export interface RoleFit { band: string; dim_deltas: unknown; desire_alignment: string | null; gaps: unknown[]; rationale: string | null }
+export const getRoleFit = (jobId: number): RoleFit | undefined => {
+  const r = db.prepare("SELECT band, dim_deltas_json, desire_alignment, gaps_json, rationale FROM role_fit WHERE job_id = ?")
+    .get(jobId) as { band: string; dim_deltas_json: string | null; desire_alignment: string | null; gaps_json: string | null; rationale: string | null } | undefined;
+  return r ? { band: r.band, dim_deltas: r.dim_deltas_json ? JSON.parse(r.dim_deltas_json) : null, desire_alignment: r.desire_alignment, gaps: r.gaps_json ? JSON.parse(r.gaps_json) : [], rationale: r.rationale } : undefined;
+};
+export function setRoleFit(jobId: number, band: string, dimDeltas: unknown, desireAlignment: string | null, gaps: unknown, rationale: string): void {
+  db.prepare(
+    `INSERT INTO role_fit (job_id, band, dim_deltas_json, desire_alignment, gaps_json, rationale)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(job_id) DO UPDATE SET band=excluded.band, dim_deltas_json=excluded.dim_deltas_json,
+       desire_alignment=excluded.desire_alignment, gaps_json=excluded.gaps_json, rationale=excluded.rationale`,
+  ).run(jobId, band, JSON.stringify(dimDeltas ?? null), desireAlignment, JSON.stringify(gaps ?? []), rationale);
+  logEvent("role_fit", `job ${jobId} → ${band}${desireAlignment ? ` (desire ${desireAlignment})` : ""}`, String(jobId));
+}
+
 export interface CoverLetter { content: string; talking_points: unknown[]; created_at: string }
 export const getCoverLetter = (jobId: number): CoverLetter | null => {
   const r = db.prepare("SELECT content, talking_points_json, created_at FROM cover_letters WHERE job_id = ?")
     .get(jobId) as { content: string; talking_points_json: string | null; created_at: string } | undefined;
   return r ? { content: r.content, talking_points: r.talking_points_json ? JSON.parse(r.talking_points_json) : [], created_at: r.created_at } : null;
 };
-export const setAssessment = (level: string, rationale: string, evidence: unknown): void => {
-  db.prepare(
-    `INSERT INTO assessment (id, level, rationale, evidence_json, updated_at)
-     VALUES (1, ?, ?, ?, datetime('now'))
-     ON CONFLICT(id) DO UPDATE SET level=excluded.level, rationale=excluded.rationale,
-       evidence_json=excluded.evidence_json, updated_at=datetime('now')`,
-  ).run(level, rationale, JSON.stringify(evidence ?? null));
-};
-
 export const recordCoverLetter = (jobId: number, content: string, points: unknown): void => {
   db.prepare(
     `INSERT INTO cover_letters (job_id, content, talking_points_json) VALUES (?, ?, ?)
-     ON CONFLICT(job_id) DO UPDATE SET content=excluded.content,
-       talking_points_json=excluded.talking_points_json`,
+     ON CONFLICT(job_id) DO UPDATE SET content=excluded.content, talking_points_json=excluded.talking_points_json`,
   ).run(jobId, content, JSON.stringify(points ?? null));
 };
 
-// ── application tracking (personal) — the apply→applied→… pipeline ───────────
-// User-reported fact (status of their own application), not a graded judgment, so it's a
-// mechanical write (like the profile). Idempotent per job; a status update PRESERVES the
-// fields you don't pass (applied_at, notes, …) rather than nulling them.
+// ── application tracking (personal) ──────────────────────────────────────────
 export interface Application {
   job_id: number; status: string; applied_at: string | null;
   next_action: string | null; next_action_at: string | null; notes: string | null; updated_at: string;
@@ -290,6 +517,7 @@ export function recordApplication(
     applied_at: pick("applied_at"), next_action: pick("next_action"),
     next_action_at: pick("next_action_at"), notes: pick("notes"),
   });
+  logEvent("applied", `job ${jobId} → ${fields.status}`, String(jobId));
 }
 
 export interface ApplicationRow extends Application { title: string | null; company: string }
@@ -300,7 +528,6 @@ export const getApplications = (): ApplicationRow[] =>
      ORDER BY a.updated_at DESC`,
   ).all() as ApplicationRow[];
 
-// Funnel counts by status (for orient + look pipeline summaries).
 export const applicationCounts = (): Record<string, number> =>
   Object.fromEntries((db.prepare("SELECT status, count(*) c FROM applications GROUP BY status").all() as { status: string; c: number }[])
     .map((r) => [r.status, r.c]));
@@ -308,9 +535,7 @@ export const applicationCounts = (): Record<string, number> =>
 export const getMeta = (key: string): string | null =>
   (db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined)?.value ?? null;
 export const setMeta = (key: string, value: string): void => {
-  db.prepare(
-    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-  ).run(key, value);
+  db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, value);
 };
 
 // ── catalog accessors ──────────────────────────────────────────────────────
@@ -333,15 +558,8 @@ export function setJobGrade(jobId: number, seniority: string, signal: string,
     for (const s of skills) ins.run(jobId, s.skill, s.kind);
   });
   tx();
+  logEvent("graded_job", `job ${jobId} → ${seniority}/${signal}`, String(jobId));
 }
-
-export const setJobFit = (jobId: number, band: string, gaps: unknown, rationale: string): void => {
-  db.prepare(
-    `INSERT INTO job_fit (job_id, band, gaps_json, rationale) VALUES (?, ?, ?, ?)
-     ON CONFLICT(job_id) DO UPDATE SET band=excluded.band, gaps_json=excluded.gaps_json,
-       rationale=excluded.rationale`,
-  ).run(jobId, band, JSON.stringify(gaps ?? null), rationale);
-};
 
 export interface JobSkill { skill: string; kind: string }
 export const getJobSkills = (jobId: number): JobSkill[] =>
@@ -349,11 +567,8 @@ export const getJobSkills = (jobId: number): JobSkill[] =>
     "SELECT skill, kind FROM job_skills WHERE job_id = ? ORDER BY CASE kind WHEN 'required' THEN 0 ELSE 1 END, skill",
   ).all(jobId) as JobSkill[];
 
-// Live MARKET skill demand — aggregate the required/preferred skills recorded by grade_job
-// across live, graded jobs (optionally narrowed to a seniority band). This is the computable
-// half of the market-demand overlay: the agent compares it to the resume/portfolio to find
-// the delta. Skills are grouped case-insensitively (Python/python merge); the surfaced label
-// is the most common casing. Only graded jobs contribute (ungraded carry no skills).
+// Live MARKET skill demand — aggregate required/preferred skills across live, graded jobs
+// (optionally narrowed to a seniority band). Grounds the upskilling plan's 'build' recs.
 export interface SkillDemand { skill: string; required: number; preferred: number; total: number }
 export function marketSkillDemand(band?: string[] | null, limit = 20): { total_jobs: number; skills: SkillDemand[] } {
   const where = ["j.still_live=1", "j.grade_seniority IS NOT NULL"];
@@ -375,13 +590,6 @@ export function marketSkillDemand(band?: string[] | null, limit = 20): { total_j
 }
 
 // ── job fetch write path (gather('fetch_jobs') calls this — db.ts is the sole writer) ──
-// Idempotent per board: upsert each posting by (company_id, source_url) and refresh
-// last_seen_at + still_live=1 for those present this fetch, then a LIVENESS pass closes
-// (still_live=0) any of this company's still-live jobs that vanished from the feed. An
-// empty feed (a valid but vacant board → []) closes them all; an UNREACHABLE board must
-// NOT reach here (callers skip on null) so a transient 404 never closes a whole company.
-// Reappearing jobs reopen (still_live=1). Stamps companies.last_fetched_at. Grades are
-// left untouched — a refetch never wipes a job's grade, only its liveness/raw fields.
 export interface RawJobInput {
   source_url: string; title?: string | null; location?: string | null;
   remote?: number | null; comp_min?: number | null; comp_max?: number | null; raw?: unknown;
@@ -428,40 +636,18 @@ export interface Company {
 const COMPANY_COLS = "id, name, domain, tags, source, ats_platform, ats_slug, resolved, resolve_attempts, last_resolve_attempt_at, added_at, last_fetched_at";
 export const getCompanies = (limit = 200): Company[] =>
   db.prepare(`SELECT ${COMPANY_COLS} FROM companies ORDER BY added_at DESC LIMIT ?`).all(limit) as Company[];
-
-// Look up a company by its resolved ATS slug — fetch_jobs uses this to attach pulled jobs.
 export const getCompanyByAts = (platform: string, slug: string): Company | undefined =>
   db.prepare(`SELECT ${COMPANY_COLS} FROM companies WHERE ats_platform=? AND ats_slug=?`).get(platform, slug) as Company | undefined;
-
-// Resolved (slug-complete) companies, stalest-first (never-fetched NULLs sort first in
-// SQLite ASC) — the batch fetch_jobs refresh order.
 export const getResolvedCompanies = (limit = 200): Company[] =>
   db.prepare(
     `SELECT ${COMPANY_COLS} FROM companies WHERE resolved=1 AND ats_platform IS NOT NULL AND ats_slug IS NOT NULL ORDER BY last_fetched_at ASC, added_at ASC LIMIT ?`,
   ).all(limit) as Company[];
 
-// ── company write path (build-zero: the persisters gather('find_companies') will call) ──
-// Naming reconciliation with tool1_build.md: the doc's "Tool A" is db.ts (this file — the
-// only writer); its add_resolved_company / add_unresolved_candidate both map to upsertCompany
-// (slug-complete → resolved=1; domain-only → resolved=0); its markCompanyResolved is
-// resolveCompany. There is no separate unresolved_candidates table — an unresolved candidate
-// is just a companies row with resolved=0, per the repo's existing schema.
-//
-// Dedup is accessor-level (matching the upsertProfile precedent of putting logic in the
-// accessor): match on the (ats_platform, ats_slug) tuple first, then on normalized domain,
-// coalescing fields on a hit so a later pass can fill blanks without clobbering known data.
-
 const normalizeDomain = (d?: string | null): string | null => {
   if (!d) return null;
-  const s = d.trim().toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .replace(/[/?#].*$/, "");
+  const s = d.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/[/?#].*$/, "");
   return s || null;
 };
-
-// tags is a plain TEXT column (no _json suffix — the repo reserves that for JSON blobs),
-// so tags serialize as a comma-delimited, de-duplicated, sorted string of namespaced values.
 const parseTags = (s: string | null | undefined): string[] =>
   s ? s.split(",").map((t) => t.trim()).filter(Boolean) : [];
 const serializeTags = (tags: string[]): string | null => {
@@ -470,13 +656,8 @@ const serializeTags = (tags: string[]): string | null => {
 };
 
 export interface CompanyInput {
-  name: string;
-  domain?: string | null;
-  source?: string | null;          // provenance, e.g. 'theirstack' | 'common_crawl'
-  tags?: string[];                 // namespaced, e.g. ['funding:series_b', 'size:51-200']
-  ats_platform?: string | null;    // 'ashby' | 'greenhouse' | 'lever' | 'workable'
-  ats_slug?: string | null;
-  resolved?: boolean;              // explicit override; defaults to (ats_platform && ats_slug)
+  name: string; domain?: string | null; source?: string | null; tags?: string[];
+  ats_platform?: string | null; ats_slug?: string | null; resolved?: boolean;
 }
 export interface UpsertResult { id: number; inserted: boolean }
 export interface ResolveResult { id: number; merged: boolean }
@@ -486,22 +667,12 @@ const findBySlug = (platform: string, slug: string): Company | undefined =>
 const findByDomain = (domain: string): Company | undefined =>
   db.prepare("SELECT * FROM companies WHERE domain = ? ORDER BY id LIMIT 1").get(domain) as Company | undefined;
 
-/**
- * Idempotent insert-or-merge for a discovered company. Matches an existing row by the
- * (ats_platform, ats_slug) tuple, then by normalized domain; on a hit it fills missing
- * fields and unions tags, never overwriting known data. Slug-complete input is stored
- * resolved=1, domain-only input resolved=0. Returns the row id and whether it was a fresh
- * insert — so a discovery run can count net-new (credit accounting, dedup-before-fetch).
- */
 export function upsertCompany(input: CompanyInput): UpsertResult {
   const platform = input.ats_platform ?? null;
   const slug = input.ats_slug ?? null;
   const domain = normalizeDomain(input.domain);
   const resolved = input.resolved ?? !!(platform && slug);
 
-  // Gather every existing row this input keys into — by slug-tuple and/or by domain. When the
-  // two keys hit two *different* rows, the same company was discovered two ways with no
-  // overlapping key until now; unify them (fold the extras into one) so no duplicate lingers.
   const bySlug = platform && slug ? findBySlug(platform, slug) : undefined;
   const byDomain = domain ? findByDomain(domain) : undefined;
   const matches: Company[] = [];
@@ -520,8 +691,6 @@ export function upsertCompany(input: CompanyInput): UpsertResult {
   }
 
   const primary = matches[0];
-  // Fold any additional matched rows into the primary, deleting each first so its slug-tuple
-  // is free before we COALESCE the tuple onto the primary (avoids hitting UNIQUE).
   for (const m of matches.slice(1)) {
     const folded = { domain: m.domain, source: m.source, tags: parseTags(m.tags),
                      ats_platform: m.ats_platform, ats_slug: m.ats_slug, resolved: m.resolved === 1 };
@@ -532,9 +701,6 @@ export function upsertCompany(input: CompanyInput): UpsertResult {
   return { id: primary.id, inserted: false };
 }
 
-// Fill missing columns and union tags onto an existing row (by id, re-read fresh so a prior
-// fold in the same call isn't lost) — never overwrites a known value. Callers guarantee any
-// slug-tuple passed here is free (not owned by another row).
 function mergeFields(
   id: number,
   input: { domain?: string | null; source?: string | null; tags?: string[]; ats_platform?: string | null; ats_slug?: string | null; resolved?: boolean },
@@ -556,22 +722,11 @@ function mergeFields(
        resolved     = @resolved
      WHERE id = @id`,
   ).run({
-    id,
-    domain: normalizeDomain(input.domain),
-    tags,
-    source: input.source ?? null,
-    ats_platform: input.ats_platform ?? null,
-    ats_slug: input.ats_slug ?? null,
-    resolved,
+    id, domain: normalizeDomain(input.domain), tags, source: input.source ?? null,
+    ats_platform: input.ats_platform ?? null, ats_slug: input.ats_slug ?? null, resolved,
   });
 }
 
-/**
- * Stage-4 success: an unresolved candidate's ATS board was found. Sets the slug-tuple and
- * flips resolved=1. Collision-safe — if another row already owns this (platform, slug), the
- * candidate is folded into that owner (domain/tags copied across) and removed, returning the
- * surviving id (merged=true).
- */
 export function resolveCompany(id: number, platform: string, slug: string): ResolveResult {
   const owner = findBySlug(platform, slug);
   if (owner && owner.id !== id) {
@@ -586,7 +741,6 @@ export function resolveCompany(id: number, platform: string, slug: string): Reso
   return { id, merged: false };
 }
 
-/** Stage-4 failure: record an attempt so a run can skip/deprioritise repeat failures. */
 export const bumpResolveAttempt = (id: number): void => {
   db.prepare(
     "UPDATE companies SET resolve_attempts = resolve_attempts + 1, last_resolve_attempt_at = datetime('now') WHERE id = ?",
@@ -594,7 +748,11 @@ export const bumpResolveAttempt = (id: number): void => {
 };
 
 const countOf = (sql: string, ...args: unknown[]): number => (db.prepare(sql).get(...args) as { c: number }).c;
-export interface Counts { companies: number; unresolved: number; jobs: number; ungraded: number; portfolio: number; portfolio_graded: number }
+export interface Counts {
+  companies: number; unresolved: number; jobs: number; ungraded: number;
+  portfolio: number; portfolio_graded: number; dimensions_assessed: number;
+  interviews_complete: number; interviews_open: number; plan_open: number;
+}
 export const counts = (): Counts => ({
   companies: countOf("SELECT count(*) c FROM companies"),
   unresolved: countOf("SELECT count(*) c FROM companies WHERE resolved = 0"),
@@ -602,107 +760,10 @@ export const counts = (): Counts => ({
   ungraded: countOf("SELECT count(*) c FROM jobs WHERE grade_seniority IS NULL"),
   portfolio: countOf("SELECT count(*) c FROM portfolio_projects"),
   portfolio_graded: countOf("SELECT count(*) c FROM portfolio_relevance"),
+  dimensions_assessed: countOf("SELECT count(*) c FROM competency_profile"),
+  interviews_complete: countOf("SELECT count(*) c FROM interviews WHERE status='complete'"),
+  interviews_open: countOf("SELECT count(*) c FROM interviews WHERE status='in_progress'"),
+  plan_open: countOf("SELECT count(*) c FROM upskilling_plan WHERE status != 'done'"),
 });
 
 export const nowStr = (): string => (db.prepare("SELECT datetime('now') t").get() as { t: string }).t;
-
-// ── catalog sync (gather('sync_catalog')) — the ONLY data that leaves the instance ──
-// THE EGRESS BOUNDARY. A snapshot reads the CATALOG plane ONLY (companies, jobs,
-// job_skills) and NEVER the personal plane (resume, profile, assessment, job_fit,
-// cover_letters) — that is the "only public data ever leaves" invariant, enforced here
-// in the one place data is serialized for sharing. Cross-instance, local ids are
-// meaningless, so rows carry NATURAL keys: a company by (ats_platform, ats_slug) or
-// domain; a job by its company + source_url. Grades (the shareable judgment) ride along;
-// raw_json is deliberately omitted (bulky, and the normalized fields suffice).
-export interface SnapshotCompany {
-  name: string; domain: string | null; tags: string | null; source: string | null;
-  ats_platform: string | null; ats_slug: string | null; resolved: number;
-}
-export interface SnapshotJob {
-  ats_platform: string | null; ats_slug: string | null; domain: string | null; // company key
-  source_url: string; title: string | null; location: string | null; remote: number | null;
-  comp_min: number | null; comp_max: number | null;
-  grade_seniority: string | null; grade_market_signal: string | null; graded_at: string | null;
-  last_seen_at: string; still_live: number; skills: { skill: string; kind: string }[];
-}
-export interface CatalogSnapshot { companies: SnapshotCompany[]; jobs: SnapshotJob[] }
-
-export function catalogSnapshot(): CatalogSnapshot {
-  const companies = db.prepare(
-    "SELECT name, domain, tags, source, ats_platform, ats_slug, resolved FROM companies",
-  ).all() as SnapshotCompany[];
-  const rows = db.prepare(
-    `SELECT j.id, c.ats_platform, c.ats_slug, c.domain, j.source_url, j.title, j.location, j.remote,
-            j.comp_min, j.comp_max, j.grade_seniority, j.grade_market_signal, j.graded_at,
-            j.last_seen_at, j.still_live
-     FROM jobs j JOIN companies c ON c.id = j.company_id`,
-  ).all() as (SnapshotJob & { id: number })[];
-  const skillsOf = db.prepare("SELECT skill, kind FROM job_skills WHERE job_id = ?");
-  const jobs = rows.map(({ id, ...j }) => ({ ...j, skills: skillsOf.all(id) as { skill: string; kind: string }[] }));
-  return { companies, jobs };
-}
-
-const localCompanyId = (ats_platform: string | null, ats_slug: string | null, domain: string | null): number | undefined => {
-  if (ats_platform && ats_slug) {
-    const r = db.prepare("SELECT id FROM companies WHERE ats_platform=? AND ats_slug=?").get(ats_platform, ats_slug) as { id: number } | undefined;
-    if (r) return r.id;
-  }
-  if (domain) {
-    const r = db.prepare("SELECT id FROM companies WHERE domain=? ORDER BY id LIMIT 1").get(domain) as { id: number } | undefined;
-    if (r) return r.id;
-  }
-  return undefined;
-};
-
-// Merge an incoming (pool) snapshot into the local catalog. NEWER-WINS by last_seen_at for
-// liveness/fields; a grade is taken when incoming is graded and local is ungraded OR the
-// incoming grade is newer (graded_at). Never closes local jobs (a pull only adds/refreshes),
-// and never touches the personal plane. Companies dedupe through upsertCompany.
-export interface ApplyResult { companies_added: number; jobs_added: number; jobs_updated: number; jobs_skipped: number }
-export function applyCatalogSnapshot(snap: CatalogSnapshot): ApplyResult {
-  const tx = db.transaction((): ApplyResult => {
-    let companies_added = 0, jobs_added = 0, jobs_updated = 0, jobs_skipped = 0;
-    for (const c of snap.companies) {
-      const r = upsertCompany({
-        name: c.name, domain: c.domain, source: c.source, ats_platform: c.ats_platform, ats_slug: c.ats_slug,
-        resolved: c.resolved === 1, tags: c.tags ? c.tags.split(",").filter(Boolean) : [],
-      });
-      if (r.inserted) companies_added++;
-    }
-    const insSkills = db.prepare("INSERT OR IGNORE INTO job_skills (job_id, skill, kind) VALUES (?, ?, ?)");
-    const setSkills = (jobId: number, skills: { skill: string; kind: string }[]) => {
-      db.prepare("DELETE FROM job_skills WHERE job_id=?").run(jobId);
-      for (const s of skills) insSkills.run(jobId, s.skill, s.kind);
-    };
-    for (const j of snap.jobs) {
-      const cid = localCompanyId(j.ats_platform, j.ats_slug, j.domain);
-      if (cid === undefined || !j.source_url) { jobs_skipped++; continue; }
-      const local = db.prepare("SELECT id, last_seen_at, grade_seniority, graded_at FROM jobs WHERE company_id=? AND source_url=?")
-        .get(cid, j.source_url) as { id: number; last_seen_at: string; grade_seniority: string | null; graded_at: string | null } | undefined;
-      if (!local) {
-        const info = db.prepare(
-          `INSERT INTO jobs (company_id, source_url, title, location, remote, comp_min, comp_max, grade_seniority, grade_market_signal, graded_at, fetched_at, last_seen_at, still_live)
-           VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),?,?)`,
-        ).run(cid, j.source_url, j.title, j.location, j.remote, j.comp_min, j.comp_max, j.grade_seniority, j.grade_market_signal, j.graded_at, j.last_seen_at, j.still_live);
-        if (j.skills.length) setSkills(Number(info.lastInsertRowid), j.skills);
-        jobs_added++;
-      } else {
-        const incomingNewer = j.last_seen_at > local.last_seen_at;
-        const takeGrade = j.grade_seniority != null
-          && (local.grade_seniority == null || (j.graded_at != null && (local.graded_at == null || j.graded_at > local.graded_at)));
-        if (!incomingNewer && !takeGrade) { jobs_skipped++; continue; }
-        if (incomingNewer)
-          db.prepare("UPDATE jobs SET title=?, location=?, remote=?, comp_min=?, comp_max=?, last_seen_at=?, still_live=? WHERE id=?")
-            .run(j.title, j.location, j.remote, j.comp_min, j.comp_max, j.last_seen_at, j.still_live, local.id);
-        if (takeGrade) {
-          db.prepare("UPDATE jobs SET grade_seniority=?, grade_market_signal=?, graded_at=? WHERE id=?")
-            .run(j.grade_seniority, j.grade_market_signal, j.graded_at, local.id);
-          setSkills(local.id, j.skills);
-        }
-        jobs_updated++;
-      }
-    }
-    return { companies_added, jobs_added, jobs_updated, jobs_skipped };
-  });
-  return tx();
-}

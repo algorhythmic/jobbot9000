@@ -1,0 +1,16 @@
+{
+  "mode": "competency_interview",
+  "rubric": "Conduct a competency interview — the engine that does three jobs at once: ASSESS (the primary evidence for candidates with no public portfolio), VERIFY (separate a builder from a confident resume), and UPSKILL (show the candidate what a great answer looks like). Probe each load-bearing claim and each competency dimension in conversation: ask them to explain a hard decision, what broke and how they fixed it, why X over Y, to trace a path through their own system, or to reason through a problem from scratch. For EACH question record: the candidate's answer (summary), a grounded EXEMPLAR ('what a great candidate at the target level would have said' — anchored to the role's requirements + the dimension rubric + the band, never a vague model opinion), a score (weak|adequate|strong), and the delta (the specific gap → an upskilling target). Where a claim is about owned work, also record ownership (sole_author|contributor|user|observer) and understanding (deep|working|shallow|cannot_explain). Be adversarial-but-supportive: tell the candidate up front this is for honest calibration AND to learn the bar, not a gotcha. A claim that doesn't hold up is unverified and must not inflate the profile. Set verified_ceiling to the highest level the interview evidence supports — it caps an over-claimed level, and for a no-portfolio candidate it ESTABLISHES the level. After the interview, re-run assess_competency per dimension with the now-demonstrated evidence, and turn each delta into an upskilling-plan item.",
+  "output_schema": {
+    "items": "[{ dimension?, claim?, question, answer_summary, exemplar, score: weak|adequate|strong, ownership?, understanding?, delta_notes }]",
+    "verified_ceiling": "one of the ladder — the highest level the interview supports (caps/establishes the level)",
+    "summary": "string — the honest read after questioning: what held up, what didn't, the biggest deltas"
+  },
+  "constraints": {
+    "score_must_be_one_of": ["weak", "adequate", "strong"],
+    "ownership_must_be_one_of": ["sole_author", "contributor", "user", "observer"],
+    "understanding_must_be_one_of": ["deep", "working", "shallow", "cannot_explain"],
+    "verified_ceiling_must_be_one_of": ["intern", "junior", "mid", "senior", "staff", "principal"],
+    "summary_required": true
+  }
+}

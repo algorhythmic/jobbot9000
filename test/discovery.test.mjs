@@ -267,57 +267,6 @@ eq(tools.compactDescription(JSON.stringify({ descriptionPlain: "Plain text role.
 eq([tools.compactDescription(null), tools.compactDescription("not json")], [null, null], "compactDescription: null/garbage -> null");
 eq(tools.compactDescription(JSON.stringify({ description: "x".repeat(2000) })).length, 1000, "compactDescription: truncated to DESC_MAX");
 
-// ════════════════════ sync_catalog ════════════════════
-// snapshot builders for controlled merge tests
-const sc = (o) => ({ name: "MergeCo", domain: null, tags: null, source: null, ats_platform: "lever", ats_slug: "mergeco", resolved: 1, ...o });
-const sj = (o) => ({ ats_platform: "lever", ats_slug: "mergeco", domain: null, source_url: "m1", title: null, location: null, remote: null, comp_min: null, comp_max: null, grade_seniority: null, grade_market_signal: null, graded_at: null, last_seen_at: "2025-01-01 00:00:00", still_live: 1, skills: [], ...o });
-
-// ── R. EGRESS SAFETY: snapshot carries catalog only, never personal data ──────
-DB.setMasterResume("SECRETRESUME_xyz");
-DB.upsertProfile({ target_role: "SECRETROLE", location_pref: "SECRETLOC" });
-DB.setAssessment("senior", "SECRETRATIONALE", ["SECRETEVIDENCE"]);
-const aJob = DB.db.prepare("SELECT id FROM jobs LIMIT 1").get();
-DB.setJobFit(aJob.id, "over", ["SECRETGAP"], "SECRETFITRATIONALE");
-DB.recordCoverLetter(aJob.id, "SECRETCOVERLETTER", ["SECRETTALKINGPOINT"]);
-const snap = DB.catalogSnapshot();
-const blob = JSON.stringify(snap);
-eq(Object.keys(snap).sort().join(","), "companies,jobs", "egress: snapshot has only companies + jobs");
-for (const secret of ["SECRETRESUME", "SECRETROLE", "SECRETLOC", "SECRETRATIONALE", "SECRETEVIDENCE", "SECRETGAP", "SECRETFITRATIONALE", "SECRETCOVERLETTER", "SECRETTALKINGPOINT"])
-  eq(blob.includes(secret), false, `egress: snapshot excludes personal '${secret}'`);
-
-// ── S. no pool configured → honest no-op, nothing leaves ──────────────────────
-const np = jres(await tools.syncCatalog({}, { pool: null }));
-eq([np.ok, np.pool_configured], [false, false], "sync: no pool -> not configured (no egress)");
-
-// ── T. mock pool: dry_run previews, full sync pulls+pushes ────────────────────
-const remoteSnap = {
-  companies: [sc({ name: "PoolCo", domain: "poolco.com", source: "pool", ats_platform: "greenhouse", ats_slug: "poolco" })],
-  jobs: [sj({ ats_platform: "greenhouse", ats_slug: "poolco", domain: "poolco.com", source_url: "https://poolco/1", title: "Pool Eng", grade_seniority: "senior", grade_market_signal: "A", graded_at: "2026-06-01 00:00:00", last_seen_at: "2026-06-01 00:00:00", skills: [{ skill: "go", kind: "required" }] })],
-};
-let pushed = null;
-const mockPool = { name: "mock", pull: async () => remoteSnap, push: async (s) => { pushed = s; return { accepted: s.jobs.length }; } };
-
-const sdry = jres(await tools.syncCatalog({ dry_run: true }, { pool: mockPool }));
-eq([sdry.ok, sdry.dry_run, sdry.diff.pull.jobs_new], [true, true, 1], "sync dry_run: previews 1 job to pull");
-eq([pushed, !!DB.getCompanyByAts("greenhouse", "poolco")], [null, false], "sync dry_run: nothing pushed or written");
-
-const full = jres(await tools.syncCatalog({}, { pool: mockPool }));
-eq([full.ok, full.pulled.companies_added, full.pulled.jobs_added], [true, 1, 1], "sync: pulled new company + job");
-eq([pushed !== null, !!DB.getCompanyByAts("greenhouse", "poolco")], [true, true], "sync: pushed local + persisted pulled rows");
-eq(DB.getMeta("last_synced") !== null, true, "sync: last_synced stamped (flips the 'synced' dimension)");
-eq(JSON.stringify(pushed).includes("SECRETRESUME"), false, "sync: pushed payload carries no personal data");
-
-// ── U. applyCatalogSnapshot merge semantics (newer-wins, grade-take) ──────────
-const mid = DB.upsertCompany({ name: "MergeCo", ats_platform: "lever", ats_slug: "mergeco" }).id;
-DB.upsertJobs(mid, [{ source_url: "m1", title: "Local" }]); // last_seen ~ now
-eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ title: "Older", last_seen_at: "2000-01-01 00:00:00" })] }).jobs_skipped, 1, "merge: older incoming skipped");
-eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ title: "Newer", last_seen_at: "2099-01-01 00:00:00" })] }).jobs_updated, 1, "merge: newer incoming updates");
-eq(DB.db.prepare("SELECT title FROM jobs WHERE company_id=? AND source_url='m1'").get(mid).title, "Newer", "merge: field updated to newer");
-eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ last_seen_at: "2000-01-01 00:00:00", grade_seniority: "staff", grade_market_signal: "A", graded_at: "2050-01-01 00:00:00", skills: [{ skill: "rust", kind: "required" }] })] }).jobs_updated, 1, "merge: grade taken even when last_seen older");
-eq(DB.db.prepare("SELECT grade_seniority FROM jobs WHERE company_id=? AND source_url='m1'").get(mid).grade_seniority, "staff", "merge: grade applied to ungraded local");
-eq(DB.applyCatalogSnapshot({ companies: [sc()], jobs: [sj({ source_url: "m2", title: "Fresh" })] }).jobs_added, 1, "merge: brand-new job added");
-eq(DB.applyCatalogSnapshot({ companies: [], jobs: [sj({ ats_slug: "ghostco", source_url: "x" })] }).jobs_skipped, 1, "merge: job for unknown company skipped");
-
 // ════════════════════ look(jobs) filters (triage + location/remote) ════════════════════
 // clause/param building (injection-safe — values go through params, not interpolation)
 const jf = tools.jobFilters({ titles_any: ["Applied AI", "Data Engineer"], location: "US", remote: true });
@@ -392,15 +341,15 @@ eq(DB.counts().portfolio_graded, 1, "re-ingest: only the persisting grade remain
 // ════════════════════ gap #6: manual projects (resume↔repo reconciliation) ════════════════════
 await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/alpha" })], enrichFn: noEnrich });
 DB.setPortfolioRelevance("u/alpha", "moderate", [], [], "r");                 // grade the github repo
-DB.addPortfolioProject("Saga", { repo: "Saga", name: "Saga", description: "multi-agent orchestration", languages: ["TypeScript", "Python"], source: "manual" });
-DB.setPortfolioRelevance("Saga", "strong", ["multi-agent"], [], "flagship");  // grade the manual project
-eq(DB.getPortfolio().map((p) => `${p.repo}:${p.source}`).sort(), ["Saga:manual", "u/alpha:github"], "add: manual project sits alongside github repos");
+DB.addPortfolioProject("AcmeService", { repo: "AcmeService", name: "AcmeService", description: "multi-agent orchestration", languages: ["TypeScript", "Python"], source: "manual" });
+DB.setPortfolioRelevance("AcmeService", "strong", ["multi-agent"], [], "flagship");  // grade the manual project
+eq(DB.getPortfolio().map((p) => `${p.repo}:${p.source}`).sort(), ["AcmeService:manual", "u/alpha:github"], "add: manual project sits alongside github repos");
 // re-ingest: github repos replaced (u/alpha gone), manual project + its grade SURVIVE
 await tools.ingestPortfolio({ github_handle: "u" }, { fetchReposFn: async () => [mkFacts({ repo: "u/beta" })], enrichFn: noEnrich });
-eq(DB.getPortfolio().map((p) => `${p.repo}:${p.source}`).sort(), ["Saga:manual", "u/beta:github"], "re-ingest: keeps the manual project, replaces github repos");
-eq([!!DB.getPortfolioRelevance("Saga"), !!DB.getPortfolioRelevance("u/alpha")], [true, false], "re-ingest: keeps manual grade, prunes the dropped github repo's grade");
+eq(DB.getPortfolio().map((p) => `${p.repo}:${p.source}`).sort(), ["AcmeService:manual", "u/beta:github"], "re-ingest: keeps the manual project, replaces github repos");
+eq([!!DB.getPortfolioRelevance("AcmeService"), !!DB.getPortfolioRelevance("u/alpha")], [true, false], "re-ingest: keeps manual grade, prunes the dropped github repo's grade");
 const rp = tools.rankedPortfolio();
-eq([rp[0].repo, rp.find((p) => p.repo === "Saga").source], ["Saga", "manual"], "rankedPortfolio: manual project surfaces source + ranks by its strong grade");
+eq([rp[0].repo, rp.find((p) => p.repo === "AcmeService").source], ["AcmeService", "manual"], "rankedPortfolio: manual project surfaces source + ranks by its strong grade");
 
 // ════════════════════ market-demand overlay (gap #2) ════════════════════
 // Unique skill names so the aggregation is deterministic despite graded jobs from earlier sections.
@@ -418,6 +367,51 @@ eq(dMid.skills.find((x) => x.skill.toLowerCase() === "pymdx").total, 2, "marketS
 eq(dMid.skills.find((x) => x.skill.toLowerCase() === "gomdx"), undefined, "marketSkillDemand: band filter excludes a senior-only skill");
 const ov = tools.marketOverlay(state.readJourneyState());
 eq([ov.computed, ov.top_skills.length > 0, typeof ov.basis === "string"], [true, true, true], "marketOverlay: computed (top_skills + basis) once jobs are graded");
+
+// ════════════════════ v2: competency profile + derived band ════════════════════
+DB.setCompetency("technical_depth", "senior", "high", [{ claim: "x", provenance: "corroborated" }], "r");
+DB.setCompetency("system_design", "junior", "low", [], "r");
+DB.setCompetency("communication", "mid", "medium", [], "r");
+DB.setCompetency("ownership", "mid", "low", [], "r"); // mean rank (3+1+2+2)/4 = 2 -> mid
+const band = DB.deriveBand();
+eq(band.floor, "junior", "deriveBand: floor = lowest dimension");
+eq(band.confidence, "low", "deriveBand: overall confidence = lowest (skeptical)");
+eq(band.band, "mid", "deriveBand: band = floor of mean rank");
+eq(DB.getAssessmentSummary().band, "mid", "assessment_summary cached on assess");
+eq(state.readJourneyState().dimensions.profiled, true, "state: profiled dimension flips");
+eq(state.readJourneyState().dimensions.verified, false, "state: unverified until an interview completes");
+
+// ════════════════════ v2: interview verifies (resumable) ════════════════════
+const ivId = DB.startInterview("competency", null);
+DB.addInterviewItems(ivId, [{ question: "explain X", answer_summary: "weak", score: "weak", ownership: "observer", understanding: "cannot_explain", claim: "AcmeService" }]);
+eq(DB.getOpenInterview().id, ivId, "interview: open session resumable");
+eq(state.readJourneyState().open_interview.id, ivId, "state: surfaces open interview to resume");
+DB.completeInterview(ivId, "junior", "did not hold up");
+eq([DB.getInterview(ivId).status, DB.getAssessmentSummary().verified], ["complete", 1], "interview: complete flips verified");
+eq(state.readJourneyState().dimensions.verified, true, "state: verified after interview completes");
+
+// ════════════════════ v2: upskilling plan (tracked, drives re-match) ════════════════════
+const pid = DB.addPlanItem("system_design", "build", "ship a sharded KV store", "system design (high demand)");
+eq([DB.getPlan().length, DB.getPlan()[0].status], [1, "suggested"], "plan: item added as suggested");
+DB.updatePlanItem(pid, "in_progress", "started");
+eq([state.readJourneyState().dimensions.has_plan, state.readJourneyState().plan.in_progress], [true, 1], "state: has_plan + in_progress count");
+DB.updatePlanItem(pid, "done", null);
+eq(DB.planCounts().done, 1, "plan: marked done");
+
+// ════════════════════ v2: role fit (per-dimension + desire alignment) ════════════════════
+const rfJob = DB.db.prepare("SELECT id FROM jobs LIMIT 1").get().id;
+DB.setRoleFit(rfJob, "under", { system_design: "needs scale" }, "mixed", ["distributed systems"], "a level under; remote-only conflict");
+eq([DB.getRoleFit(rfJob).band, DB.getRoleFit(rfJob).desire_alignment], ["under", "mixed"], "role_fit: stored band + desire alignment");
+
+// ════════════════════ v2: resume revision history (tracked) ════════════════════
+DB.setMasterResume("v1 resume");                            // initial: no rationale -> no revision
+DB.setMasterResume("v2 resume", "quantified real impact");  // coached: tracked
+eq([DB.getResumeRevisions().length, DB.getResumeRevisions()[0].rationale], [1, "quantified real impact"], "resume: coached revision tracked");
+
+// ════════════════════ v2: durability journal ════════════════════
+const evKinds = new Set(DB.getEvents(200).map((e) => e.kind));
+for (const k of ["assessed", "interviewed", "planned", "plan_progress", "resume_revised", "role_fit"])
+  eq(evKinds.has(k), true, `journal: '${k}' event recorded (persists across sessions)`);
 
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}

@@ -1,0 +1,16 @@
+{
+  "mode": "role_fit",
+  "rubric": "Judge the candidate's fit on a specific job, against their competency profile AND their desires. band: over (the role is below their verified level), exact (well-matched), under (above their current verified level — name what to close). Read fit PER DIMENSION (technical_depth, system_design, communication, ownership) vs. what the role demands, not as one blob — that's what makes the gaps targetable for upskilling. Also judge desire_alignment: does this role match what the candidate said they WANT (role type, domain, comp floor, work style, stated priorities)? strong = matches fitness and desires; mixed = one but not the other (surface the tension — e.g. 'you'd be a fit but it's onsite and you want remote', or 'you want this but you're a level under'); weak = neither. Reference the assessed level/profile and be honest: an unverified profile means low-confidence fit — say so. This is personal; never shared.",
+  "output_schema": {
+    "band": "over | exact | under",
+    "dim_deltas": "{ technical_depth?, system_design?, communication?, ownership? } — the gap vs the role per dimension",
+    "desire_alignment": "strong | mixed | weak — vs the candidate's stated desires",
+    "gaps": "string[] — specific things to close before this role is a real fit",
+    "rationale": "string — must reference the assessed profile/level and the desire match"
+  },
+  "constraints": {
+    "band_must_be_one_of": ["over", "exact", "under"],
+    "desire_alignment_must_be_one_of": ["strong", "mixed", "weak"],
+    "rationale_required": true
+  }
+}

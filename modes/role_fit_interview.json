@@ -1,0 +1,16 @@
+{
+  "mode": "role_fit_interview",
+  "rubric": "Conduct a role-specific interview for ONE target job — practice + assessment grounded in that posting. Use the job's graded required/preferred skills and seniority as the bar. Ask the questions this role would actually ask (system design at its scale, the domain problems it names, the tradeoffs it cares about). For each: record the candidate's answer, a grounded EXEMPLAR ('what a strong hire for THIS role would have said' — anchored to the posting's requirements at its band), a score (weak|adequate|strong), and the delta. This is repeatable PRACTICE: re-running it as the candidate improves is the point, and the deltas become upskilling-plan items targeted at this role. Be adversarial-but-supportive. verified_ceiling = the level this performance supports for this kind of role; it feeds role fit (assess_role_fit) and, where it generalizes, the competency profile. Never invent the candidate's answers or inflate the exemplar beyond the role's real bar.",
+  "output_schema": {
+    "items": "[{ dimension?, claim?, question, answer_summary, exemplar, score: weak|adequate|strong, delta_notes }]",
+    "verified_ceiling": "one of the ladder — the level this performance supports for this role",
+    "summary": "string — readiness for this role: strengths, the gaps to close before applying"
+  },
+  "constraints": {
+    "score_must_be_one_of": ["weak", "adequate", "strong"],
+    "ownership_must_be_one_of": ["sole_author", "contributor", "user", "observer"],
+    "understanding_must_be_one_of": ["deep", "working", "shallow", "cannot_explain"],
+    "verified_ceiling_must_be_one_of": ["intern", "junior", "mid", "senior", "staff", "principal"],
+    "summary_required": true
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "mode": "upskilling_plan",
+  "rubric": "Turn assessed gaps into a concrete, tracked plan that genuinely raises the candidate's fitness — the upskilling half of the loop. Each item has a type: 'learn' (a specific skill/topic to study, with what to actually do — not 'learn distributed systems' but 'build and load-test a sharded key-value store'), 'resume' (a specific change to the master resume — reframe a bullet, quantify a real outcome, surface a buried strength; NEVER invent experience), or 'build' (a specific portfolio PROJECT to ship that would close an in-demand gap). GROUND 'build' and 'learn' items in real market demand: prefer the skills the live graded jobs in the candidate's band actually ask for (the market-demand overlay), and say which in-demand skill each item closes. Tie each item to the gap it addresses (a competency dimension or a named skill). Keep it honest and achievable — a short ordered plan that moves the needle, not a wish list. Items are tracked (suggested → in_progress → done); closing them raises fitness and re-opens higher-band roles.",
+  "output_schema": {
+    "items": "[{ gap, type: learn|resume|build, spec, market_demand }]"
+  },
+  "constraints": {
+    "type_must_be_one_of": ["learn", "resume", "build"],
+    "spec_required": true
+  }
+}
