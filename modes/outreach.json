@@ -1,0 +1,14 @@
+{
+  "mode": "outreach",
+  "rubric": "Draft a WARM outreach message to a specific person at a target company. Lead with a concrete problem, initiative, or product surface at THAT company the user can credibly help with — not flattery, not a generic intro. Back it with ONE project from the graded portfolio as evidence (prefer a 'strong'-relevance repo whose work maps to the problem). Customized to the person and company; never a blast. Grounded in real work — never invent experience or a connection that doesn't exist. Keep it short and human. DRAFT ONLY: jobbot never sends; the user sends it themselves and decides whether to.",
+  "output_schema": {
+    "angle": "string — the specific problem/initiative at the company you lead with",
+    "anchor": "string — the portfolio project (repo name) featured as evidence",
+    "message": "string — the message body: concise, specific, human; opens with the angle, cites the anchor, closes with a low-friction ask"
+  },
+  "constraints": {
+    "no_invented_experience": true,
+    "must_be_customized": true,
+    "draft_only": true
+  }
+}

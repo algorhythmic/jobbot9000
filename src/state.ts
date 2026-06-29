@@ -5,13 +5,13 @@
 // interview, in-progress plan items).
 import {
   getProfile, getMasterResume, assessmentSummary, getCompetencyProfile, getOpenInterview,
-  counts, applicationCounts, planCounts, type Desires,
+  counts, applicationCounts, planCounts, outreachCounts, type Desires,
 } from "./db.js";
 
 // To add a dimension: extend this union and add its predicate in readJourneyState.
 export type Dimension =
   | "onboarded" | "profiled" | "verified" | "portfolio_fetched" | "portfolio_graded"
-  | "jobs_discovered" | "has_plan" | "has_applications";
+  | "jobs_discovered" | "has_plan" | "has_applications" | "has_outreach";
 
 export interface JourneyState {
   dimensions: Record<Dimension, boolean>;
@@ -29,6 +29,7 @@ export interface JourneyState {
   catalog: { companies: number; unresolved: number; jobs: number; ungraded_jobs: number };
   plan: Record<string, number>;     // upskilling-plan counts by status
   pipeline: Record<string, number>; // application counts by status
+  outreach: Record<string, number>; // outreach draft/sent counts (empty until a message is drafted)
 }
 
 export function readJourneyState(): JourneyState {
@@ -40,6 +41,7 @@ export function readJourneyState(): JourneyState {
   const c = counts();
   const plan = planCounts();
   const pipeline = applicationCounts();
+  const outreach = outreachCounts();
   return {
     dimensions: {
       onboarded: !!profile,
@@ -50,6 +52,7 @@ export function readJourneyState(): JourneyState {
       jobs_discovered: c.jobs > 0,
       has_plan: c.plan_open > 0,
       has_applications: Object.keys(pipeline).length > 0,
+      has_outreach: Object.keys(outreach).length > 0,
     },
     assessed_level: summary?.band ?? null,
     assessment: summary ? { band: summary.band, confidence: summary.confidence, floor: summary.floor, verified: !!summary.verified } : null,
@@ -66,5 +69,6 @@ export function readJourneyState(): JourneyState {
     catalog: { companies: c.companies, unresolved: c.unresolved, jobs: c.jobs, ungraded_jobs: c.ungraded },
     plan,
     pipeline,
+    outreach,
   };
 }

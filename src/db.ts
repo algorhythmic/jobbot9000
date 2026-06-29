@@ -138,6 +138,20 @@ CREATE TABLE IF NOT EXISTS applications (               -- the user's applicatio
   notes          TEXT,
   updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS outreach (                   -- a DRAFTED warm-outreach message (personal; jobbot never sends)
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id    INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  job_id        INTEGER REFERENCES jobs(id) ON DELETE SET NULL,  -- optional: outreach about a specific role
+  contact_name  TEXT,
+  contact_role  TEXT,
+  contact_url   TEXT,                                            -- a profile/handle (LinkedIn etc.) — the user has the channel
+  angle         TEXT,                                            -- the specific problem/initiative the message leads with
+  anchor_repo   TEXT,                                            -- the portfolio project featured as evidence
+  message       TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'draft',                   -- draft (default) | sent (the user marks it after THEY send)
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS events (                     -- APPEND-ONLY journal — the narrative timeline; never mutated/pruned
   id      INTEGER PRIMARY KEY AUTOINCREMENT,
   ts      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -481,6 +495,58 @@ export const getApplications = (): ApplicationRow[] =>
 
 export const applicationCounts = (): Record<string, number> =>
   Object.fromEntries((db.prepare("SELECT status, count(*) c FROM applications GROUP BY status").all() as { status: string; c: number }[])
+    .map((r) => [r.status, r.c]));
+
+// ── outreach (personal) — DRAFTED warm messages; jobbot never sends ──────────
+export interface OutreachInput {
+  company_id: number; message?: string; job_id?: number | null;
+  contact_name?: string | null; contact_role?: string | null; contact_url?: string | null;
+  angle?: string | null; anchor_repo?: string | null; status?: string;
+}
+// Insert a new draft, or (with id) update an existing one — preserving fields not re-passed
+// (so marking status:'sent' keeps the message/contact). Returns the row id; journals the step.
+export function recordOutreach(id: number | undefined, fields: OutreachInput): number {
+  if (id !== undefined) {
+    const cur = db.prepare("SELECT * FROM outreach WHERE id = ?").get(id) as any;
+    if (cur) {
+      const pick = (k: string) => ((fields as any)[k] !== undefined ? (fields as any)[k] : cur[k]);
+      db.prepare(
+        `UPDATE outreach SET company_id=@company_id, job_id=@job_id, contact_name=@contact_name, contact_role=@contact_role,
+           contact_url=@contact_url, angle=@angle, anchor_repo=@anchor_repo, message=@message, status=@status, updated_at=datetime('now')
+         WHERE id=@id`,
+      ).run({ id, company_id: pick("company_id"), job_id: pick("job_id"), contact_name: pick("contact_name"), contact_role: pick("contact_role"), contact_url: pick("contact_url"), angle: pick("angle"), anchor_repo: pick("anchor_repo"), message: pick("message"), status: pick("status") ?? "draft" });
+      logEvent("outreach", `outreach ${id} → ${pick("status") ?? "draft"}`, String(id));
+      return id;
+    }
+  }
+  const info = db.prepare(
+    `INSERT INTO outreach (company_id, job_id, contact_name, contact_role, contact_url, angle, anchor_repo, message, status)
+     VALUES (@company_id, @job_id, @contact_name, @contact_role, @contact_url, @angle, @anchor_repo, @message, @status)`,
+  ).run({
+    company_id: fields.company_id, job_id: fields.job_id ?? null, contact_name: fields.contact_name ?? null,
+    contact_role: fields.contact_role ?? null, contact_url: fields.contact_url ?? null, angle: fields.angle ?? null,
+    anchor_repo: fields.anchor_repo ?? null, message: fields.message ?? "", status: fields.status ?? "draft",
+  });
+  const newId = Number(info.lastInsertRowid);
+  logEvent("outreach", `drafted outreach (status ${fields.status ?? "draft"})`, String(newId));
+  return newId;
+}
+
+export interface OutreachRow {
+  id: number; company: string; company_id: number; job_id: number | null; contact_name: string | null;
+  contact_role: string | null; contact_url: string | null; angle: string | null; anchor_repo: string | null;
+  message: string; status: string; created_at: string; updated_at: string;
+}
+export const getOutreach = (): OutreachRow[] =>
+  db.prepare(
+    `SELECT o.id, c.name AS company, o.company_id, o.job_id, o.contact_name, o.contact_role, o.contact_url,
+            o.angle, o.anchor_repo, o.message, o.status, o.created_at, o.updated_at
+     FROM outreach o JOIN companies c ON c.id = o.company_id ORDER BY o.updated_at DESC`,
+  ).all() as OutreachRow[];
+export const getOutreachById = (id: number): OutreachRow | undefined =>
+  getOutreach().find((o) => o.id === id);
+export const outreachCounts = (): Record<string, number> =>
+  Object.fromEntries((db.prepare("SELECT status, count(*) c FROM outreach GROUP BY status").all() as { status: string; c: number }[])
     .map((r) => [r.status, r.c]));
 
 export const getMeta = (key: string): string | null =>

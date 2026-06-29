@@ -413,6 +413,19 @@ const evKinds = new Set(DB.getEvents(200).map((e) => e.kind));
 for (const k of ["assessed", "interviewed", "planned", "plan_progress", "resume_revised", "role_fit"])
   eq(evKinds.has(k), true, `journal: '${k}' event recorded (persists across sessions)`);
 
+// ════════════════════ outreach arm (draft-only) ════════════════════
+const orCo = DB.upsertCompany({ name: "OutreachCo", ats_platform: "greenhouse", ats_slug: "outreachco" }).id;
+const oid = DB.recordOutreach(undefined, { company_id: orCo, message: "Saw your eval-tooling work — a relevant project of mine.", contact_name: "Jane Lead", contact_role: "Eng Manager", angle: "eval tooling", anchor_repo: "AcmeService" });
+eq(typeof oid, "number", "recordOutreach: returns a new id");
+const orow = DB.getOutreachById(oid);
+eq([orow.company, orow.status, orow.contact_name, orow.anchor_repo], ["OutreachCo", "draft", "Jane Lead", "AcmeService"], "recordOutreach: stored as draft, joined to company");
+eq(DB.outreachCounts(), { draft: 1 }, "outreachCounts: 1 draft");
+// update without re-passing the message → preserves it; mark sent (the user sent it)
+DB.recordOutreach(oid, { company_id: orCo, status: "sent" });
+const sent = DB.getOutreachById(oid);
+eq([sent.status, sent.message.includes("eval-tooling")], ["sent", true], "recordOutreach: status update preserves the message");
+eq([state.readJourneyState().dimensions.has_outreach, state.readJourneyState().outreach.sent], [true, 1], "state: has_outreach dimension + outreach counts");
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 try { DB.db.close(); } catch {}
 try { rmSync(TMP, { recursive: true, force: true }); } catch {}
