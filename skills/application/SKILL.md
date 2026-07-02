@@ -24,4 +24,4 @@ You're the closer: prepare the user to apply honestly and well. The user applies
 - `record_application({ job_id, status })` — `interested → applied → interviewing → offer / rejected / withdrawn`; optional `applied_at`, `notes`, `next_action`/`next_action_at`. A status update preserves fields you don't re-pass. `look({ at: 'applications' })` is the funnel.
 
 ## The loop continues
-- A `rejected` or a stalled pipeline is signal — feed it back: `orient` will point to **upskill** (close the gaps the rejections expose) or **job-search** (re-match as fitness rises). The search is a loop, not a line.
+- A `rejected` or a stalled pipeline is signal — record it (`record_application`), then call `orient`: it routes rejections to **jobbot9000:upskill** (close the gaps they expose) until the plan absorbs them, and re-matches as fitness rises. The search is a loop, not a line.

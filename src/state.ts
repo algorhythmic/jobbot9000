@@ -5,13 +5,14 @@
 // interview, in-progress plan items).
 import {
   getProfile, getMasterResume, assessmentSummary, getCompetencyProfile, getOpenInterview,
-  counts, applicationCounts, planCounts, type Desires,
+  counts, applicationCounts, planCounts, planDoneSinceAssess, rejectionsSincePlan,
+  liveJobsInBand, bandFor, type Desires,
 } from "./db.js";
 
 // To add a dimension: extend this union and add its predicate in readJourneyState.
 export type Dimension =
   | "onboarded" | "profiled" | "verified" | "portfolio_fetched" | "portfolio_graded"
-  | "jobs_discovered" | "has_plan" | "has_applications";
+  | "jobs_discovered" | "has_applications";
 
 export interface JourneyState {
   dimensions: Record<Dimension, boolean>;
@@ -26,9 +27,14 @@ export interface JourneyState {
     target_role: string | null; target_niche: string | null; location_pref: string | null;
     github_handle: string | null; desires: Desires | null; no_resume: boolean; no_github: boolean;
   } | null;
-  catalog: { companies: number; unresolved: number; jobs: number; ungraded_jobs: number };
+  // live_in_band: live graded jobs inside the user's band ±1 (null until assessed) — the
+  // "anything to pursue?" read the recommender routes on.
+  catalog: { companies: number; unresolved: number; jobs: number; ungraded_jobs: number; live_in_band: number | null };
   plan: Record<string, number>;     // upskilling-plan counts by status
   pipeline: Record<string, number>; // application counts by status
+  // The edges that make the loop TURN: progress not yet re-assessed, outcomes not yet
+  // fed back into the plan. The recommender (orient) routes on these.
+  signals: { plan_done_since_assess: number; rejections_since_plan: number };
 }
 
 export function readJourneyState(): JourneyState {
@@ -40,15 +46,15 @@ export function readJourneyState(): JourneyState {
   const c = counts();
   const plan = planCounts();
   const pipeline = applicationCounts();
+  const band = bandFor(summary?.band ?? null);
   return {
     dimensions: {
       onboarded: !!profile,
       profiled: c.dimensions_assessed > 0,
-      verified: c.interviews_complete > 0,
+      verified: !!summary?.verified,
       portfolio_fetched: c.portfolio > 0,
       portfolio_graded: c.portfolio_graded > 0,
       jobs_discovered: c.jobs > 0,
-      has_plan: c.plan_open > 0,
       has_applications: Object.keys(pipeline).length > 0,
     },
     assessed_level: summary?.band ?? null,
@@ -63,8 +69,9 @@ export function readJourneyState(): JourneyState {
           desires: profile.desires, no_resume: !!profile.no_resume, no_github: !!profile.no_github,
         }
       : null,
-    catalog: { companies: c.companies, unresolved: c.unresolved, jobs: c.jobs, ungraded_jobs: c.ungraded },
+    catalog: { companies: c.companies, unresolved: c.unresolved, jobs: c.jobs, ungraded_jobs: c.ungraded, live_in_band: band ? liveJobsInBand(band) : null },
     plan,
     pipeline,
+    signals: { plan_done_since_assess: planDoneSinceAssess(), rejections_since_plan: rejectionsSincePlan() },
   };
 }

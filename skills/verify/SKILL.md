@@ -26,7 +26,7 @@ Record with `record_interview`:
 
 ## Re-assess honestly
 - After the interview, **re-run `assess_competency` per dimension** with the now-demonstrated evidence: raise confidence only for what held up, set levels no higher than `verified_ceiling`, and for a no-portfolio candidate set the level the interview *earned* (don't leave them floored). A claim that didn't hold up must not inflate the profile or be featured.
-- Turn each delta into a plan item — go to the **upskill** skill.
+- Turn each delta into a plan item — go to **jobbot9000:upskill**.
 
 ## Next
-- With a verified profile, `orient` routes to **job-search**. Honest calibration is the gift: coaching a junior as a junior — or a quiet senior as a senior — is what actually gets them hired.
+- Call `orient` — it routes (once the deltas become plan items, to **jobbot9000:upskill** to work them, then **jobbot9000:job-search**). Honest calibration is the gift: coaching a junior as a junior — or a quiet senior as a senior — is what actually gets them hired.

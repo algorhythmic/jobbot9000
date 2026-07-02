@@ -25,4 +25,4 @@ This is the flywheel: the interview surfaced gaps and the bar; now turn them int
 - When an item is **done**, the user genuinely improved: re-assess the dimension it addressed (`assess_competency`), and re-run `look({ at: 'jobs', scope: 'relevant' })` — a higher band may now be in reach. That re-match is the loop turning.
 
 ## Next
-- As fitness rises, return to **job-search** for the newly-reachable roles, or **application** to pursue one.
+- Call `orient` — it routes: as fitness rises, to **jobbot9000:job-search** for the newly-reachable roles, or **jobbot9000:application** to pursue one.
