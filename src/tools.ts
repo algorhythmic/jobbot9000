@@ -22,10 +22,6 @@ type State = ReturnType<typeof readJourneyState>;
 const MAX_CREDITS_PER_RUN = Number(process.env.THEIRSTACK_MAX_CREDITS_PER_RUN ?? 150);
 const providerContext = (): ProviderContext => ({ apiKey: process.env.THEIRSTACK_API_KEY });
 
-// All three gather steps are wired and keyless-by-default; sync was cut in v2. pendingTools
-// stays so a future gated step can re-use the honest "not yet" plumbing.
-const pendingTools = (): string[] => [];
-
 // ── grading modes — the single source of truth for the closed vocabularies ──
 interface ModeConstraints { [key: string]: unknown }
 interface Mode { mode: string; rubric?: string; output_schema?: Record<string, unknown>; constraints: ModeConstraints }
@@ -66,12 +62,8 @@ const enumOf = (v: string[]) => z.enum(v as [string, ...string[]]);
 const ladder = SENIORITY.join(" → ");
 
 // The user's level ±1 band (around the derived overall band), or null if unassessed.
-function bandFor(level: string | null): string[] | null {
-  if (!level) return null;
-  const r = SENIORITY.indexOf(level);
-  if (r < 0) return null;
-  return SENIORITY.slice(Math.max(0, r - 1), r + 2);
-}
+// Canonical ladder order lives in db.ts (LADDER); the mode JSON mirrors it.
+const bandFor = DB.bandFor;
 
 const json = (o: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(o, null, 2) }] });
 const noJob = (id: number) => json({ ok: false, error: `no job ${id} — find a valid job_id via look({ at: 'jobs' })` });
@@ -143,6 +135,31 @@ const emptyCatalogNote = (s: State) =>
     ? `no jobs yet — discover companies with gather({ step: 'find_companies' }), then pull boards with gather({ step: 'fetch_jobs' }). You can also ${prepHint(s)} now.`
     : `${s.catalog.companies} companies discovered but no jobs pulled — run gather({ step: 'fetch_jobs' })${s.catalog.unresolved > 0 ? ` (${s.catalog.unresolved} unresolved)` : ""}. You can also ${prepHint(s)} now.`;
 
+// The router — one priority-ordered read of the whole loop, pure over JourneyState (exported
+// for tests). Every state has an exit edge back into the cycle; there is no terminal "done":
+// apply → rejection → upskill → item done → re-assess → re-match → apply. Order: resume an
+// open thread, then the onboarding gates, then the loop edges (progress to re-assess, plan to
+// work, outcomes to feed back), then market work.
+export function recommendNext(s: State): string {
+  if (!s.dimensions.onboarded) return "coach — onboard (profile + desires) first";
+  if (s.open_interview) return `verify — resume the open ${s.open_interview.type} interview (record_interview), then complete it`;
+  if (!s.dimensions.profiled) return "coach — assess the competency profile (skeptically; absence ≠ low level)";
+  if (!s.dimensions.verified) return "verify — run a competency interview to establish/verify the profile (this is also how no-portfolio candidates are assessed)";
+  const planOpen = (s.plan.suggested ?? 0) + (s.plan.in_progress ?? 0);
+  if (s.catalog.jobs === 0)
+    return `job-search — gather('find_companies') + gather('fetch_jobs') to populate the market${planOpen > 0 ? `; the ${planOpen} open plan item(s) (look at:'plan') are workable meanwhile` : `; meanwhile you can ${prepHint(s)}`}`;
+  if (s.signals.plan_done_since_assess > 0)
+    return `verify — ${s.signals.plan_done_since_assess} plan item(s) closed since the last assessment: re-assess the dimensions they addressed (assess_competency), then re-match (look jobs scope:'relevant')`;
+  if (planOpen > 0) return "upskill — work the open plan items (look at:'plan'); closing them raises fitness and re-opens higher-band roles";
+  if (s.signals.rejections_since_plan > 0)
+    return `upskill — ${s.signals.rejections_since_plan} rejection(s) since the plan last changed: turn the gaps they expose into new plan items (recommend_upskilling)`;
+  if (s.catalog.ungraded_jobs >= s.catalog.jobs)
+    return "job-search — jobs fetched but none graded: work the grading queue (look jobs scope:'worklist', then grade_job)";
+  if ((s.catalog.live_in_band ?? 0) > 0)
+    return "application — pursue the best-fit roles (look jobs scope:'relevant', then the packet); or job-search to widen the market";
+  return "job-search — no live graded roles in your band: refresh boards (gather 'fetch_jobs'), widen discovery (gather 'find_companies'), grade the worklist, and re-match";
+}
+
 // Open threads a fresh session should resume (the durability payoff): an unfinished interview,
 // in-progress plan items, applications with a pending next action.
 function openThreads(s: State): string[] {
@@ -158,21 +175,11 @@ export function registerTools(server: McpServer): void {
   // ── orient: the one state door (loop-aware + resume-first) ─────────────────
   server.registerTool("orient", {
     description:
-      "Start EVERY session here. Where the user is in the readiness loop, the single next best action, and OPEN THREADS to resume (an unfinished interview, in-progress plan items) — because the whole journey persists in the DB and spans weeks/months, this is how a fresh session picks up where the last left off. detail: 'recommend' (default; + the skill to use now), 'raw' (bare state), 'resume' (full rehydration bundle: state + open threads + recent journal), 'dashboard' (fitness profile, market gap, upskilling plan, notes). Safe as the first call; no required args.",
-    inputSchema: { detail: enumOf(["recommend", "raw", "resume", "dashboard"]).optional() },
+      "Start EVERY session here. Where the user is in the readiness loop, the single next best action (recommended_skill — follow it; this is the router), OPEN THREADS to resume (an unfinished interview, in-progress plan items), and the recent journal — because the whole journey persists in the DB and spans weeks/months, this is how a fresh session picks up where the last left off. detail: 'recommend' (default), 'dashboard' (fitness profile, market gap, upskilling plan, notes). Safe as the first call; no required args.",
+    inputSchema: { detail: enumOf(["recommend", "dashboard"]).optional() },
   }, async (a) => {
     const detail = a.detail ?? "recommend";
     const s = readJourneyState();
-    if (detail === "raw") return json({ ...s, pending_tools: pendingTools() });
-
-    if (detail === "resume") {
-      return json({
-        state: s,
-        open_threads: openThreads(s),
-        recent_history: DB.getEvents(20),
-        note: "rehydration bundle — resume open threads first, then continue the loop. The DB holds everything; nothing was lost between sessions.",
-      });
-    }
 
     const base: Record<string, unknown> = { server: "jobbot9000", state: s, open_threads: openThreads(s) };
     if (s.dimensions.has_applications) {
@@ -181,15 +188,9 @@ export function registerTools(server: McpServer): void {
     }
 
     if (detail === "recommend") {
-      const conf = s.assessment?.confidence;
-      base.recommended_skill = !s.dimensions.onboarded ? "coach — onboard (profile + desires) first"
-        : s.open_interview ? `verify — resume the open ${s.open_interview.type} interview (record_interview), then complete it`
-        : !s.dimensions.profiled ? "coach — assess the competency profile (skeptically; absence ≠ low level)"
-        : !s.dimensions.verified ? "verify — run a competency interview to establish/verify the profile (this is also how no-portfolio candidates are assessed)"
-        : s.catalog.jobs === 0 ? `job-search — ${prepHint(s)}; then gather('find_companies') + gather('fetch_jobs') to populate the market`
-        : (s.plan.in_progress ?? 0) > 0 ? "upskill — work the in-progress plan items; closing them raises fitness and re-opens roles"
-        : "job-search or application";
-      base.loop_note = "the loop: profile⇅desires → match → interview (assess+verify+upskill) → plan (learn/resume/build) → apply → re-match. Closing gaps re-opens higher-band roles.";
+      base.recommended_skill = recommendNext(s);
+      base.recent_history = DB.getEvents(10);
+      base.loop_note = "the loop: profile⇅desires → match → interview (assess+verify+upskill) → plan (learn/resume/build) → apply → re-match. Closing gaps re-opens higher-band roles; rejections feed the plan. Resume open threads first, then follow recommended_skill.";
       return json(base);
     }
 
@@ -197,10 +198,7 @@ export function registerTools(server: McpServer): void {
     const band = bandFor(s.assessed_level);
     let gap: Record<string, unknown> = { note: "assess the competency profile to compute the relevant band" };
     if (band) {
-      const relevant = (DB.db.prepare(
-        `SELECT count(*) c FROM jobs WHERE still_live=1 AND grade_seniority IN (${band.map(() => "?").join(",")})`,
-      ).get(...band) as { c: number }).c;
-      gap = { relevant_in_band: relevant, whole_market: s.catalog.jobs, ungraded: s.catalog.ungraded_jobs, band };
+      gap = { relevant_in_band: s.catalog.live_in_band, whole_market: s.catalog.jobs, ungraded: s.catalog.ungraded_jobs, band };
       if (s.catalog.jobs === 0) gap.note = "zeros reflect an unpopulated catalog, not measured demand";
       else if (s.catalog.ungraded_jobs > 0) gap.note = `${s.catalog.ungraded_jobs} jobs ungraded — grade them before reading the band count as final`;
     }
@@ -626,7 +624,9 @@ export function registerTools(server: McpServer): void {
   }, async (a) => {
     if (!DB.getJob(a.job_id)) return noJob(a.job_id);
     DB.recordApplication(a.job_id, { status: a.status, applied_at: a.applied_at, next_action: a.next_action, next_action_at: a.next_action_at, notes: a.notes });
-    return json({ ok: true, job_id: a.job_id, status: a.status, pipeline: DB.applicationCounts() });
+    const out: Record<string, unknown> = { ok: true, job_id: a.job_id, status: a.status, pipeline: DB.applicationCounts() };
+    if (a.status === "rejected") out.note = "rejection recorded — signal, not verdict: orient now routes to upskill until the plan absorbs the gaps it exposes.";
+    return json(out);
   });
 
   // ── gather: the one door to the outside world (sync cut in v2) ─────────────

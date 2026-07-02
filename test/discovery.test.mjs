@@ -381,6 +381,11 @@ eq(DB.assessmentSummary().band, "mid", "assessmentSummary: band derived on read"
 eq(state.readJourneyState().dimensions.profiled, true, "state: profiled dimension flips");
 eq(state.readJourneyState().dimensions.verified, false, "state: unverified until an interview completes");
 
+// a role_fit rehearsal for one posting does NOT verify the whole competency profile
+const rfIv = DB.startInterview("role_fit", null);
+DB.completeInterview(rfIv, null, "rehearsal only");
+eq(DB.assessmentSummary().verified, false, "verified: a completed role_fit interview does NOT verify the profile");
+
 // ════════════════════ v2: interview verifies (resumable) ════════════════════
 const ivId = DB.startInterview("competency", null);
 DB.addInterviewItems(ivId, [{ question: "explain X", answer_summary: "weak", score: "weak", ownership: "observer", understanding: "cannot_explain", claim: "AcmeService" }]);
@@ -394,9 +399,52 @@ eq(state.readJourneyState().dimensions.verified, true, "state: verified after in
 const pid = DB.addPlanItem("system_design", "build", "ship a sharded KV store", "system design (high demand)");
 eq([DB.getPlan().length, DB.getPlan()[0].status], [1, "suggested"], "plan: item added as suggested");
 DB.updatePlanItem(pid, "in_progress", "started");
-eq([state.readJourneyState().dimensions.has_plan, state.readJourneyState().plan.in_progress], [true, 1], "state: has_plan + in_progress count");
+eq(state.readJourneyState().plan.in_progress, 1, "state: in_progress plan count");
 DB.updatePlanItem(pid, "done", null);
 eq(DB.planCounts().done, 1, "plan: marked done");
+
+// ════════════════════ v2.1: loop signals (the edges that make the loop TURN) ════════════════════
+// SQLite timestamps are second-resolution and everything above ran in the same second, so
+// order the comparisons explicitly by nudging rows into the future.
+DB.db.prepare("UPDATE upskilling_plan SET updated_at = datetime('now', '+1 hour') WHERE id=?").run(pid);
+eq(DB.planDoneSinceAssess(), 1, "signal: plan item closed since the last assessment -> re-assess");
+eq(state.readJourneyState().signals.plan_done_since_assess, 1, "state: surfaces plan_done_since_assess");
+DB.db.prepare("UPDATE competency_profile SET updated_at = datetime('now', '+2 hours') WHERE dimension='system_design'").run();
+eq(DB.planDoneSinceAssess(), 0, "signal: clears once a dimension is re-assessed");
+
+const rejJob = DB.db.prepare("SELECT id FROM jobs WHERE source_url='ja2'").get().id;
+DB.recordApplication(rejJob, { status: "rejected" });
+DB.db.prepare("UPDATE applications SET updated_at = datetime('now', '+1 hour') WHERE job_id=?").run(rejJob);
+eq(DB.rejectionsSincePlan(), 1, "signal: rejection since the plan last grew -> feed it back");
+eq(state.readJourneyState().signals.rejections_since_plan, 1, "state: surfaces rejections_since_plan");
+const pid2 = DB.addPlanItem("communication", "learn", "run a mock behavioural loop", null);
+DB.db.prepare("UPDATE upskilling_plan SET created_at = datetime('now', '+2 hours') WHERE id=?").run(pid2);
+eq(DB.rejectionsSincePlan(), 0, "signal: clears once the plan absorbs the rejection");
+
+// ════════════════════ v2.1: the recommender is a LOOP (priority-ordered, no dead end) ════════════════════
+const mkS = (o = {}) => ({
+  dimensions: { onboarded: true, profiled: true, verified: true, portfolio_fetched: false, portfolio_graded: false, jobs_discovered: true, has_applications: false, ...(o.dimensions ?? {}) },
+  assessed_level: "mid",
+  assessment: { band: "mid", confidence: "medium", floor: "junior", verified: true },
+  competency: [], open_interview: o.open_interview ?? null, has_resume: true,
+  profile: { target_role: "swe", target_niche: null, location_pref: null, github_handle: null, desires: null, no_resume: false, no_github: false },
+  catalog: { companies: 3, unresolved: 0, jobs: 10, ungraded_jobs: 2, live_in_band: 4, ...(o.catalog ?? {}) },
+  plan: o.plan ?? {}, pipeline: o.pipeline ?? {},
+  signals: { plan_done_since_assess: 0, rejections_since_plan: 0, ...(o.signals ?? {}) },
+});
+const skillOf = (s) => tools.recommendNext(s).split(" ")[0];
+eq(skillOf(mkS({ dimensions: { onboarded: false } })), "coach", "recommend: not onboarded -> coach");
+eq(skillOf(mkS({ open_interview: { id: 1, type: "competency", job_id: null } })), "verify", "recommend: open interview -> verify (resume the thread)");
+eq(skillOf(mkS({ dimensions: { profiled: false } })), "coach", "recommend: not profiled -> coach");
+eq(skillOf(mkS({ dimensions: { verified: false } })), "verify", "recommend: unverified -> verify");
+eq(skillOf(mkS({ catalog: { companies: 0, jobs: 0, ungraded_jobs: 0, live_in_band: null } })), "job-search", "recommend: empty market -> job-search (populate)");
+eq(skillOf(mkS({ signals: { plan_done_since_assess: 1 } })), "verify", "recommend: plan item closed -> re-assess + re-match (the loop turns)");
+eq(skillOf(mkS({ plan: { suggested: 2 } })), "upskill", "recommend: FRESH (suggested) plan -> upskill, not a dead end");
+eq(skillOf(mkS({ plan: { in_progress: 1 } })), "upskill", "recommend: in-progress plan -> upskill");
+eq(skillOf(mkS({ signals: { rejections_since_plan: 2 } })), "upskill", "recommend: rejections feed back -> upskill");
+eq(skillOf(mkS({ catalog: { ungraded_jobs: 10, live_in_band: 0 } })), "job-search", "recommend: all jobs ungraded -> job-search (grade the worklist)");
+eq(skillOf(mkS()), "application", "recommend: verified + graded in-band roles -> application");
+eq(skillOf(mkS({ catalog: { live_in_band: 0 } })), "job-search", "recommend: nothing live in band -> job-search (refresh + re-match), never a dead end");
 
 // ════════════════════ v2: role fit (per-dimension + desire alignment) ════════════════════
 const rfJob = DB.db.prepare("SELECT id FROM jobs LIMIT 1").get().id;

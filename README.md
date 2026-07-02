@@ -53,7 +53,7 @@ Two rules hold everywhere:
 
 **Three doors:**
 
-- **`orient(detail?)`** — start every session here. Where the user is in the loop, the next best action, and **open threads to resume**. `detail`: `recommend` (default), `raw` (bare state), `resume` (full rehydration bundle + recent journal), `dashboard` (the competency profile, fitness trend, market gap, plan, notes).
+- **`orient(detail?)`** — start every session here. Where the user is in the loop, the next best action (`recommended_skill` — the router, priority-ordered over the loop's edges so every state has a way forward), **open threads to resume**, and the recent journal. `detail`: `recommend` (default), `dashboard` (the competency profile, market gap, plan, notes).
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`market`/`relevant`/`worklist`), `companies`, `resume`, `portfolio`, `profile`, `competency`, `interview`, `plan`, `packet`, `applications`, `history`.
 - **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull live ATS boards), `ingest_portfolio` (public GitHub repos + verification signals).
 

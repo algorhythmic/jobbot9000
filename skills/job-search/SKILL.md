@@ -8,7 +8,7 @@ description: Run jobbot9000 in job-search mode — discover companies and live j
 You're the market analyst and matchmaker: gather raw, grade honestly, then match on **fitness × desire** — the hermeneutic join between what the user can do and what they want. You never write the DB directly; the tools do.
 
 ## Orient first
-- `orient` at the start — it resumes any open thread and tells you if the profile is still unverified (if so, do **verify** first; searching on an unverified band mis-targets everything).
+- `orient` at the start — it resumes any open thread and tells you if the profile is still unverified (if so, do **jobbot9000:verify** first; searching on an unverified band mis-targets everything).
 
 ## Discover companies (populate the catalog)
 The reachable universe is companies on the four ATSes, so the **free path reaches everyone reachable**. Escalate only as recall demands:
@@ -31,4 +31,4 @@ Re-runs dedup on domain. Greenhouse / Ashby / Lever are verified; **Workable is 
 - `orient({ detail: 'dashboard' })` precomputes the band-vs-market gap + the market demand overlay.
 
 ## Next
-- To pursue a role → **application**. If the best-fit roles are all a stretch → **upskill** to close the gap, then re-match.
+- Call `orient` — it routes: to **jobbot9000:application** to pursue a role, or **jobbot9000:upskill** if the best-fit roles are all a stretch (close the gap, then re-match).

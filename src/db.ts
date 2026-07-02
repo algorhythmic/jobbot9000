@@ -343,14 +343,24 @@ export function deriveBand(profile: Competency[] = getCompetencyProfile()): Deri
   return { band, floor, confidence: CONFIDENCE_ORDER[confIdx], dims: profile.length };
 }
 
+// The level ±1 band around a ladder level — the window matching and the "relevant" job
+// scope read from. null when unassessed (or the level isn't on the ladder).
+export function bandFor(level: string | null): string[] | null {
+  if (!level) return null;
+  const r = LADDER.indexOf(level as typeof LADDER[number]);
+  if (r < 0) return null;
+  return LADDER.slice(Math.max(0, r - 1), r + 2) as unknown as string[];
+}
+
 // The overall assessment, DERIVED on read (no cache): band/floor/confidence from the
-// dimensions, `verified` true once any interview is complete (what earns the profile beyond
-// self-report). null until at least one dimension is assessed.
+// dimensions, `verified` true once a COMPETENCY interview is complete (what earns the profile
+// beyond self-report — a role_fit rehearsal for one posting doesn't verify the whole profile).
+// null until at least one dimension is assessed.
 export interface AssessmentSummary { band: string | null; confidence: string | null; floor: string | null; verified: boolean }
 export function assessmentSummary(): AssessmentSummary | null {
   const d = deriveBand();
   if (!d) return null;
-  const verified = (db.prepare("SELECT count(*) c FROM interviews WHERE status='complete'").get() as { c: number }).c > 0;
+  const verified = countOf("SELECT count(*) c FROM interviews WHERE status='complete' AND type='competency'") > 0;
   return { band: d.band, confidence: d.confidence, floor: d.floor, verified };
 }
 
@@ -702,7 +712,6 @@ const countOf = (sql: string, ...args: unknown[]): number => (db.prepare(sql).ge
 export interface Counts {
   companies: number; unresolved: number; jobs: number; ungraded: number;
   portfolio: number; portfolio_graded: number; dimensions_assessed: number;
-  interviews_complete: number; interviews_open: number; plan_open: number;
 }
 export const counts = (): Counts => ({
   companies: countOf("SELECT count(*) c FROM companies"),
@@ -712,9 +721,26 @@ export const counts = (): Counts => ({
   portfolio: countOf("SELECT count(*) c FROM portfolio_projects"),
   portfolio_graded: countOf("SELECT count(*) c FROM portfolio_relevance"),
   dimensions_assessed: countOf("SELECT count(*) c FROM competency_profile"),
-  interviews_complete: countOf("SELECT count(*) c FROM interviews WHERE status='complete'"),
-  interviews_open: countOf("SELECT count(*) c FROM interviews WHERE status='in_progress'"),
-  plan_open: countOf("SELECT count(*) c FROM upskilling_plan WHERE status != 'done'"),
 });
+
+// Live, graded jobs inside a band — the "is there anything to pursue" read.
+export const liveJobsInBand = (band: string[]): number =>
+  band.length
+    ? countOf(`SELECT count(*) c FROM jobs WHERE still_live=1 AND grade_seniority IN (${band.map(() => "?").join(",")})`, ...band)
+    : 0;
+
+// ── loop signals — the edges that make the readiness loop TURN (not just fill) ──
+// Plan items closed since the competency profile was last touched: the user genuinely
+// improved, so re-assess the dimensions those items addressed and re-match. Clears once
+// any dimension is re-assessed (the re-assessment acknowledges the progress).
+export const planDoneSinceAssess = (): number =>
+  countOf(`SELECT count(*) c FROM upskilling_plan p WHERE p.status='done'
+           AND p.updated_at > COALESCE((SELECT max(updated_at) FROM competency_profile), p.updated_at)`);
+
+// Rejections recorded since the plan last grew: outcomes not yet fed back into upskilling
+// items. Clears once a new plan item is added (the plan absorbed the signal).
+export const rejectionsSincePlan = (): number =>
+  countOf(`SELECT count(*) c FROM applications a WHERE a.status='rejected'
+           AND a.updated_at > COALESCE((SELECT max(created_at) FROM upskilling_plan), '')`);
 
 export const nowStr = (): string => (db.prepare("SELECT datetime('now') t").get() as { t: string }).t;
