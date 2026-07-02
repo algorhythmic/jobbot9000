@@ -29,4 +29,4 @@ Record with `record_interview`:
 - Turn each delta into a plan item — go to **jobbot9000:upskill**.
 
 ## Next
-- Call `orient` — it routes (with a verified profile, typically to **jobbot9000:upskill** for the plan, then **jobbot9000:job-search**). Honest calibration is the gift: coaching a junior as a junior — or a quiet senior as a senior — is what actually gets them hired.
+- Call `orient` — it routes (once the deltas become plan items, to **jobbot9000:upskill** to work them, then **jobbot9000:job-search**). Honest calibration is the gift: coaching a junior as a junior — or a quiet senior as a senior — is what actually gets them hired.

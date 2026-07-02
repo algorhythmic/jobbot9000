@@ -412,13 +412,18 @@ export function addPlanItem(gap: string, type: string, spec: string, marketDeman
   logEvent("planned", `${type} · ${gap}: ${spec}`, String(info.lastInsertRowid));
   return Number(info.lastInsertRowid);
 }
+// updated_at marks the last STATUS TRANSITION, not any touch — planDoneSinceAssess reads it
+// as "when did this item close", so a notes-only edit (or re-setting the same status) must
+// not bump it and falsely re-fire the re-assess signal.
 export function updatePlanItem(id: number, status?: string | null, progressNotes?: string | null): boolean {
-  const cur = db.prepare("SELECT id, gap, type FROM upskilling_plan WHERE id = ?").get(id) as { id: number; gap: string; type: string } | undefined;
+  const cur = db.prepare("SELECT id, gap, type, status FROM upskilling_plan WHERE id = ?").get(id) as { id: number; gap: string; type: string; status: string } | undefined;
   if (!cur) return false;
+  const transitioned = status != null && status !== cur.status;
   db.prepare(
-    `UPDATE upskilling_plan SET status = COALESCE(?, status), progress_notes = COALESCE(?, progress_notes), updated_at = datetime('now') WHERE id = ?`,
-  ).run(status ?? null, progressNotes ?? null, id);
-  if (status) logEvent("plan_progress", `${cur.type} · ${cur.gap} → ${status}`, String(id));
+    `UPDATE upskilling_plan SET status = COALESCE(?, status), progress_notes = COALESCE(?, progress_notes),
+       updated_at = CASE WHEN ? THEN datetime('now') ELSE updated_at END WHERE id = ?`,
+  ).run(status ?? null, progressNotes ?? null, transitioned ? 1 : 0, id);
+  if (transitioned) logEvent("plan_progress", `${cur.type} · ${cur.gap} → ${status}`, String(id));
   return true;
 }
 export const planCounts = (): Record<string, number> =>
@@ -462,6 +467,9 @@ export interface Application {
 export const getApplication = (jobId: number): Application | undefined =>
   db.prepare("SELECT * FROM applications WHERE job_id = ?").get(jobId) as Application | undefined;
 
+// updated_at marks the last STATUS TRANSITION, not any touch — rejectionsSincePlan reads it
+// as "when was this rejected", so re-recording the same status (e.g. to add notes) must not
+// bump it and falsely re-fire the feed-back signal. Journals a transition, not every call.
 export function recordApplication(
   jobId: number,
   fields: { status: string; applied_at?: string | null; next_action?: string | null; next_action_at?: string | null; notes?: string | null },
@@ -472,13 +480,14 @@ export function recordApplication(
     `INSERT INTO applications (job_id, status, applied_at, next_action, next_action_at, notes, updated_at)
      VALUES (@job_id, @status, @applied_at, @next_action, @next_action_at, @notes, datetime('now'))
      ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, applied_at=excluded.applied_at,
-       next_action=excluded.next_action, next_action_at=excluded.next_action_at, notes=excluded.notes, updated_at=datetime('now')`,
+       next_action=excluded.next_action, next_action_at=excluded.next_action_at, notes=excluded.notes,
+       updated_at=CASE WHEN excluded.status != applications.status THEN datetime('now') ELSE applications.updated_at END`,
   ).run({
     job_id: jobId, status: fields.status,
     applied_at: pick("applied_at"), next_action: pick("next_action"),
     next_action_at: pick("next_action_at"), notes: pick("notes"),
   });
-  logEvent("applied", `job ${jobId} → ${fields.status}`, String(jobId));
+  if (cur?.status !== fields.status) logEvent("applied", `job ${jobId} → ${fields.status}`, String(jobId));
 }
 
 export interface ApplicationRow extends Application { title: string | null; company: string }

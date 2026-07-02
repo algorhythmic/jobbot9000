@@ -421,6 +421,21 @@ const pid2 = DB.addPlanItem("communication", "learn", "run a mock behavioural lo
 DB.db.prepare("UPDATE upskilling_plan SET created_at = datetime('now', '+2 hours') WHERE id=?").run(pid2);
 eq(DB.rejectionsSincePlan(), 0, "signal: clears once the plan absorbs the rejection");
 
+// updated_at means STATUS TRANSITION, not any touch — a notes-only edit or same-status
+// re-record must not re-fire a settled signal. (Clocks set so a spurious bump WOULD fire.)
+DB.db.prepare("UPDATE competency_profile SET updated_at = datetime('now', '-1 hour')").run();
+DB.db.prepare("UPDATE upskilling_plan SET updated_at = datetime('now', '-2 hours') WHERE id=?").run(pid);
+eq(DB.planDoneSinceAssess(), 0, "signal: item closed before the last assessment -> quiet");
+DB.updatePlanItem(pid, null, "wrote a retro");
+eq(DB.planDoneSinceAssess(), 0, "signal: notes-only plan edit is not a transition (no re-fire)");
+DB.updatePlanItem(pid, "done", null);
+eq(DB.planDoneSinceAssess(), 0, "signal: same-status re-set is not a transition (no re-fire)");
+DB.db.prepare("UPDATE applications SET updated_at = datetime('now', '-2 hours') WHERE job_id=?").run(rejJob);
+DB.db.prepare("UPDATE upskilling_plan SET created_at = datetime('now', '-1 hour') WHERE id=?").run(pid2);
+eq(DB.rejectionsSincePlan(), 0, "signal: absorbed rejection -> quiet");
+DB.recordApplication(rejJob, { status: "rejected", notes: "saved the feedback email" });
+eq([DB.rejectionsSincePlan(), DB.getApplication(rejJob).notes], [0, "saved the feedback email"], "signal: same-status re-record updates fields but is not a transition (no re-fire)");
+
 // ════════════════════ v2.1: the recommender is a LOOP (priority-ordered, no dead end) ════════════════════
 const mkS = (o = {}) => ({
   dimensions: { onboarded: true, profiled: true, verified: true, portfolio_fetched: false, portfolio_graded: false, jobs_discovered: true, has_applications: false, ...(o.dimensions ?? {}) },
