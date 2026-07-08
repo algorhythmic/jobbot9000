@@ -3,7 +3,8 @@
 // across plugin UPDATES by persisting node_modules in the durable data dir
 // (CLAUDE_PLUGIN_DATA) instead of the ephemeral plugin root (CLAUDE_PLUGIN_ROOT,
 // which changes on every update). node_modules is reinstalled only when
-// package.json changes; dist/ is a cheap tsc rebuild once the deps are present.
+// package.json changes or the native binary won't load; dist/ is a cheap tsc
+// rebuild once the deps are present.
 // Uses only Node built-ins, so it works before `npm install` has ever run. It runs
 // synchronously and swallows failures, so a broken setup never aborts the session.
 import { existsSync, mkdirSync, copyFileSync, readFileSync, lstatSync, symlinkSync, rmSync } from "node:fs";
@@ -19,11 +20,23 @@ const run = (cmd, cwd) => execSync(cmd, { cwd, stdio: "inherit" });
 const pathNode = (p) => { try { lstatSync(p); return true; } catch { return false; } };
 // Prefer `npm ci` (deterministic; fails closed on lockfile drift) when a lockfile is present.
 const install = (dir) => run(existsSync(join(dir, "package-lock.json")) ? "npm ci --no-fund" : "npm install --no-fund", dir);
+// Actually LOAD the one native dep (better-sqlite3) from a given node_modules — a folder
+// on disk isn't proof it works: a plugin-install copy can carry the JS and drop the
+// compiled .node binary, which only fails at `new Database()`, never at require(). A
+// throwaway in-memory construct in a child process is the honest, quoting-portable check.
+const nativeOk = (nmDir) => {
+  if (!existsSync(join(nmDir, "better-sqlite3"))) return false;
+  try {
+    execSync(`node -e "new (require('better-sqlite3'))(':memory:')"`,
+      { cwd: dirname(nmDir), stdio: "ignore", env: { ...process.env, NODE_PATH: nmDir } });
+    return true;
+  } catch { return false; }
+};
 
 try {
   if (!DATA) {
     // Local dev (no persistent dir): the simple, original behavior.
-    if (!existsSync(rootNM)) { console.error("[jobbot9000] installing dependencies …"); install(ROOT); }
+    if (!existsSync(rootNM) || !nativeOk(rootNM)) { console.error("[jobbot9000] installing dependencies …"); install(ROOT); }
     if (!existsSync(distEntry)) { console.error("[jobbot9000] building …"); run("npm run build", ROOT); }
     process.exit(0);
   }
@@ -33,7 +46,7 @@ try {
   const dataNM = join(DATA, "node_modules");
   const pkg = readFileSync(join(ROOT, "package.json"), "utf8");
   const pkgCache = join(DATA, "package.json");
-  const stale = !existsSync(dataNM) || !existsSync(pkgCache) || readFileSync(pkgCache, "utf8") !== pkg;
+  const stale = !existsSync(dataNM) || !existsSync(pkgCache) || readFileSync(pkgCache, "utf8") !== pkg || !nativeOk(dataNM);
   if (stale) {
     console.error("[jobbot9000] installing dependencies into the plugin data dir (persists across updates) …");
     copyFileSync(join(ROOT, "package.json"), pkgCache);
@@ -48,8 +61,14 @@ try {
     if (lstatSync(rootNM).isSymbolicLink()) {
       if (existsSync(rootNM)) rootResolves = true;        // valid link from a prior run
       else rmSync(rootNM, { force: true });               // dangling link → recreate below
+    } else if (nativeOk(rootNM)) {
+      rootResolves = true;                                // a real dir whose native binary loads (dev checkout) — leave it
     } else {
-      rootResolves = true;                                // a real dir (dev checkout) — leave it
+      // A real dir whose native binary is missing — e.g. an install copy that carried
+      // node_modules but dropped better-sqlite3's build/. It would shadow the good deps
+      // in DATA and crash the server, so drop it and relink to the data dir below.
+      console.error("[jobbot9000] plugin-root deps are incomplete (native binary missing) — relinking to the data dir …");
+      rmSync(rootNM, { recursive: true, force: true });
     }
   }
   if (!rootResolves) {

@@ -101,7 +101,7 @@ claude --plugin-dir /path/to/jobbot9000
 
 Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 15 tools`.
 
-On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir and builds it; it no-ops afterward. First-run setup compiles a native dependency, so it takes a moment.
+On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir and builds it; it no-ops afterward. First-run setup installs a native dependency (a prebuilt binary where one is available for your platform/Node version, otherwise compiled from source — which needs a C/C++ toolchain), so it takes a moment. The hook self-heals a half-populated `node_modules` (e.g. a local install copy that dropped the native binary) by reinstalling into the data dir.
 
 State and the local catalog live in an embedded SQLite database under `${CLAUDE_PLUGIN_DATA}/state/` (resolves to `~/.claude/plugins/data/<plugin-id>/state/`), which survives across sessions **and** plugin updates. (Fallback: `~/.jobbot/state`.) Uninstalling deletes the data dir unless you pass `--keep-data`.
 
