@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Node majors ship on a schedule of their own, not ours. A weekly run means a release
+  # that breaks the server turns CI red BEFORE a user hits it — this is the early-warning
+  # half of "upgrading Node needs no action": no dev has to remember to go check.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -11,7 +17,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22]
+        # 22.13 is the declared floor (package.json engines) — the oldest Node exposing
+        # node:sqlite unflagged; pinned exactly so the floor itself stays tested rather
+        # than drifting up with the 22.x line. `latest` tracks the newest Node forever, so
+        # a new major is covered the day it lands without anyone editing this matrix.
+        node: ["22.13.0", "24", "latest"]
+    name: node ${{ matrix.node }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

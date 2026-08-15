@@ -101,7 +101,11 @@ claude --plugin-dir /path/to/jobbot9000
 
 Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 15 tools`.
 
-On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir and builds it; it no-ops afterward. First-run setup compiles a native dependency, so it takes a moment.
+**Requires Node 22.13+** (24 LTS or newer recommended) — that's where Node's built-in SQLite (`node:sqlite`) is available unflagged.
+
+On the first session after install, a bootstrap hook (`hooks/hooks.json` → `scripts/bootstrap.mjs`) installs the server's dependencies into the persistent data dir and builds it; it no-ops afterward. Setup is fast: every dependency is pure JavaScript, so there's nothing to compile and no build toolchain needed.
+
+**Upgrading Node needs no action.** The server has no native dependency — SQLite comes from the Node runtime itself (`src/sqlite.ts`), so nothing is tied to Node's ABI. A native SQLite driver would have to be recompiled (and wait on upstream prebuilds) for every new Node major; this one just keeps working. Your database is a plain SQLite file, unchanged by the switch.
 
 State and the local catalog live in an embedded SQLite database under `${CLAUDE_PLUGIN_DATA}/state/` (resolves to `~/.claude/plugins/data/<plugin-id>/state/`), which survives across sessions **and** plugin updates. (Fallback: `~/.jobbot/state`.) Uninstalling deletes the data dir unless you pass `--keep-data`.
 
@@ -112,6 +116,8 @@ npm install
 npm run build      # compile the MCP server to dist/
 npm run dev        # run the server over stdio (tsx)
 npm test           # offline test suite (tsx against src/, mocked HTTP — no network/key)
+                   #   test/sqlite.test.mjs    — the node:sqlite driver seam
+                   #   test/discovery.test.mjs — ATS/providers/gather + the loop
 ```
 
 The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/state`) and opens `jobbot.db` there; unset, it falls back to `~/.jobbot/state`.
@@ -128,6 +134,7 @@ The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/state
 src/
   index.ts                   stdio entry; registers the tools
   db.ts                      SQLite schema + accessors — the only code that writes the DB (incl. the journal + history)
+  sqlite.ts                  the SQLite driver — node:sqlite (built into Node), so there is no native dep to rebuild
   state.ts                   the loop state machine (state derived from what data exists)
   tools.ts                   the 16-tool surface
   providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in)

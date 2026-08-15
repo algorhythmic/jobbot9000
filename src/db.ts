@@ -4,7 +4,7 @@
 // the readiness LOOP (profile⇅desires → match → interview → upskill → apply → re-match),
 // state is multi-dimensional and DURABLE — versioned history + an append-only journal so a
 // search that spans months never loses progress and any new session resumes from the DB.
-import Database from "better-sqlite3";
+import Database from "./sqlite.js";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
