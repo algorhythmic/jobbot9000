@@ -8,7 +8,7 @@ description: Run jobbot9000 in application mode — for a chosen role, optionall
 You're the closer: prepare the user to apply honestly and well. The user applies; you assemble the packet and write the one generated artifact — a tailored cover letter grounded in it.
 
 ## Orient first
-- `orient` resumes any open thread (incl. an in-progress role-fit interview) and surfaces the pipeline.
+- `orient` resumes any open thread (incl. an in-progress role-fit interview or an open application next action) and surfaces the pipeline. Use the read-only `look({ at: 'applications' })` for the current funnel and `look({ at: 'history' })` for the durable local journal.
 
 ## Rehearse (optional but powerful) — a role-fit interview
 - `record_interview({ type: 'role_fit', job_id, ... })` runs a **role-specific** interview: questions at *this posting's* bar, with exemplars anchored to it. It's repeatable PRACTICE — the deltas become upskilling items, and re-running it as the user improves is the point. Use it to get them ready, not just to grade them.
@@ -21,7 +21,10 @@ You're the closer: prepare the user to apply honestly and well. The user applies
 
 ## Hand off + track
 - Give the user the cover letter, the master resume, talking points, and the gaps to be ready for. They submit.
-- `record_application({ job_id, status })` — `interested → applied → interviewing → offer / rejected / withdrawn`; optional `applied_at`, `notes`, `next_action`/`next_action_at`. A status update preserves fields you don't re-pass. `look({ at: 'applications' })` is the funnel.
+- `record_application({ job_id, status })` — `interested → applied → interviewing → offer / rejected / withdrawn`; this records what the user reports, and never submits an application.
+- Optional metadata: `applied_at`, `notes`, `next_action`, and `next_action_at`. Omitted fields retain their saved values; supplied `null` explicitly clears a field. Empty strings remain explicit text, without trimming or normalization. To finish a follow-up, keep the current status and call `record_application({ job_id, status, next_action: null, next_action_at: null })`.
+- Creation or a status transition appends an `applied` event. A same-status effective metadata change appends `application_updated`, with changed fields and their `from`/`to` values in the local event summary. Exact repeats append no event and do not touch the row. Use the returned `changed`, `transitioned`, and `changed_fields` to distinguish these outcomes.
+- `updated_at` records the last status transition, not a metadata edit. Updating a rejected application's notes therefore does not re-trigger rejection feedback. Read the resulting application and history through `look`; keep all personal metadata and journal details local.
 
 ## The loop continues
 - A `rejected` or a stalled pipeline is signal — record it (`record_application`), then call `orient`: it routes rejections to **jobbot9000:upskill** (close the gaps they expose) until the plan absorbs them, and re-matches as fitness rises. The search is a loop, not a line.

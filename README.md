@@ -74,6 +74,10 @@ Two rules hold everywhere:
 | `recommend_upskilling` | personal | `upskilling_plan` (learn/resume/build, market-grounded) |
 | `record_cover_letter` | personal | `cover_letter` (gated on verified confidence) |
 
+**Application tracking is durable and substantive.** The user alone submits applications; `record_application` records their reported status and metadata. Omit `applied_at`, `next_action`, `next_action_at`, or `notes` to retain the saved value; pass `null` to explicitly clear it. Empty strings remain explicit text, without trimming or normalization. For a completed follow-up, keep the current status and pass both `next_action: null` and `next_action_at: null`.
+
+Creating an application or changing its status appends an `applied` journal event. Keeping the same status while changing metadata appends `application_updated`, with the changed fields and their `from`/`to` values in the local event summary. An exact repeat appends no event and does not touch the row. The tool returns `changed`, `transitioned`, and `changed_fields`. `updated_at` remains the time of the last status transition, so editing a rejected application's notes does not re-trigger rejection feedback. Read the current pipeline through `look({ at: 'applications' })` and the journal through `look({ at: 'history' })`; both are read-only. Start with `orient` to resume open application next actions.
+
 The competency profile is **multi-dimensional** — `technical_depth`, `system_design`, `communication`, `ownership` — each with a level, confidence, and provenance-tagged evidence; the overall band is derived.
 
 ## The skills
@@ -136,7 +140,7 @@ src/
   db.ts                      SQLite schema + accessors — the only code that writes the DB (incl. the journal + history)
   sqlite.ts                  the SQLite driver — node:sqlite (built into Node), so there is no native dep to rebuild
   state.ts                   the loop state machine (state derived from what data exists)
-  tools.ts                   the 16-tool surface
+  tools.ts                   the 15-tool surface
   providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in)
   ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
   github.ts                  keyless GitHub sense — public repos + verification signals (authorship/traction/badges)

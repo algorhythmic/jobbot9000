@@ -622,13 +622,13 @@ export function registerTools(server: McpServer): void {
 
   // ── application tracking (personal, mechanical) ────────────────────────────
   server.registerTool("record_application", {
-    description: `Track the user's application (they apply; this records it). → personal. status: ${APP_STATUS.join(" | ")}. Idempotent; a status update preserves fields you don't pass. Optional applied_at / next_action / next_action_at / notes. Read the funnel via look({ at: 'applications' }).`,
-    inputSchema: { job_id: z.number().int(), status: enumOf(APP_STATUS), applied_at: z.string().optional(), next_action: z.string().optional(), next_action_at: z.string().optional(), notes: z.string().optional() },
+    description: `Track the user's application (they apply; this records it). → personal. status: ${APP_STATUS.join(" | ")}. Optional applied_at / next_action / next_action_at / notes: omit to preserve, null to clear, text (including empty strings) is stored verbatim. Status transitions journal as applied; same-status metadata changes journal as application_updated with from/to values. Exact repeats are no-ops. Returns changed / transitioned / changed_fields. updated_at marks only status transitions, so metadata edits don't replay rejection signals. Read the funnel via look({ at: 'applications' }) and the journal via look({ at: 'history' }).`,
+    inputSchema: { job_id: z.number().int(), status: enumOf(APP_STATUS), applied_at: z.string().nullable().optional(), next_action: z.string().nullable().optional(), next_action_at: z.string().nullable().optional(), notes: z.string().nullable().optional() },
   }, async (a) => {
     if (!DB.getJob(a.job_id)) return noJob(a.job_id);
-    DB.recordApplication(a.job_id, { status: a.status, applied_at: a.applied_at, next_action: a.next_action, next_action_at: a.next_action_at, notes: a.notes });
-    const out: Record<string, unknown> = { ok: true, job_id: a.job_id, status: a.status, pipeline: DB.applicationCounts() };
-    if (a.status === "rejected") out.note = "rejection recorded — signal, not verdict: orient now routes to upskill until the plan absorbs the gaps it exposes.";
+    const result = DB.recordApplication(a.job_id, { status: a.status, applied_at: a.applied_at, next_action: a.next_action, next_action_at: a.next_action_at, notes: a.notes });
+    const out: Record<string, unknown> = { ok: true, job_id: a.job_id, status: a.status, ...result, pipeline: DB.applicationCounts() };
+    if (a.status === "rejected" && result.transitioned) out.note = "rejection recorded — signal, not verdict: orient now routes to upskill until the plan absorbs the gaps it exposes.";
     return json(out);
   });
 

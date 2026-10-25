@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS applications (               -- the user's applicatio
 CREATE TABLE IF NOT EXISTS events (                     -- APPEND-ONLY journal — the narrative timeline; never mutated/pruned
   id      INTEGER PRIMARY KEY AUTOINCREMENT,
   ts      TEXT NOT NULL DEFAULT (datetime('now')),
-  kind    TEXT NOT NULL,                                  -- assessed | interviewed | graded_job | role_fit | planned | plan_progress | resume_revised | applied | profile | matched
+  kind    TEXT NOT NULL,                                  -- assessed | interviewed | graded_job | role_fit | planned | plan_progress | resume_revised | applied | application_updated | profile | matched
   summary TEXT NOT NULL,
   ref     TEXT
 );
@@ -467,27 +467,55 @@ export interface Application {
 export const getApplication = (jobId: number): Application | undefined =>
   db.prepare("SELECT * FROM applications WHERE job_id = ?").get(jobId) as Application | undefined;
 
+export interface ApplicationInput {
+  status: string; applied_at?: string | null; next_action?: string | null;
+  next_action_at?: string | null; notes?: string | null;
+}
+const APPLICATION_FIELDS = ["status", "applied_at", "next_action", "next_action_at", "notes"] as const;
+export interface ApplicationWriteResult {
+  changed: boolean;
+  transitioned: boolean;
+  changed_fields: (typeof APPLICATION_FIELDS[number])[];
+}
+
 // updated_at marks the last STATUS TRANSITION, not any touch — rejectionsSincePlan reads it
-// as "when was this rejected", so re-recording the same status (e.g. to add notes) must not
-// bump it and falsely re-fire the feed-back signal. Journals a transition, not every call.
+// as "when was this rejected". Metadata edits have their own journal event and must not
+// re-fire that signal. Omission preserves a field; null clears it; text is kept verbatim.
+// Compare, persist, and journal together so failed writes leave neither a partial row nor
+// a stray event. Exact repeats don't touch the application row or append to the journal.
 export function recordApplication(
   jobId: number,
-  fields: { status: string; applied_at?: string | null; next_action?: string | null; next_action_at?: string | null; notes?: string | null },
-): void {
-  const cur = getApplication(jobId);
-  const pick = <K extends keyof Application>(k: K): unknown => (fields as any)[k] !== undefined ? (fields as any)[k] : (cur?.[k] ?? null);
-  db.prepare(
-    `INSERT INTO applications (job_id, status, applied_at, next_action, next_action_at, notes, updated_at)
-     VALUES (@job_id, @status, @applied_at, @next_action, @next_action_at, @notes, datetime('now'))
-     ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, applied_at=excluded.applied_at,
-       next_action=excluded.next_action, next_action_at=excluded.next_action_at, notes=excluded.notes,
-       updated_at=CASE WHEN excluded.status != applications.status THEN datetime('now') ELSE applications.updated_at END`,
-  ).run({
-    job_id: jobId, status: fields.status,
-    applied_at: pick("applied_at"), next_action: pick("next_action"),
-    next_action_at: pick("next_action_at"), notes: pick("notes"),
-  });
-  if (cur?.status !== fields.status) logEvent("applied", `job ${jobId} → ${fields.status}`, String(jobId));
+  fields: ApplicationInput,
+): ApplicationWriteResult {
+  return db.transaction((): ApplicationWriteResult => {
+    const cur = getApplication(jobId);
+    const pick = (key: Exclude<typeof APPLICATION_FIELDS[number], "status">): string | null =>
+      fields[key] !== undefined ? fields[key] : cur?.[key] ?? null;
+    const next = {
+      status: fields.status, applied_at: pick("applied_at"), next_action: pick("next_action"),
+      next_action_at: pick("next_action_at"), notes: pick("notes"),
+    };
+    const changed_fields = APPLICATION_FIELDS.filter((key) => (cur?.[key] ?? null) !== next[key]);
+    const transitioned = cur?.status !== next.status;
+    if (!changed_fields.length) return { changed: false, transitioned: false, changed_fields };
+
+    db.prepare(
+      `INSERT INTO applications (job_id, status, applied_at, next_action, next_action_at, notes, updated_at)
+       VALUES (@job_id, @status, @applied_at, @next_action, @next_action_at, @notes, datetime('now'))
+       ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, applied_at=excluded.applied_at,
+         next_action=excluded.next_action, next_action_at=excluded.next_action_at, notes=excluded.notes,
+         updated_at=CASE WHEN excluded.status != applications.status THEN datetime('now') ELSE applications.updated_at END`,
+    ).run({ job_id: jobId, ...next });
+    // Keep old and new values in the existing local journal, including cleared values.
+    // One call emits one event even when status and multiple metadata fields change.
+    const changes = Object.fromEntries(changed_fields.map((key) => [key, { from: cur?.[key] ?? null, to: next[key] }]));
+    logEvent(
+      transitioned ? "applied" : "application_updated",
+      `${transitioned ? `job ${jobId} → ${next.status}` : `job ${jobId} application updated (${next.status})`}; changes ${JSON.stringify(changes)}`,
+      String(jobId),
+    );
+    return { changed: true, transitioned, changed_fields };
+  })();
 }
 
 export interface ApplicationRow extends Application { title: string | null; company: string }
