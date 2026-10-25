@@ -8,7 +8,7 @@ description: Run jobbot9000's competency interview — the engine that assesses 
 A resume and a GitHub are **claims, not proof.** The interview is the engine of the loop — it does three jobs at once: **assess** (depth shown by explaining, not linking — so this is how a strong engineer with no public portfolio is fairly assessed), **verify** (separate a builder from a confident résumé), and **upskill** (show the candidate the bar). Be **adversarial-but-supportive**: tell them up front it's for honest calibration *and* to learn what great looks like — not a gotcha.
 
 ## Orient first
-- `orient` flags when the profile is unverified (`competency_verified: false`) and surfaces any open interview to resume. Interviews are **resumable** — pick up an in-progress session across turns/sessions.
+- `orient` flags when the profile is unverified (`competency_verified: false`) and may surface an open interview. Interviews are **resumable** across turns/sessions. Before recording, use `look({ at: 'interview' })` to inspect session IDs and choose the intended `type` and `job_id` context; do not assume the latest open interview is the right one.
 
 ## Read the picture
 - `look({ at: 'competency' })` — the profile + which dimensions are thin/unverified. `look({ at: 'resume' })` and `look({ at: 'portfolio' })` — the headline claims (each flagship, each "shipped to real users", each senior-sounding skill) and the `verify` signals.
@@ -21,8 +21,10 @@ Probe the load-bearing claims and the thin dimensions. Test, don't accept:
 
 Record with `record_interview`:
 - `type: 'competency'` (general) — builds/verifies the profile, works with no portfolio.
+- To resume, pass the chosen `interview_id` and the same `type` and `job_id` context. Keep the `interview_id` returned by each successful call for later turns. Without an ID, resume only when exactly one in-progress session matches that context; if multiple match, select the intended ID from `look({ at: 'interview' })`. Never append to an interview for a different job or type.
+- For job-specific practice, use `type: 'role_fit'` with that posting's existing `job_id` on every call. Keep each role-fit session tied to its job; do not reuse one across jobs. A competency interview can have no `job_id`, or an existing `job_id` when intentionally tied to a posting.
 - For EACH item: the question, the answer summary, a **grounded exemplar** ("what a great candidate at the target level would say" — anchored to the role/dimension bar, never vague), a `score`, and the **delta** (the gap → an upskilling target). For owned-work claims, also `ownership` + `understanding`.
-- Append across turns; call with `done: true` + a `summary` to complete it. `verified_ceiling` caps an over-claim — and for a no-portfolio candidate it *establishes* the level.
+- Append across turns; call with `done: true` + a nonblank `summary` to complete it. `verified_ceiling` caps an over-claim — and for a no-portfolio candidate it *establishes* the level. If a request fails preflight, correct the context or summary and resubmit the whole request; the failed request recorded no items.
 
 ## Re-assess honestly
 - After the interview, **re-run `assess_competency` per dimension** with the now-demonstrated evidence: raise confidence only for what held up, set levels no higher than `verified_ceiling`, and for a no-portfolio candidate set the level the interview *earned* (don't leave them floored). A claim that didn't hold up must not inflate the profile or be featured.

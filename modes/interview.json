@@ -11,6 +11,10 @@
     "ownership_must_be_one_of": ["sole_author", "contributor", "user", "observer"],
     "understanding_must_be_one_of": ["deep", "working", "shallow", "cannot_explain"],
     "verified_ceiling_must_be_one_of": ["intern", "junior", "mid", "senior", "staff", "principal"],
-    "summary_required": true
+    "summary_required": true,
+    "completion_summary_must_be_nonblank": true,
+    "role_fit_requires_existing_job_id": true,
+    "session_context": "An interview belongs to its exact type and job_id (or null). A supplied interview_id must identify an in_progress interview with that same context. Without an interview_id, resume only when that context has one open session; if several match, choose an interview_id explicitly. Never use a session from another job or type.",
+    "failed_preflight": "Correct the request and resubmit it in full; no interview or items should be written when context or completion validation fails."
   }
 }
