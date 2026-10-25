@@ -50,6 +50,7 @@ const PROVENANCE = vocab(MODE.competency, "provenance_must_be_one_of");
 const SCORE = vocab(MODE.interview, "score_must_be_one_of");
 const OWNERSHIP = vocab(MODE.interview, "ownership_must_be_one_of");
 const UNDERSTANDING = vocab(MODE.interview, "understanding_must_be_one_of");
+const INTERVIEW_CEILING = vocab(MODE.interview, "verified_ceiling_must_be_one_of");
 const FITBAND = vocab(MODE.roleFit, "band_must_be_one_of");
 const DESIRE_ALIGN = vocab(MODE.roleFit, "desire_alignment_must_be_one_of");
 const MARKET = vocab(MODE.job, "market_signal_must_be_one_of");
@@ -228,7 +229,7 @@ export function registerTools(server: McpServer): void {
   // ── look: the one read door (never fetches, never writes) ──────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='resume' (with_market_overlay adds computed demand; revision history is in at='history'). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (latest session, or interview_id; its Q/A/exemplars/deltas). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='resume' (with_market_overlay adds computed demand; revision history is in at='history'). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (open/latest session, scoped to job_id when supplied, or exact interview_id; explicit IDs never fall back, both IDs must match; includes Q/A/exemplars/deltas and all_sessions for selection). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
     inputSchema: {
       at: enumOf(["jobs", "companies", "resume", "portfolio", "profile", "competency", "interview", "plan", "packet", "applications", "history"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
@@ -309,9 +310,23 @@ export function registerTools(server: McpServer): void {
     }
 
     if (a.at === "interview") {
-      const iv = a.interview_id ? DB.getInterview(a.interview_id) : (DB.getOpenInterview() ?? DB.getInterviews()[0]);
-      if (!iv) return json({ note: "no interviews yet — run a competency interview (record_interview) to assess + verify + learn the bar." });
-      return json({ interview: iv, items: DB.getInterviewItems(iv.id), all_sessions: DB.getInterviews().map((x) => ({ id: x.id, type: x.type, status: x.status, job_id: x.job_id })) });
+      const sessions = DB.getInterviews();
+      const all_sessions = sessions.map((x) => ({ id: x.id, type: x.type, status: x.status, job_id: x.job_id }));
+      const scoped = a.job_id !== undefined ? sessions.filter((x) => x.job_id === a.job_id) : sessions;
+      const iv = a.interview_id !== undefined
+        ? DB.getInterview(a.interview_id)
+        : scoped.find((x) => x.status === "in_progress") ?? scoped[0];
+      if (!iv) return json({
+        note: a.interview_id !== undefined
+          ? `no interview ${a.interview_id} — choose an interview_id from all_sessions.`
+          : a.job_id !== undefined
+            ? `no interviews for job ${a.job_id} — start a role-fit interview with record_interview.`
+            : "no interviews yet — run a competency interview (record_interview) to assess + verify + learn the bar.",
+        all_sessions,
+      });
+      if (a.job_id !== undefined && iv.job_id !== a.job_id)
+        return json({ ok: false, error: `interview ${iv.id} belongs to job ${iv.job_id ?? "none"}, not job ${a.job_id}.`, all_sessions });
+      return json({ interview: iv, items: DB.getInterviewItems(iv.id), all_sessions });
     }
 
     if (a.at === "plan") {
@@ -492,10 +507,11 @@ export function registerTools(server: McpServer): void {
 
   // ── interview (the engine: assess + verify + upskill; repeatable, resumable) ─
   server.registerTool("record_interview", {
-    description: `Record a competency or role-fit interview — the engine that ASSESSES (primary evidence for no-portfolio candidates), VERIFIES (catches over-claiming), and UPSKILLS (each item carries a grounded exemplar — 'what a great candidate would have said' — and the delta). → personal. type: ${INTERVIEW_TYPE.join(" | ")} (role_fit needs job_id; its exemplars are anchored to that posting's bar). Resumable: appends to the open interview of this type, or starts one. Set done:true (with a summary) to complete it; verified_ceiling caps/establishes the level. Mode: interview. After completing, re-run assess_competency with the now-demonstrated evidence and turn deltas into plan items (recommend_upskilling).`,
+    description: `Record a competency or role-fit interview — the engine that ASSESSES (primary evidence for no-portfolio candidates), VERIFIES (catches over-claiming), and UPSKILLS (each item carries a grounded exemplar — 'what a great candidate would have said' — and the delta). → personal. type: ${INTERVIEW_TYPE.join(" | ")}; role_fit requires an existing job_id and exemplars anchored to that posting's bar. An explicit interview_id resumes only an in_progress session matching type and job_id (or no job). Without it, resume the unique matching open session or start when none match; multiple matches return candidate_interview_ids for explicit selection. done:true requires a nonblank summary before any write. Start/items/completion and their journal events persist atomically. verified_ceiling caps/establishes the level. Mode: interview. After completing, re-run assess_competency with demonstrated evidence and turn deltas into plan items (recommend_upskilling).`,
     inputSchema: {
       type: enumOf(INTERVIEW_TYPE),
-      job_id: z.number().int().optional(),
+      job_id: z.number().int().positive().safe().optional(),
+      interview_id: z.number().int().positive().safe().optional(),
       items: z.array(z.object({
         dimension: enumOf(DIMENSION).optional(),
         claim: z.string().optional(),
@@ -507,24 +523,24 @@ export function registerTools(server: McpServer): void {
         understanding: enumOf(UNDERSTANDING).optional(),
         delta_notes: z.string().optional(),
       })).min(1),
-      verified_ceiling: enumOf(SENIORITY).optional(),
+      verified_ceiling: enumOf(INTERVIEW_CEILING).optional(),
       summary: z.string().optional(),
       done: z.boolean().optional(),
     },
   }, async (a) => {
-    if (a.type === "role_fit" && a.job_id !== undefined && !DB.getJob(a.job_id)) return noJob(a.job_id);
-    const open = DB.getOpenInterview();
-    const id = open && open.type === a.type && (open.job_id ?? null) === (a.job_id ?? null) ? open.id : DB.startInterview(a.type, a.job_id);
-    DB.addInterviewItems(id, a.items);
-    const out: Record<string, unknown> = { ok: true, interview_id: id, items_recorded: a.items.length };
-    if (a.done) {
-      if (!a.summary) return json({ ok: false, error: "completing an interview (done:true) needs a summary — the honest read after questioning." });
-      DB.completeInterview(id, a.verified_ceiling ?? null, a.summary);
+    let result: DB.RecordInterviewResult;
+    try {
+      result = DB.recordInterview(a);
+    } catch (e) {
+      return json({ ok: false, error: `interview was not recorded: ${errMsg(e)}` });
+    }
+    if (!result.ok) return json(result);
+    const out: Record<string, unknown> = { ...result };
+    if (result.completed) {
       const weak = a.items.filter((i) => i.score === "weak" || i.understanding === "shallow" || i.understanding === "cannot_explain" || i.ownership === "observer").length;
-      out.completed = true;
       out.note = `completed. ${weak}/${a.items.length} item(s) were weak/unverified. Now: re-run assess_competency per dimension with the demonstrated evidence (level ≤ verified_ceiling ${a.verified_ceiling ?? "?"}), and recommend_upskilling for each delta.`;
     } else {
-      out.note = "appended. Continue the interview, or call again with done:true + a summary to complete it (the session persists, so you can resume it in a later turn).";
+      out.note = "appended. Continue using this interview_id and the same type/job_id, or call again with done:true + a nonblank summary to complete it.";
     }
     return json(out);
   });

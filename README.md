@@ -80,6 +80,8 @@ Creating an application or changing its status appends an `applied` journal even
 
 The competency profile is **multi-dimensional** — `technical_depth`, `system_design`, `communication`, `ownership` — each with a level, confidence, and provenance-tagged evidence; the overall band is derived.
 
+**Interviews resume by context.** Role-fit interviews require an existing `job_id`; `look({ at: 'interview', job_id })` or an explicit `interview_id` selects the read context. In `record_interview`, an explicit `interview_id` resumes only an `in_progress` session matching the supplied type and job context. Without it, the tool resumes the unique matching open session or starts one when none match; ambiguity returns `candidate_interview_ids` for an explicit choice. `done: true` requires a nonblank summary. Preconditions are checked before writes, and session start, items, completion, and their journal events persist atomically. Appends have no retry idempotency token: if a success response is lost, inspect the saved session before retrying rather than blindly replaying items.
+
 ## The skills
 
 Five playbooks, invoked automatically by their `description` (and as `/jobbot9000:<name>`): **coach** (onboard + assess), **verify** (the competency interview), **upskill** (plan + resume + projects), **job-search** (discover + grade + match), **application** (rehearse + apply + track). Each opens with `orient`, so any session resumes the loop.

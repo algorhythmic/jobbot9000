@@ -8,6 +8,7 @@ import Database from "./sqlite.js";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveInterviewRequest, type InterviewRequest, type InterviewError } from "./interview.js";
 
 // STATE_DIR is set by the plugin to ${CLAUDE_PLUGIN_DATA}/state — a persistent, per-plugin
 // directory (~/.claude/plugins/data/<id>/) that survives sessions AND plugin updates. If the
@@ -399,6 +400,32 @@ export function completeInterview(interviewId: number, verifiedCeiling: string |
   db.prepare("UPDATE interviews SET status='complete', verified_ceiling=?, summary=?, updated_at=datetime('now') WHERE id=?")
     .run(verifiedCeiling, summary, interviewId);
   logEvent("interviewed", `completed interview ${interviewId}${verifiedCeiling ? ` (verified_ceiling ${verifiedCeiling})` : ""}`, String(interviewId));
+}
+
+export type RecordInterviewResult = InterviewError | {
+  ok: true;
+  interview_id: number;
+  items_recorded: number;
+  completed: boolean;
+};
+
+// Resolve the target and preconditions before the first mutation. The outer transaction
+// includes session creation, every item, completion, and their journal events; the existing
+// item helper's nested transaction uses the driver's SAVEPOINT support.
+export function recordInterview(request: InterviewRequest): RecordInterviewResult {
+  return db.transaction((): RecordInterviewResult => {
+    const choice = resolveInterviewRequest(request, {
+      sessions: getInterviews(),
+      jobExists: request.job_id === undefined ? undefined : !!getJob(request.job_id),
+    });
+    if (!choice.ok) return choice;
+    const id = choice.action === "resume"
+      ? choice.interview_id!
+      : startInterview(choice.type, choice.job_id);
+    addInterviewItems(id, choice.items);
+    if (choice.done) completeInterview(id, choice.verified_ceiling ?? null, choice.summary!);
+    return { ok: true, interview_id: id, items_recorded: choice.items.length, completed: choice.done };
+  })();
 }
 
 // ── upskilling plan (learn / resume / build — tracked, drives re-match) ──────
