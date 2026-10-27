@@ -11,7 +11,7 @@ export interface Finding { url: string; title: string }
 export interface Provenance { url: string; fetchedAt: number; confidence: "source_reported"; staleAfter: number }
 export interface CompanyResult { company: Candidate; jobs: Finding[]; provenance: Provenance[]; score?: number }
 export interface DiscoveryRun {
-  id: string; status: "running" | "completed" | "no_results" | "cancelled" | "stopped";
+  schemaVersion: 1; id: string; status: "running" | "completed" | "no_results" | "cancelled" | "stopped";
   phase: Phase; cursor?: string; companyIndex: number; companies: CompanyResult[];
   requests: number; reason?: string; updatedAt: number; ttlMs: number; inputCompanies?: Candidate[];
 }
@@ -31,7 +31,7 @@ export interface ReadLedger {
 }
 export interface DiscoveryDeps {
   adapter: FixtureAdapter; store: DiscoveryStore; ledger: ReadLedger; policies: SourcePolicy[];
-  now?: () => number; sleep?: (ms: number) => Promise<void>;
+  now?: () => number; sleep?: (ms: number) => Promise<void>; random?: () => number;
   score?: (company: Candidate, jobs: readonly Finding[]) => number;
 }
 export interface DiscoveryOptions {
@@ -42,6 +42,12 @@ const bound = (n: number | undefined, fallback: number, max: number): number => 
   if (n === undefined) return fallback;
   if (!Number.isSafeInteger(n) || n < 1) throw new Error("invalid positive bound");
   return Math.min(n, max);
+};
+const candidate = (value: unknown): value is Candidate => {
+  if (!value || typeof value !== "object") return false;
+  const c = value as Candidate;
+  return typeof c.name === "string" && !!c.name.trim() && typeof c.domain === "string" && !!c.domain.trim()
+    && (c.boardUrl === undefined || (typeof c.boardUrl === "string" && !!c.boardUrl.trim()));
 };
 export function allowedUrl(raw: string, phase: Phase, policies: readonly SourcePolicy[], now: number): URL {
   if (!Number.isSafeInteger(now) || now < 0) throw new Error("invalid policy check timestamp");
@@ -92,19 +98,50 @@ export async function discoverCompanies(options: DiscoveryOptions, deps?: Discov
   if (!deps || deps.adapter.fixtureOnly !== true) throw new Error("only explicitly injected synthetic adapters are enabled");
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const ttl = bound(options.ttlMs, 86400000, 30 * 86400000);
   const timeout = bound(options.timeoutMs, 10000, 30000);
   let run: DiscoveryRun;
+  if (options.companies !== undefined && (!Array.isArray(options.companies) || !options.companies.every(candidate))) {
+    throw new Error("invalid manual company input");
+  }
+  const selectedInput = options.companies?.map((c) => ({ name: c.name.trim(), domain: c.domain.trim().toLowerCase(),
+    ...(c.boardUrl === undefined ? {} : { boardUrl: c.boardUrl.trim() }) }))
+    .filter((c, i, all) => all.findIndex((x) => x.domain === c.domain) === i).slice(0, limits.companies);
   const existing = deps.store.load(options.id);
   if (!options.resume && existing) throw new Error("run ID already exists; request resume explicitly");
   const loaded = options.resume ? existing : undefined;
   if (options.resume && !loaded) throw new Error("resume run not found");
-  const manualInput = options.companies ?? loaded?.inputCompanies;
-  const fresh = (): DiscoveryRun => ({ id: options.id, status: "running", phase: manualInput ? "resolve" : "discover", companyIndex: 0,
+  if (loaded) {
+    // Persistence is an untrusted boundary. Never reinterpret unknown state as
+    // a fresh run or advance a corrupt cursor by making more source reads.
+    if (loaded.schemaVersion !== 1) throw new Error("unsupported persisted discovery schema version");
+    if (loaded.id !== options.id) throw new Error("stored run ID mismatch");
+    const timestamp = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+    const company = (value: unknown): boolean => {
+      if (!value || typeof value !== "object") return false;
+      const c = value as CompanyResult;
+      return candidate(c.company) && c.company.domain === c.company.domain.trim().toLowerCase()
+        && Array.isArray(c.jobs) && c.jobs.length <= 1000
+        && c.jobs.every((job) => job && typeof job.url === "string" && !!job.url && typeof job.title === "string" && !!job.title)
+        && Array.isArray(c.provenance) && c.provenance.length <= 100
+        && c.provenance.every((p) => p && typeof p.url === "string" && !!p.url && p.confidence === "source_reported"
+          && timestamp(p.fetchedAt) && timestamp(p.staleAfter) && p.staleAfter > p.fetchedAt)
+        && (c.score === undefined || (typeof c.score === "number" && Number.isFinite(c.score)));
+    };
+    if (!["running", "completed", "no_results", "cancelled", "stopped"].includes(loaded.status)
+      || !["discover", "resolve", "jobs"].includes(loaded.phase)
+      || !Array.isArray(loaded.companies) || loaded.companies.length > 25 || !loaded.companies.every(company)
+      || (loaded.inputCompanies !== undefined && (!Array.isArray(loaded.inputCompanies) || loaded.inputCompanies.length > 25 || !loaded.inputCompanies.every(candidate)))
+      || !Number.isSafeInteger(loaded.companyIndex) || loaded.companyIndex < 0 || loaded.companyIndex > loaded.companies.length
+      || !Number.isSafeInteger(loaded.requests) || loaded.requests < 0 || loaded.requests > 100
+      || !Number.isSafeInteger(loaded.updatedAt) || loaded.updatedAt < 0
+      || !Number.isSafeInteger(loaded.ttlMs) || loaded.ttlMs < 1 || loaded.ttlMs > 30 * 86400000
+      || (loaded.cursor !== undefined && typeof loaded.cursor !== "string")) throw new Error("invalid persisted discovery state");
+  }
+  const ttl = bound(options.ttlMs, loaded?.ttlMs ?? 86400000, 30 * 86400000);
+  const manualInput = selectedInput ?? loaded?.inputCompanies;
+  const fresh = (): DiscoveryRun => ({ schemaVersion: 1, id: options.id, status: "running", phase: manualInput ? "resolve" : "discover", companyIndex: 0,
     ...(manualInput ? { inputCompanies: structuredClone(manualInput) } : {}), ttlMs: ttl,
-    companies: (manualInput ?? []).slice(0, limits.companies).filter((c, i, all) => all.findIndex((x) => x.domain.trim().toLowerCase() === c.domain.trim().toLowerCase()) === i)
-      .map((c) => ({ company: { ...c, domain: c.domain.trim().toLowerCase() }, jobs: [], provenance: [] })), requests: 0, updatedAt: now() });
-  if (loaded && loaded.id !== options.id) throw new Error("stored run ID mismatch");
+    companies: (manualInput ?? []).map((c) => ({ company: { ...c }, jobs: [], provenance: [] })), requests: 0, updatedAt: now() });
   run = loaded ? structuredClone(loaded) : fresh();
   if (loaded && ["completed", "no_results"].includes(loaded.status)) {
     const stale = loaded.status === "no_results"
@@ -117,6 +154,11 @@ export async function discoverCompanies(options: DiscoveryOptions, deps?: Discov
   const save = () => { run.updatedAt = now(); deps.store.save(structuredClone(run)); };
   const check = () => { if (options.signal?.aborted) throw new Error("cancelled"); };
   const provenance = (url: string): Provenance => ({ url, fetchedAt: now(), confidence: "source_reported", staleAfter: now() + ttl });
+  const backoff = (attempt: number): number => {
+    const jitter = (deps.random ?? Math.random)();
+    if (!Number.isFinite(jitter) || jitter < 0 || jitter > 1) throw new Error("invalid backoff random value");
+    return 2 ** attempt * 1000 + Math.floor(jitter * 1000);
+  };
   const read = async (initial: string, phase: Phase): Promise<{ body: unknown; url: string }> => {
     let url = initial, redirects = 0, retries = 0;
     while (true) {
@@ -132,33 +174,39 @@ export async function discoverCompanies(options: DiscoveryOptions, deps?: Discov
       options.signal?.addEventListener("abort", abort, { once: true });
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        check(); run.requests++; save();
+        check();
+        // Waiting for a shared domain slot may outlive the terms decision.
+        allowedUrl(safe.href, phase, deps.policies, now());
+        run.requests++; save();
         reply = await Promise.race([
           deps.adapter.read(safe.href, controller.signal), aborted,
           new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("request timeout")); }, timeout); }),
         ]);
+        check();
+        if (!Number.isSafeInteger(reply.status) || reply.status < 100 || reply.status > 599) throw new Error("invalid source HTTP status");
+        if ([301, 302, 303, 307, 308].includes(reply.status)) {
+          if (!reply.redirect || ++redirects > 2) throw new Error("redirect limit or missing target");
+          url = new URL(reply.redirect, safe).href; continue;
+        }
+        if (reply.status === 429 || reply.status >= 500) {
+          if (retries++ >= 2) throw new Error("retry limit exhausted");
+          const retry = reply.retryAfterSeconds;
+          if (retry !== undefined && (!Number.isFinite(retry) || retry < 0 || retry > 60)) throw new Error("unsupported Retry-After");
+          // Keep the shared host slot through cooldown so other workers cannot
+          // issue reads while this source asks us to wait.
+          await sleep(retry === undefined ? backoff(retries) : retry * 1000); continue;
+        }
+        if (reply.status < 200 || reply.status >= 300) throw new Error(`source denied HTTP ${reply.status}`);
+        return { body: reply.body, url: safe.href };
       } catch (error) {
         if (!options.signal?.aborted && error instanceof Error && error.message === "request timeout" && retries++ < 2) {
-          await sleep(2 ** retries * 1000); continue;
+          await sleep(backoff(retries)); continue;
         }
         throw error;
       } finally {
         if (timer) clearTimeout(timer);
         options.signal?.removeEventListener("abort", abort); release();
       }
-      check();
-      if ([301, 302, 303, 307, 308].includes(reply.status)) {
-        if (!reply.redirect || ++redirects > 2) throw new Error("redirect limit or missing target");
-        url = new URL(reply.redirect, safe).href; continue;
-      }
-      if (reply.status === 429 || reply.status >= 500) {
-        if (retries++ >= 2) throw new Error("retry limit exhausted");
-        const retry = reply.retryAfterSeconds ?? 2 ** retries;
-        if (!Number.isFinite(retry) || retry < 0 || retry > 60) throw new Error("unsupported Retry-After");
-        await sleep(retry * 1000); continue;
-      }
-      if (reply.status < 200 || reply.status >= 300) throw new Error(`source denied HTTP ${reply.status}`);
-      return { body: reply.body, url: safe.href };
     }
   };
   save();
@@ -180,11 +228,20 @@ export async function discoverCompanies(options: DiscoveryOptions, deps?: Discov
         save();
       } else {
         const result = run.companies[run.companyIndex];
-        if (!result) { run.status = run.companies.length ? "completed" : "no_results"; save(); break; }
+        if (!result) {
+          run.status = run.companies.length ? "completed" : "no_results";
+          if (run.status === "no_results") run.reason = "no_candidates";
+          save(); break;
+        }
         const response = await read(deps.adapter.url(run.phase, result.company, run.cursor), run.phase);
         result.provenance.push(provenance(response.url));
         if (run.phase === "resolve") {
-          result.company = deps.adapter.resolved(response.body, result.company);
+          const resolved = deps.adapter.resolved(response.body, structuredClone(result.company));
+          if (!resolved || typeof resolved.name !== "string" || !resolved.name.trim()
+            || typeof resolved.domain !== "string" || resolved.domain.trim().toLowerCase() !== result.company.domain) {
+            throw new Error("resolved company identity mismatch");
+          }
+          result.company = { ...resolved, domain: result.company.domain };
           run.phase = "jobs";
         } else {
           const page = deps.adapter.jobs(response.body);

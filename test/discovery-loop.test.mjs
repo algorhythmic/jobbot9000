@@ -36,7 +36,7 @@ function fixture(custom = {}) {
     resolved(body, company) { return { ...company, boardUrl: body.boardUrl }; },
     jobs(body) { return { items: body.jobs ?? [], next: body.next }; },
   };
-  const deps = { adapter, store, ledger: memoryReadLedger(), policies: [policy()], now: () => tick, sleep: async (ms) => { tick += ms; }, ...custom.deps };
+  const deps = { adapter, store, ledger: memoryReadLedger(), policies: [policy()], random: () => 0, now: () => tick, sleep: async (ms) => { tick += ms; }, ...custom.deps };
   return { id, deps, calls, companies, store, saves: () => saves, now: () => tick };
 }
 try {
@@ -93,7 +93,8 @@ try {
   });
   await test("empty discovery terminates with no_results", async () => {
     const f = fixture(); f.companies.length = 0;
-    assert.equal((await discoverCompanies({ id: f.id, execute: true }, f.deps)).run.status, "no_results");
+    const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+    assert.equal(run.status, "no_results"); assert.equal(run.reason, "no_candidates");
     assert.equal(f.calls.length, 1);
   });
   await test("company cap stops expansion at25", async () => {
@@ -201,6 +202,7 @@ try {
     const f = fixture(); f.deps.policies[0].expiresAt = START + 1;
     const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
     assert.equal(run.status, "stopped"); assert.match(run.reason, /stale/);
+    assert.equal(f.calls.length, 1); assert.equal(run.requests, 1);
   });
   await test("job references cannot smuggle prohibited destination URLs", async () => {
     const f = fixture(); f.deps.adapter.jobs = () => ({ items: [{ url: "https://linkedin.com/jobs/1", title: "Synthetic" }] });
@@ -236,6 +238,152 @@ try {
   });
   await test("missing resume run rejected before reads", async () => {
     const f = fixture(); await assert.rejects(discoverCompanies({ id: f.id, execute: true, resume: true }, f.deps), /not found/); assert.equal(f.calls.length, 0);
+  });
+  await test("source policy expiring while queued blocks the first read", async () => {
+    let tick = START;
+    const f = fixture({ deps: { now: () => tick, ledger: { async acquire() { tick += 2000; return () => {}; } } } });
+    f.deps.policies[0].expiresAt = START + 1000;
+    const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+    assert.equal(run.status, "stopped"); assert.match(run.reason, /stale/);
+    assert.equal(f.calls.length, 0); assert.equal(run.requests, 0);
+  });
+  await test("shared host slot remains held throughout Retry-After cooldown", async () => {
+    let tick = START, enterCooldown, endCooldown, firstCooldown = true, granted = false;
+    const entered = new Promise((resolve) => { enterCooldown = resolve; });
+    const cooldown = new Promise((resolve) => { endCooldown = resolve; });
+    const ledger = memoryReadLedger();
+    const sleep = async (ms) => {
+      if (ms === 3000 && firstCooldown) { firstCooldown = false; enterCooldown(); await cooldown; }
+      tick += ms;
+    };
+    const now = () => tick;
+    const f = fixture({ read: () => ({ status: 429, retryAfterSeconds: 3 }), deps: { ledger, sleep, now } });
+    const running = discoverCompanies({ id: f.id, execute: true }, f.deps);
+    await entered;
+    const waiting = ledger.acquire("careers.example", now, sleep, 500).then((release) => { granted = true; return release; });
+    await Promise.resolve(); await Promise.resolve();
+    assert.equal(granted, false);
+    endCooldown();
+    const release = await waiting;
+    assert.ok(tick >= START + 3000); release();
+    const { run } = await running;
+    assert.match(run.reason, /retry limit/); assert.equal(f.calls.length, 3);
+  });
+  await test("malformed HTTP status fails closed before result parsing", async () => {
+    for (const status of [NaN, Infinity, 0, 600, 200.5, "200", undefined]) {
+      const f = fixture({ read: () => ({ status }) });
+      const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+      assert.equal(run.status, "stopped"); assert.match(run.reason, /invalid source HTTP status/);
+      assert.equal(f.calls.length, 1); assert.equal(run.companies.length, 0);
+    }
+  });
+  await test("unknown or corrupt persisted state is never reset or read", async () => {
+    for (const patch of [{ status: "unknown" }, { phase: "unexpected" }, { companyIndex: -1 }, { companyIndex: 2 }, { requests: -1 }, { requests: null }, { updatedAt: -1 }, { ttlMs: 0 }, { cursor: {} }]) {
+      const f = fixture();
+      const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+      f.store.save({ ...run, ...patch });
+      const calls = f.calls.length, saves = f.saves();
+      await assert.rejects(discoverCompanies({ id: f.id, execute: true, resume: true, refreshStale: true }, f.deps), /invalid persisted/);
+      assert.equal(f.calls.length, calls); assert.equal(f.saves(), saves);
+      assert.deepEqual(f.store.load(f.id), { ...run, ...patch });
+    }
+  });
+  await test("manual deduplication precedes the company cap", async () => {
+    const f = fixture();
+    const companies = Array.from({ length: 25 }, () => ({ name: "Duplicate Synthetic", domain: " A.EXAMPLE " }));
+    companies.push({ name: "Second Synthetic", domain: "b.example" });
+    const { run } = await discoverCompanies({ id: f.id, execute: true, companies }, f.deps);
+    assert.equal(run.status, "completed"); assert.equal(run.companies.length, 2);
+    assert.deepEqual(run.companies.map((c) => c.company.domain), ["a.example", "b.example"]);
+    assert.equal(f.calls.length, 4);
+  });
+  await test("resolver cannot silently replace canonical company identity", async () => {
+    const f = fixture();
+    f.deps.adapter.resolved = (_body, company) => { company.domain = "different.example"; return company; };
+    const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+    assert.equal(run.status, "stopped"); assert.match(run.reason, /identity mismatch/);
+    assert.equal(run.companies[0].company.domain, "a.example"); assert.equal(f.calls.length, 2);
+  });
+  await test("resolver normalizes equivalent domain identity", async () => {
+    const f = fixture(); f.deps.adapter.resolved = (_body, company) => ({ ...company, domain: " A.EXAMPLE " });
+    const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+    assert.equal(run.status, "completed"); assert.equal(run.companies[0].company.domain, "a.example");
+  });
+  await test("unsupported persisted schema versions require explicit recovery", async () => {
+    for (const version of [undefined, 0, 2]) {
+      const f = fixture(); const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+      const corrupt = { ...run, schemaVersion: version }; f.store.save(corrupt);
+      const calls = f.calls.length, saves = f.saves();
+      await assert.rejects(discoverCompanies({ id: f.id, execute: true, resume: true }, f.deps), /unsupported persisted discovery schema/);
+      assert.equal(f.calls.length, calls); assert.equal(f.saves(), saves);
+    }
+  });
+  await test("corrupt nested persisted data fails before any read or write", async () => {
+    for (const patch of [
+      { jobs: "bad" }, { jobs: [{ url: 42, title: "Synthetic" }] }, { provenance: "bad" },
+      { provenance: [{ url: "https://careers.example/jobs", confidence: "source_reported", fetchedAt: START, staleAfter: START - 1 }] },
+      { company: { name: "Synthetic", domain: " A.EXAMPLE " } }, { company: { name: "Synthetic", domain: "a.example", boardUrl: {} } },
+      { score: "bad" }, { jobs: Array.from({ length: 1001 }, () => ({ url: "https://careers.example/jobs/1", title: "Synthetic" })) },
+    ]) {
+      const f = fixture(); const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+      f.store.save({ ...run, status: "stopped", phase: "jobs", companyIndex: 0, companies: [{ ...run.companies[0], ...patch }] });
+      const calls = f.calls.length, saves = f.saves();
+      await assert.rejects(discoverCompanies({ id: f.id, execute: true, resume: true }, f.deps), /invalid persisted/);
+      assert.equal(f.calls.length, calls); assert.equal(f.saves(), saves);
+    }
+  });
+  await test("corrupt manual input and persisted bounds are not reset", async () => {
+    for (const patch of [{ inputCompanies: [null] }, { inputCompanies: "bad" }, { requests: 101 }, { ttlMs: 30 * 86400000 + 1 }]) {
+      const f = fixture(); const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+      f.store.save({ ...run, ...patch }); const calls = f.calls.length, saves = f.saves();
+      await assert.rejects(discoverCompanies({ id: f.id, execute: true, resume: true }, f.deps), /invalid persisted/);
+      assert.equal(f.calls.length, calls); assert.equal(f.saves(), saves);
+    }
+  });
+  await test("invalid manual inputs fail before persistence or adapter calls", async () => {
+    for (const companies of ["bad", [null], [{ name: "", domain: "a.example" }], [{ name: "Synthetic", domain: 42 }], [{ name: "Synthetic", domain: " " }], [{ name: "Synthetic", domain: "a.example", boardUrl: {} }]]) {
+      const f = fixture(); let loads = 0;
+      f.deps.store.load = () => { loads++; return undefined; };
+      await assert.rejects(discoverCompanies({ id: f.id, execute: true, companies }, f.deps), /invalid manual/);
+      assert.equal(f.calls.length, 0); assert.equal(f.saves(), 0); assert.equal(loads, 0);
+    }
+  });
+  await test("persisted manual targets are normalized deduplicated and capped", async () => {
+    const f = fixture();
+    const companies = [{ name: "Duplicate", domain: " A.EXAMPLE " }, { name: "Duplicate2", domain: "a.example" },
+      ...Array.from({ length: 30 }, (_, i) => ({ name: `Synthetic ${i}`, domain: `s${i}.example` }))];
+    const { run } = await discoverCompanies({ id: f.id, execute: true, companies }, f.deps);
+    assert.equal(run.inputCompanies.length, 25); assert.equal(run.companies.length, 25);
+    assert.equal(run.inputCompanies[0].domain, "a.example");
+    assert.equal(new Set(run.inputCompanies.map((c) => c.domain)).size, 25);
+  });
+  await test("resume preserves original TTL for newly fetched provenance", async () => {
+    const f = fixture(); const normal = f.deps.adapter.read;
+    let once = true;
+    f.deps.adapter.read = async (...args) => { if (once) { once = false; return { status: 403 }; } return normal(...args); };
+    const first = await discoverCompanies({ id: f.id, execute: true, ttlMs: 1234 }, f.deps);
+    assert.equal(first.run.status, "stopped");
+    const { run } = await discoverCompanies({ id: f.id, execute: true, resume: true }, f.deps);
+    assert.equal(run.status, "completed"); assert.equal(run.ttlMs, 1234);
+    for (const company of run.companies) for (const p of company.provenance) assert.equal(p.staleAfter - p.fetchedAt, 1234);
+  });
+  await test("absent Retry-After uses deterministic exponential jitter", async () => {
+    let tick = START; const sleeps = [];
+    const f = fixture({ read: () => ({ status: 503 }), deps: { random: () => 0.5, now: () => tick, sleep: async (ms) => { sleeps.push(ms); tick += ms; } } });
+    const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+    assert.match(run.reason, /retry limit/); assert.deepEqual(sleeps, [2500, 4500]);
+  });
+  await test("explicit Retry-After never samples jitter", async () => {
+    const f = fixture({ read: () => ({ status: 429, retryAfterSeconds: 2 }), deps: { random: () => { throw new Error("must not sample jitter"); } } });
+    const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+    assert.match(run.reason, /retry limit/); assert.equal(f.calls.length, 3);
+  });
+  await test("invalid injected jitter fails closed", async () => {
+    for (const random of [() => NaN, () => -1, () => 1.01]) {
+      const f = fixture({ read: () => ({ status: 503 }), deps: { random } });
+      const { run } = await discoverCompanies({ id: f.id, execute: true }, f.deps);
+      assert.match(run.reason, /invalid backoff random/); assert.equal(f.calls.length, 1);
+    }
   });
   console.log(`\n${pass} passed, 0 failed`);
 } finally { globalThis.fetch = originalFetch; rmSync(TMP, { recursive: true, force: true }); }
