@@ -10,12 +10,14 @@
     "algorhythmic (https://github.com/algorhythmic)"
   ],
   "repository": "https://github.com/algorhythmic/jobbot9000",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/sqlite.test.mjs && tsx test/discovery.test.mjs"
+    "test": "node --import tsx test/sqlite.test.mjs && node --import tsx test/discovery.test.mjs && node --import tsx test/application-regression.test.mjs && node --import tsx test/interview-regression.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
