@@ -12,7 +12,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TMP = mkdtempSync(join(tmpdir(), "jbdisc-"));
-process.env.STATE_DIR = TMP;
+process.env.JOBBOT_PRIVATE_DIR = join(TMP, ".private");
+process.env.STATE_DIR = join(TMP, ".private", "state");
 const SEEDS = join(TMP, "seeds.json");
 process.env.JOBBOT_SEEDS_FILE = SEEDS;
 writeFileSync(SEEDS, "[]"); // start empty
@@ -20,7 +21,12 @@ writeFileSync(SEEDS, "[]"); // start empty
 const src = (f) => new URL(`../src/${f}`, import.meta.url).href;
 const ats = await import(src("ats.ts"));
 const prov = await import(src("providers.ts"));
-const tools = await import(src("tools.ts"));
+const rawTools = await import(src("tools.ts"));
+// Existing execution fixtures opt in explicitly; dry-run defaults have dedicated tests.
+const tools = { ...rawTools };
+for (const name of ["findCompanies", "fetchJobs", "ingestPortfolio"]) {
+  tools[name] = (args, deps) => rawTools[name]({ dry_run: false, ...args }, deps);
+}
 const DB = await import(src("db.ts"));
 
 let pass = 0, fail = 0;
@@ -107,16 +113,16 @@ eq([DB.counts().companies, DB.counts().unresolved], [2, 1], "on-demand: persiste
 // ── E. Default-is-free: no provider, empty roster -> free no-op with guidance ──
 const def = jres(await tools.findCompanies({ titles: ["SWE"] }, { resolve: atsResolve }));
 eq([def.ok, def.provider, def.credits_spent, def.discovered], [true, "curated", 0, 0], "default: free curated, no spend");
-eq(typeof def.note === "string" && def.note.includes("companies:"), true, "default: empty roster -> guides to on-demand / seeds / theirstack");
+eq(typeof def.note === "string" && def.note.includes("live discovery remains disabled"), true, "default: empty roster -> local seed guidance and network-disabled notice");
 eq(DB.counts().companies, 2, "default: empty roster persisted nothing");
 
 // ── F. TheirStack is now opt-in (not default) ─────────────────────────────────
-eq(jres(await tools.findCompanies({ provider: "theirstack", titles: ["SWE"] }, { ctx: { apiKey: undefined } })).ok, false, "theirstack: explicit + no key -> ok:false (honest)");
-const dry = jres(await tools.findCompanies({ provider: "theirstack", titles: ["SWE"], dry_run: true }, { ctx: tsCtx }));
-eq([dry.dry_run, dry.estimate.total_matches], [true, 120], "theirstack: dry_run -> free estimate");
+eq(jres(await tools.findCompanies({ provider: "theirstack", titles: ["SWE"] }, { ctx: { apiKey: undefined, fetchFn: tsFetch }, resolve: atsResolve })).ok, false, "theirstack: explicit + no synthetic key -> ok:false (honest)");
+const dry = jres(await tools.findCompanies({ provider: "theirstack", titles: ["SWE"], dry_run: true }, { ctx: tsCtx, resolve: atsResolve }));
+eq([dry.dry_run, dry.estimate], [true, undefined], "theirstack: dry_run -> local preview without estimate request");
 
 // ── G. Confirmation gate: projected > ceiling without confirm -> no spend ─────
-const gated = jres(await tools.findCompanies({ provider: "theirstack", titles: ["SWE"], limit: 25, max_credits: 10 }, { ctx: tsCtx }));
+const gated = jres(await tools.findCompanies({ provider: "theirstack", titles: ["SWE"], limit: 25, max_credits: 10 }, { ctx: tsCtx, resolve: atsResolve }));
 eq([gated.ok, gated.confirmation_required], [false, true], "ceiling: over-budget pull blocked pending confirm");
 eq(DB.counts().companies, 2, "ceiling: blocked run persisted nothing");
 

@@ -1,5 +1,7 @@
 # jobbot9000
 
+> **Offline foundation (local build):** discovery defaults to a local dry-run preview with zero fetches or catalog mutations. Network adapters have no live default; explicit execution requires injected adapters. No sending/submission capability exists. Use synthetic data only until private transcript retention and per-source terms have been reviewed.
+
 A local, market-aware **job-search readiness loop** for your AI agent — packaged as a **Claude Code plugin**. One install bundles an MCP server (which reads the real job market and holds your journey) and the skills that drive it. Your agent is the brain; this is its senses and memory. Nothing is hosted, no keys leave your machine, and the whole journey persists locally across sessions that may span months.
 
 ```mermaid
@@ -113,7 +115,7 @@ On the first session after install, a bootstrap hook (`hooks/hooks.json` → `sc
 
 **Upgrading Node needs no action.** The server has no native dependency — SQLite comes from the Node runtime itself (`src/sqlite.ts`), so nothing is tied to Node's ABI. A native SQLite driver would have to be recompiled (and wait on upstream prebuilds) for every new Node major; this one just keeps working. Your database is a plain SQLite file, unchanged by the switch.
 
-State and the local catalog live in an embedded SQLite database under `${CLAUDE_PLUGIN_DATA}/state/` (resolves to `~/.claude/plugins/data/<plugin-id>/state/`), which survives across sessions **and** plugin updates. (Fallback: `~/.jobbot/state`.) Uninstalling deletes the data dir unless you pass `--keep-data`.
+State and the local catalog live in an embedded SQLite database under `${CLAUDE_PLUGIN_DATA}/.private/state/` (resolves to `~/.claude/plugins/data/<plugin-id>/state/`), which survives across sessions **and** plugin updates. (Fallback: `~/.jobbot/.private/state`.) Uninstalling deletes the data dir unless you pass `--keep-data`.
 
 ## Develop
 
@@ -126,7 +128,7 @@ npm test           # offline test suite (tsx against src/, mocked HTTP — no ne
                    #   test/discovery.test.mjs — ATS/providers/gather + the loop
 ```
 
-The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/state`) and opens `jobbot.db` there; unset, it falls back to `~/.jobbot/state`.
+The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/.private/state`) and opens `jobbot.db` there; unset, it falls back to `~/.jobbot/.private/state`.
 
 **Heads-up when running Claude Code *inside* this repo:** the root `.mcp.json` is auto-discovered as a *project* server but `${CLAUDE_PLUGIN_ROOT}` only expands in *plugin* context, so that project-scoped copy fails harmlessly (`MCP error -32000`). Run `claude --plugin-dir` from **outside** the repo, or disable the project `jobbot` server in `/mcp`. The real plugin shows as `plugin:jobbot9000:jobbot`.
 
@@ -162,3 +164,11 @@ Any extension must respect the invariants — **the agent never writes the DB** 
 - **A new skill** → drop `skills/<name>/SKILL.md` with `name` + `description` frontmatter; it auto-registers as `/<name>`.
 - **A new journey dimension** → extend the `Dimension` union in `src/state.ts` and add its predicate in `readJourneyState`.
 - **Durability** → any new stateful step persists in the DB and, if it's a meaningful event, appends to the `events` journal (`db.logEvent`), so a fresh session resumes it.
+
+## Private storage boundary
+
+Personal state, discovery run state, SQLite sidecars, drafts and receipts belong only under a git-ignored `.private/` directory. The plugin selects `${CLAUDE_PLUGIN_DATA}/.private/state`; standalone use defaults to `~/.jobbot/.private/state`. An absolute `STATE_DIR` may select a directory under `.private`, with optional `JOBBOT_PRIVATE_DIR` naming that exact `.private` anchor. Relative/unexpanded paths, escapes, symlink components, and multiply linked database files are rejected. Private directories are tightened to 0700 and database files to 0600. This guards accidental path escape; it is not isolation from another process running as the same user.
+
+Existing legacy state is never opened, moved or deleted automatically. Back up legacy data and obtain an explicit migration decision before using a new private location; this change opens a new schema-compatible private database. Operator application/interview contracts have offline synthetic regression coverage. Harness transcripts can retain tool outputs outside the private root; real personal use remains on hold until the operator resolves retention. Do not treat SQLite containment alone as satisfying transcript privacy.
+
+Run offline tests with `npm test` (Node's `--import tsx` loader avoids the tsx CLI IPC socket). No test needs live endpoints, real profiles or credentials.

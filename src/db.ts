@@ -5,27 +5,13 @@
 // state is multi-dimensional and DURABLE — versioned history + an append-only journal so a
 // search that spans months never loses progress and any new session resumes from the DB.
 import Database from "./sqlite.js";
-import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { prepareStorage } from "./storage.js";
 import { resolveInterviewRequest, type InterviewRequest, type InterviewError } from "./interview.js";
 
-// STATE_DIR is set by the plugin to ${CLAUDE_PLUGIN_DATA}/state — a persistent, per-plugin
-// directory (~/.claude/plugins/data/<id>/) that survives sessions AND plugin updates. If the
-// host didn't expand that variable (unset, or a literal "${...}"), fall back to a STABLE
-// absolute path under the home dir, NEVER a cwd-relative one (which would fragment the DB).
-function resolveStateDir(): string {
-  const v = process.env.STATE_DIR;
-  if (!v || v.includes("${")) {
-    if (v) process.stderr.write(`[jobbot9000] STATE_DIR was not expanded ("${v}") — falling back to ~/.jobbot/state\n`);
-    return join(homedir(), ".jobbot", "state");
-  }
-  return v;
-}
-const STATE_DIR = resolveStateDir();
-mkdirSync(STATE_DIR, { recursive: true });
-
-export const db = new Database(join(STATE_DIR, "jobbot.db"));
+// All personal state and SQLite sidecars stay in .private. Legacy state is never
+// opened, moved or deleted implicitly; configure an explicit private state root.
+const storage = prepareStorage();
+export const db = new Database(storage.databasePath);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 db.pragma("busy_timeout = 5000"); // wait (don't throw SQLITE_BUSY) if another session holds the write lock

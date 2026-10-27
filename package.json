@@ -17,7 +17,7 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx test/sqlite.test.mjs && node --import tsx test/discovery.test.mjs && node --import tsx test/application-regression.test.mjs && node --import tsx test/interview-regression.test.mjs"
+    "test": "node --import tsx test/sqlite.test.mjs && node --import tsx test/discovery.test.mjs && node --import tsx test/application-regression.test.mjs && node --import tsx test/interview-regression.test.mjs && node --import tsx test/storage.test.mjs && node --import tsx test/storage-db.test.mjs && node --import tsx test/dry-run.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

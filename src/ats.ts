@@ -1,3 +1,4 @@
+import { disabledFetch } from "./network.js";
 // ats.ts — free, keyless ATS-slug resolution (Tool 1, stage 4). Given a company's
 // name + domain, find which public ATS board it runs and its slug. Every endpoint is
 // a keyless GET keyed on a per-company slug; there is NO cross-company search, so we
@@ -121,7 +122,7 @@ const NORMALIZERS: Record<AtsPlatform, (j: any) => RawJob[] | null> = {
  * error, garbage payload). The null-vs-[] distinction matters for liveness: [] means
  * "valid board, nothing open" (close everything), null means "couldn't reach" (leave as-is).
  */
-export async function fetchBoard(platform: AtsPlatform, slug: string, fetchFn: FetchFn = fetch): Promise<RawJob[] | null> {
+export async function fetchBoard(platform: AtsPlatform, slug: string, fetchFn: FetchFn = disabledFetch): Promise<RawJob[] | null> {
   let res: Response;
   try { res = await fetchFn(ENDPOINTS[platform](slug)); } catch { return null; }
   if (!res.ok) return null;
@@ -153,7 +154,7 @@ export async function resolveAts(
   company: { name: string; domain?: string | null },
   opts: ResolveOpts = {},
 ): Promise<AtsResolution | null> {
-  const f = opts.fetchFn ?? fetch;
+  const f = opts.fetchFn ?? disabledFetch;
   const order = opts.order ?? ORDER;
   const candidates = slugCandidates(company.name, company.domain);
   let fallbackEmpty: AtsResolution | null = null; // first non-Workable empty board, used only if nothing populated
