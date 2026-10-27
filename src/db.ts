@@ -794,3 +794,31 @@ export const rejectionsSincePlan = (): number =>
            AND a.updated_at > COALESCE((SELECT max(created_at) FROM upskilling_plan), '')`);
 
 export const nowStr = (): string => (db.prepare("SELECT datetime('now') t").get() as { t: string }).t;
+
+// Discovery checkpoints share the existing private DB and its transaction boundary.
+// Serial owner use only: worker leases/cross-process scheduling belong to stage e.
+// Payloads contain candidate-specific findings and must never be exported to git.
+db.exec(`CREATE TABLE IF NOT EXISTS discovery_runs (
+  id TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+const discoveryId = (id: string): void => {
+  if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error("invalid discovery run ID");
+};
+export function loadDiscoveryRun<T>(id: string): T | undefined {
+  discoveryId(id);
+  const row = db.prepare("SELECT payload_json FROM discovery_runs WHERE id=?").get(id) as { payload_json: string } | undefined;
+  return row ? JSON.parse(row.payload_json) as T : undefined;
+}
+export function saveDiscoveryRun<T extends { id: string }>(run: T): void {
+  discoveryId(run.id);
+  const payload = JSON.stringify(run);
+  db.transaction(() => {
+    db.prepare(`INSERT INTO discovery_runs(id,payload_json) VALUES (?,?)
+      ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json,
+      revision=discovery_runs.revision+1, updated_at=datetime('now')`).run(run.id, payload);
+    logEvent("discovery_checkpoint", "discovery checkpoint saved", run.id);
+  })();
+}
