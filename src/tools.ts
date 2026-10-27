@@ -10,6 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readFileSync } from "node:fs";
+import { NETWORK_DISABLED } from "./network.js";
 import * as DB from "./db.js";
 import { readJourneyState } from "./state.js";
 import { resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
@@ -20,7 +21,6 @@ type State = ReturnType<typeof readJourneyState>;
 
 // Per-run spend ceiling for paid discovery (the gate TheirStack itself doesn't provide).
 const MAX_CREDITS_PER_RUN = Number(process.env.THEIRSTACK_MAX_CREDITS_PER_RUN ?? 150);
-const providerContext = (): ProviderContext => ({ apiKey: process.env.THEIRSTACK_API_KEY });
 
 // ── grading modes — the single source of truth for the closed vocabularies ──
 interface ModeConstraints { [key: string]: unknown }
@@ -651,11 +651,11 @@ export function registerTools(server: McpServer): void {
   // ── gather: the one door to the outside world (sync cut in v2) ─────────────
   server.registerTool("gather", {
     description:
-      "The one door to the outside world — reach out, persist, return findings. step: " +
-      "'find_companies' (lead-gen → ATS-slug resolution; FREE. Pass companies:[{name,domain}] to resolve on demand, or companies:[{name,ats_platform,ats_slug}] to PIN a board; or a query from the resume for the curated roster; provider:'theirstack' (+THEIRSTACK_API_KEY) for paid targeted discovery, count-first + credit-gated), " +
-      "'fetch_jobs' (pull live ATS boards → raw ungraded jobs; keyless. ats_platform+ats_slug or company_id, or none = refresh all resolved, stalest-first), " +
-      "'ingest_portfolio' (public GitHub repos → portfolio facts + VERIFICATION signals (authorship/traction/age/vanity-badges); keyless. github_handle or the profile's; enrich_max bounds enrichment). " +
-      "Persistence is a side effect; the agent still never writes the DB itself.",
+      "Dry-run by default: preview locally with no requests or writes. Network execution is disabled in this foundation; explicit dry_run:false requires injected offline adapters. step: " +
+      "'find_companies' (preview company inputs or a discovery query; explicit local execution can persist pinned boards or curated slug-complete seeds), " +
+      "'fetch_jobs' (preview ATS board targets; execution requires an injected board adapter), " +
+      "'ingest_portfolio' (preview public GitHub portfolio ingestion; execution requires injected list and enrichment adapters). " +
+      "No send or submit capability. Network adapters are unavailable through this MCP surface.",
     inputSchema: {
       step: enumOf(["find_companies", "fetch_jobs", "ingest_portfolio"]),
       companies: z.array(z.object({ name: z.string(), domain: z.string().optional(), ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(), ats_slug: z.string().optional() })).optional(),
@@ -706,9 +706,17 @@ async function persistDiscovered(companies: DiscoveredCompany[], resolve: typeof
 
 const nextNote = () => "resolved companies are ready — pull their live boards with gather({ step: 'fetch_jobs' }).";
 
+const networkDisabled = () => json({ ok: false, code: "network_disabled", error: NETWORK_DISABLED });
+const preview = (step: string, input: unknown) => json({
+  ok: true, dry_run: true, step, preview: input,
+  note: "Local preview only: no adapter calls, credential reads or writes. Live network is disabled.",
+});
+
 export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
+  if (a.dry_run !== false) return preview("find_companies", a);
   const resolve = deps.resolve ?? resolveAts;
   if (a.companies?.length) {
+    if (!deps.resolve && a.companies.some((c) => !(c.ats_platform && c.ats_slug))) return networkDisabled();
     const discovered: DiscoveredCompany[] = a.companies.map((c) => ({
       name: c.name, domain: c.domain ?? null, tags: [], source: "manual",
       ats_platform: (c.ats_platform && c.ats_slug) ? c.ats_platform : null,
@@ -723,28 +731,31 @@ export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
   const providerName = a.provider ?? Object.keys(PROVIDERS)[0];
   const provider = PROVIDERS[providerName];
   if (!provider) return json({ ok: false, error: `unknown provider '${providerName}' — available: ${Object.keys(PROVIDERS).join(", ")}` });
-  const ctx = deps.ctx ?? providerContext();
-  if (!provider.available(ctx)) return json({ ok: false, error: `provider '${provider.name}' is unavailable${provider.requiresKey ? " — set THEIRSTACK_API_KEY to opt into paid targeting. The free 'curated' provider and the 'companies' on-demand path need no key." : "."}` });
+  if (provider.requiresKey && (!deps.ctx?.fetchFn || !deps.resolve)) return networkDisabled();
+  const ctx = deps.ctx ?? {};
+  if (!provider.available(ctx)) return json({ ok: false, error: `provider '${provider.name}' is unavailable${provider.requiresKey ? " — an injected offline context must supply a synthetic key. Local curated and pinned-company paths need no key." : "."}` });
   const q: DiscoverQuery = { titles: a.titles, technologies: a.technologies, seniority: a.seniority ?? null, locations: a.locations, posted_within_days: a.posted_within_days, limit: a.limit };
   let est; try { est = await provider.estimate(q, ctx); } catch (e) { return json({ ok: false, error: `discovery pre-flight failed: ${errMsg(e)}` }); }
   const ceiling = a.max_credits ?? MAX_CREDITS_PER_RUN;
-  if (a.dry_run) return json({ ok: true, dry_run: true, provider: provider.name, estimate: est, ceiling, note: est.projected_credits === 0 ? "free provider — re-run without dry_run to persist." : "free count only — re-run without dry_run to pull (paid)." });
   if (est.projected_credits > ceiling && !a.confirm) return json({ ok: false, confirmation_required: true, provider: provider.name, estimate: est, ceiling, note: `projected ~${est.projected_credits} credits exceeds the ceiling (${ceiling}). Re-run with confirm:true, or lower limit / raise max_credits.` });
   let result; try { result = await provider.discover(q, ctx); } catch (e) { return json({ ok: false, error: `discovery failed: ${errMsg(e)}` }); }
+  if (!deps.resolve && result.companies.some((c) => !(c.ats_platform && c.ats_slug))) return networkDisabled();
   const persisted = await persistDiscovered(result.companies, resolve);
   const out: Record<string, unknown> = { ok: true, provider: provider.name, estimate: est, credits_spent: result.records_billed, discovered: result.companies.length, persisted, catalog: readJourneyState().catalog, next: nextNote() };
-  if (result.companies.length === 0 && provider.name === "curated") out.note = "the curated seed roster is empty. Name companies directly — gather({ step: 'find_companies', companies: [{ name, domain }] }) — or add to seeds/companies.json, or set THEIRSTACK_API_KEY.";
+  if (result.companies.length === 0 && provider.name === "curated") out.note = "the curated seed roster is empty. Preview company inputs, or configure local slug-complete seeds; live discovery remains disabled.";
   return json(out);
 }
 
 // ── fetch_jobs orchestration ──────────────────────────────────────────────────
-interface FetchArgs { ats_platform?: string; ats_slug?: string; company_id?: number; limit?: number }
+interface FetchArgs { dry_run?: boolean; ats_platform?: string; ats_slug?: string; company_id?: number; limit?: number }
 interface FetchTarget { company_id: number; platform: AtsPlatform; slug: string; name: string }
 interface FetchDeps { fetchBoardFn?: typeof fetchBoard; sleep?: (ms: number) => Promise<void>; politeDelayMs?: number }
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
-  const fetchBoardFn = deps.fetchBoardFn ?? fetchBoard;
+  if (a.dry_run !== false) return preview("fetch_jobs", a);
+  if (!deps.fetchBoardFn) return networkDisabled();
+  const fetchBoardFn = deps.fetchBoardFn;
   const sleep = deps.sleep ?? realSleep;
   const politeDelayMs = deps.politeDelayMs ?? 1000;
   const targets: FetchTarget[] = [];
@@ -783,20 +794,22 @@ export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
 
 // ── ingest_portfolio orchestration (with verification signals) ────────────────
 const ENRICH_MAX_DEFAULT = 20;
-interface IngestArgs { github_handle?: string; include_forks?: boolean; enrich_max?: number }
+interface IngestArgs { dry_run?: boolean; github_handle?: string; include_forks?: boolean; enrich_max?: number }
 interface IngestDeps { fetchReposFn?: typeof fetchUserRepos; enrichFn?: typeof enrichRepo; token?: string }
 
 export async function ingestPortfolio(a: IngestArgs, deps: IngestDeps = {}) {
+  if (a.dry_run !== false) return preview("ingest_portfolio", a);
+  if (!deps.fetchReposFn || !deps.enrichFn) return networkDisabled();
   const s = readJourneyState();
   if (s.profile?.no_github) return json({ ok: false, error: "the user opted out of GitHub (no_github) — coach from the interview + described projects; absence is not penalized." });
   const handle = a.github_handle ?? s.profile?.github_handle ?? undefined;
   if (!handle) return json({ ok: false, error: "no github_handle — pass one, or capture it via capture_profile." });
-  const token = deps.token ?? process.env.GITHUB_TOKEN;
-  const fetchReposFn = deps.fetchReposFn ?? fetchUserRepos;
+  const token = deps.token;
+  const fetchReposFn = deps.fetchReposFn;
   let repos: RepoFacts[];
   try { repos = await fetchReposFn(handle, { token }); } catch (e) { return json({ ok: false, error: `GitHub fetch failed: ${errMsg(e)}` }); }
   const kept = a.include_forks ? repos : repos.filter((r) => !r.is_fork);
-  const enrichFn = deps.enrichFn ?? enrichRepo;
+  const enrichFn = deps.enrichFn;
   const enrichMax = a.enrich_max ?? ENRICH_MAX_DEFAULT;
   const toEnrich = kept.slice(0, enrichMax);
   for (const r of toEnrich) {

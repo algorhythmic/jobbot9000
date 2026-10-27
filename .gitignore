@@ -6,3 +6,6 @@ state/
 *.db-wal
 .DS_Store
 *.log
+
+# Candidate data, drafts, run state and local receipts must never be committed.
+.private/

@@ -5,27 +5,13 @@
 // state is multi-dimensional and DURABLE — versioned history + an append-only journal so a
 // search that spans months never loses progress and any new session resumes from the DB.
 import Database from "./sqlite.js";
-import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { prepareStorage } from "./storage.js";
 import { resolveInterviewRequest, type InterviewRequest, type InterviewError } from "./interview.js";
 
-// STATE_DIR is set by the plugin to ${CLAUDE_PLUGIN_DATA}/state — a persistent, per-plugin
-// directory (~/.claude/plugins/data/<id>/) that survives sessions AND plugin updates. If the
-// host didn't expand that variable (unset, or a literal "${...}"), fall back to a STABLE
-// absolute path under the home dir, NEVER a cwd-relative one (which would fragment the DB).
-function resolveStateDir(): string {
-  const v = process.env.STATE_DIR;
-  if (!v || v.includes("${")) {
-    if (v) process.stderr.write(`[jobbot9000] STATE_DIR was not expanded ("${v}") — falling back to ~/.jobbot/state\n`);
-    return join(homedir(), ".jobbot", "state");
-  }
-  return v;
-}
-const STATE_DIR = resolveStateDir();
-mkdirSync(STATE_DIR, { recursive: true });
-
-export const db = new Database(join(STATE_DIR, "jobbot.db"));
+// All personal state and SQLite sidecars stay in .private. Legacy state is never
+// opened, moved or deleted implicitly; configure an explicit private state root.
+const storage = prepareStorage();
+export const db = new Database(storage.databasePath);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 db.pragma("busy_timeout = 5000"); // wait (don't throw SQLITE_BUSY) if another session holds the write lock
@@ -808,3 +794,171 @@ export const rejectionsSincePlan = (): number =>
            AND a.updated_at > COALESCE((SELECT max(created_at) FROM upskilling_plan), '')`);
 
 export const nowStr = (): string => (db.prepare("SELECT datetime('now') t").get() as { t: string }).t;
+
+// Discovery checkpoints share the existing private DB and its transaction boundary.
+// Serial owner use only: worker leases/cross-process scheduling belong to stage e.
+// Payloads contain candidate-specific findings and must never be exported to git.
+db.exec(`CREATE TABLE IF NOT EXISTS discovery_runs (
+  id TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+const discoveryId = (id: string): void => {
+  if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error("invalid discovery run ID");
+};
+export function loadDiscoveryRun<T>(id: string): T | undefined {
+  discoveryId(id);
+  const row = db.prepare("SELECT payload_json FROM discovery_runs WHERE id=?").get(id) as { payload_json: string } | undefined;
+  return row ? JSON.parse(row.payload_json) as T : undefined;
+}
+export function saveDiscoveryRun<T extends { id: string }>(run: T): void {
+  discoveryId(run.id);
+  const payload = JSON.stringify(run);
+  db.transaction(() => {
+    db.prepare(`INSERT INTO discovery_runs(id,payload_json) VALUES (?,?)
+      ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json,
+      revision=discovery_runs.revision+1, updated_at=datetime('now')`).run(run.id, payload);
+    logEvent("discovery_checkpoint", "discovery checkpoint saved", run.id);
+  })();
+}
+
+// Durable read reservations for a SERIAL owner. These counters survive restart;
+// they are not cross-process inflight locks or worker leases.
+db.exec(`CREATE TABLE IF NOT EXISTS discovery_read_days (
+  day TEXT PRIMARY KEY, requests INTEGER NOT NULL CHECK(requests >= 0)
+);
+CREATE TABLE IF NOT EXISTS discovery_read_hosts (
+  host TEXT PRIMARY KEY, last_started_ms INTEGER NOT NULL
+)`);
+/** Return a required wait without consuming budget, or 0 after reserving a read. */
+export function reserveDiscoveryRead(host: string, timestamp: number, dailyLimit: number): number {
+  if (typeof host !== "string" || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(host) || !host.includes("."))
+    throw new Error("invalid discovery read host");
+  if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > 8640000000000000)
+    throw new Error("invalid discovery read timestamp");
+  if (!Number.isSafeInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 500)
+    throw new Error("invalid discovery daily request bound");
+  const day = new Date(timestamp).toISOString().split("T")[0];
+  return db.transaction(() => {
+    const row = db.prepare("SELECT requests FROM discovery_read_days WHERE day=?").get(day) as { requests: number } | undefined;
+    if ((row?.requests ?? 0) >= dailyLimit) throw new Error("daily request budget exhausted");
+    const previous = db.prepare("SELECT last_started_ms FROM discovery_read_hosts WHERE host=?").get(host) as { last_started_ms: number } | undefined;
+    const wait = Math.max(0, (previous?.last_started_ms ?? -Infinity) + 1000 - timestamp);
+    if (wait) return wait;
+    db.prepare(`INSERT INTO discovery_read_days(day,requests) VALUES (?,1)
+      ON CONFLICT(day) DO UPDATE SET requests=requests+1`).run(day);
+    db.prepare(`INSERT INTO discovery_read_hosts(host,last_started_ms) VALUES (?,?)
+      ON CONFLICT(host) DO UPDATE SET last_started_ms=excluded.last_started_ms`).run(host, timestamp);
+    logEvent("discovery_read_reserved", "discovery read reserved");
+    return 0;
+  })();
+}
+
+// Stage b private people collection. The queue is a view of retained findings,
+// never an outreach draft or executor queue. All SQL writes remain in this file.
+// secure_delete overwrites SQLite cells going forward; WAL/backups may retain
+// historical pages and require a separate operator retention policy.
+import { createHash as peopleHash } from "node:crypto";
+import type { PersonFinding, PeopleReviewItem } from "./people-types.js";
+import { validatePersonFinding } from "./people-sources.js";
+db.pragma("secure_delete = ON");
+db.exec(`CREATE TABLE IF NOT EXISTS people_findings (
+  id_hash TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_people_expiry ON people_findings(expires_at);
+CREATE TABLE IF NOT EXISTS people_tombstones (
+  id_hash TEXT PRIMARY KEY,
+  reason TEXT NOT NULL CHECK(reason IN ('suppressed','deleted'))
+);
+CREATE TABLE IF NOT EXISTS people_blocked_channels (
+  channel_hash TEXT PRIMARY KEY,
+  reason TEXT NOT NULL CHECK(reason IN ('suppressed','deleted'))
+)`);
+function peopleIdentity(id: string): string {
+  if (typeof id !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error("invalid people ID");
+  return peopleHash("sha256").update(id).digest("hex");
+}
+function peopleTime(now: number): void {
+  if (!Number.isSafeInteger(now) || now < 0 || now > 8640000000000000) throw new Error("invalid people timestamp");
+}
+function peopleChannelHashes(person: PersonFinding): string[] {
+  return person.channels.map((channel) => peopleHash("sha256").update(JSON.stringify(["channel", channel.kind, channel.value.trim().toLowerCase()])).digest("hex"));
+}
+export function collectPrivatePerson(person: PersonFinding): boolean {
+  validatePersonFinding(person);
+  const hash = peopleIdentity(person.id);
+  const payload = JSON.stringify(person);
+  return db.transaction(() => {
+    if (db.prepare("SELECT 1 FROM people_tombstones WHERE id_hash=?").get(hash) ||
+        peopleChannelHashes(person).some((channel) => db.prepare("SELECT 1 FROM people_blocked_channels WHERE channel_hash=?").get(channel))) return false;
+    db.prepare(`INSERT INTO people_findings(id_hash,payload_json,expires_at) VALUES (?,?,?)
+      ON CONFLICT(id_hash) DO UPDATE SET payload_json=excluded.payload_json, expires_at=excluded.expires_at`)
+      .run(hash, payload, person.provenance.expiresAt);
+    logEvent("people_collected", "private review finding retained", hash);
+    return true;
+  })();
+}
+export function purgeExpiredPeople(now: number): number {
+  peopleTime(now);
+  return db.transaction(() => {
+    const result = db.prepare("DELETE FROM people_findings WHERE expires_at<=?").run(now);
+    if (result.changes) logEvent("people_expired", `private findings expired: ${result.changes}`);
+    return result.changes;
+  })();
+}
+export function reviewPrivatePeople(now: number): PeopleReviewItem[] {
+  peopleTime(now);
+  return db.transaction(() => {
+    // Expiration physically removes payloads, rather than merely hiding them.
+    purgeExpiredPeople(now);
+    const rows = db.prepare("SELECT payload_json FROM people_findings ORDER BY id_hash").all() as { payload_json: string }[];
+    try {
+      return rows.flatMap(({ payload_json }): PeopleReviewItem[] => {
+        const person: unknown = JSON.parse(payload_json);
+        validatePersonFinding(person);
+        return person.provenance.fetchedAt > now ? [] : [{ person, stale: false, needsReview: true }];
+      });
+    } catch {
+      // Native JSON errors may include a payload excerpt. Never let private
+      // content escape into harness/server error logs on a corrupt record.
+      throw new Error("private people review data is invalid");
+    }
+  })();
+}
+function removePrivatePerson(id: string, reason: "suppressed" | "deleted"): void {
+  const hash = peopleIdentity(id);
+  db.transaction(() => {
+    const rows = db.prepare("SELECT id_hash,payload_json FROM people_findings").all() as { id_hash: string; payload_json: string }[];
+    const identities = new Set([hash]);
+    const channels = new Set<string>();
+    // Conservative alias handling: a shared published channel also removes
+    // other queued identities. Only channel-kind fingerprints survive.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const row of rows) {
+        let person: PersonFinding;
+        try { const value: unknown = JSON.parse(row.payload_json); validatePersonFinding(value); person = value; }
+        catch { continue; } // Target corruption still gets removed by its ID.
+        const hashes = peopleChannelHashes(person);
+        if (!identities.has(row.id_hash) && !hashes.some((channel) => channels.has(channel))) continue;
+        if (!identities.has(row.id_hash)) { identities.add(row.id_hash); changed = true; }
+        for (const channel of hashes) if (!channels.has(channel)) { channels.add(channel); changed = true; }
+      }
+    }
+    for (const identity of identities) {
+      db.prepare("DELETE FROM people_findings WHERE id_hash=?").run(identity);
+      // Minimal opaque tombstones prevent automatic recollection after deletion.
+      db.prepare(`INSERT INTO people_tombstones(id_hash,reason) VALUES (?,?)
+        ON CONFLICT(id_hash) DO UPDATE SET reason=excluded.reason`).run(identity, reason);
+    }
+    for (const channel of channels) db.prepare(`INSERT INTO people_blocked_channels(channel_hash,reason) VALUES (?,?)
+      ON CONFLICT(channel_hash) DO UPDATE SET reason=excluded.reason`).run(channel, reason);
+    logEvent(`people_${reason}`, `private findings removed: ${identities.size}; opaque tombstones retained`, hash);
+  })();
+}
+export const suppressPrivatePerson = (id: string): void => removePrivatePerson(id, "suppressed");
+export const deletePrivatePerson = (id: string): void => removePrivatePerson(id, "deleted");
