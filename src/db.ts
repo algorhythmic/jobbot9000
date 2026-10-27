@@ -854,3 +854,105 @@ export function reserveDiscoveryRead(host: string, timestamp: number, dailyLimit
     return 0;
   })();
 }
+
+// Stage b private people collection. The queue is a view of retained findings,
+// never an outreach draft or executor queue. All SQL writes remain in this file.
+// secure_delete overwrites SQLite cells going forward; WAL/backups may retain
+// historical pages and require a separate operator retention policy.
+import { createHash as peopleHash } from "node:crypto";
+import type { PersonFinding, PeopleReviewItem } from "./people-types.js";
+import { validatePersonFinding } from "./people-sources.js";
+db.pragma("secure_delete = ON");
+db.exec(`CREATE TABLE IF NOT EXISTS people_findings (
+  id_hash TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_people_expiry ON people_findings(expires_at);
+CREATE TABLE IF NOT EXISTS people_tombstones (
+  id_hash TEXT PRIMARY KEY,
+  reason TEXT NOT NULL CHECK(reason IN ('suppressed','deleted'))
+);
+CREATE TABLE IF NOT EXISTS people_blocked_channels (
+  channel_hash TEXT PRIMARY KEY,
+  reason TEXT NOT NULL CHECK(reason IN ('suppressed','deleted'))
+)`);
+function peopleIdentity(id: string): string {
+  if (typeof id !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error("invalid people ID");
+  return peopleHash("sha256").update(id).digest("hex");
+}
+function peopleTime(now: number): void {
+  if (!Number.isSafeInteger(now) || now < 0 || now > 8640000000000000) throw new Error("invalid people timestamp");
+}
+function peopleChannelHashes(person: PersonFinding): string[] {
+  return person.channels.map((channel) => peopleHash("sha256").update(JSON.stringify(["channel", channel.kind, channel.value.trim().toLowerCase()])).digest("hex"));
+}
+export function collectPrivatePerson(person: PersonFinding): boolean {
+  validatePersonFinding(person);
+  const hash = peopleIdentity(person.id);
+  const payload = JSON.stringify(person);
+  return db.transaction(() => {
+    if (db.prepare("SELECT 1 FROM people_tombstones WHERE id_hash=?").get(hash) ||
+        peopleChannelHashes(person).some((channel) => db.prepare("SELECT 1 FROM people_blocked_channels WHERE channel_hash=?").get(channel))) return false;
+    db.prepare(`INSERT INTO people_findings(id_hash,payload_json,expires_at) VALUES (?,?,?)
+      ON CONFLICT(id_hash) DO UPDATE SET payload_json=excluded.payload_json, expires_at=excluded.expires_at`)
+      .run(hash, payload, person.provenance.expiresAt);
+    logEvent("people_collected", "private review finding retained", hash);
+    return true;
+  })();
+}
+export function purgeExpiredPeople(now: number): number {
+  peopleTime(now);
+  return db.transaction(() => {
+    const result = db.prepare("DELETE FROM people_findings WHERE expires_at<=?").run(now);
+    if (result.changes) logEvent("people_expired", `private findings expired: ${result.changes}`);
+    return result.changes;
+  })();
+}
+export function reviewPrivatePeople(now: number): PeopleReviewItem[] {
+  peopleTime(now);
+  return db.transaction(() => {
+    // Expiration physically removes payloads, rather than merely hiding them.
+    purgeExpiredPeople(now);
+    const rows = db.prepare("SELECT payload_json FROM people_findings ORDER BY id_hash").all() as { payload_json: string }[];
+    return rows.flatMap(({ payload_json }): PeopleReviewItem[] => {
+      const person: unknown = JSON.parse(payload_json);
+      validatePersonFinding(person);
+      return person.provenance.fetchedAt > now ? [] : [{ person, stale: false, needsReview: true }];
+    });
+  })();
+}
+function removePrivatePerson(id: string, reason: "suppressed" | "deleted"): void {
+  const hash = peopleIdentity(id);
+  db.transaction(() => {
+    const rows = db.prepare("SELECT id_hash,payload_json FROM people_findings").all() as { id_hash: string; payload_json: string }[];
+    const identities = new Set([hash]);
+    const channels = new Set<string>();
+    // Conservative alias handling: a shared published channel also removes
+    // other queued identities. Only channel-kind fingerprints survive.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const row of rows) {
+        let person: PersonFinding;
+        try { const value: unknown = JSON.parse(row.payload_json); validatePersonFinding(value); person = value; }
+        catch { continue; } // Target corruption still gets removed by its ID.
+        const hashes = peopleChannelHashes(person);
+        if (!identities.has(row.id_hash) && !hashes.some((channel) => channels.has(channel))) continue;
+        if (!identities.has(row.id_hash)) { identities.add(row.id_hash); changed = true; }
+        for (const channel of hashes) if (!channels.has(channel)) { channels.add(channel); changed = true; }
+      }
+    }
+    for (const identity of identities) {
+      db.prepare("DELETE FROM people_findings WHERE id_hash=?").run(identity);
+      // Minimal opaque tombstones prevent automatic recollection after deletion.
+      db.prepare(`INSERT INTO people_tombstones(id_hash,reason) VALUES (?,?)
+        ON CONFLICT(id_hash) DO UPDATE SET reason=excluded.reason`).run(identity, reason);
+    }
+    for (const channel of channels) db.prepare(`INSERT INTO people_blocked_channels(channel_hash,reason) VALUES (?,?)
+      ON CONFLICT(channel_hash) DO UPDATE SET reason=excluded.reason`).run(channel, reason);
+    logEvent(`people_${reason}`, `private findings removed: ${identities.size}; opaque tombstones retained`, hash);
+  })();
+}
+export const suppressPrivatePerson = (id: string): void => removePrivatePerson(id, "suppressed");
+export const deletePrivatePerson = (id: string): void => removePrivatePerson(id, "deleted");
