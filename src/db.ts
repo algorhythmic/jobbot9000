@@ -915,11 +915,17 @@ export function reviewPrivatePeople(now: number): PeopleReviewItem[] {
     // Expiration physically removes payloads, rather than merely hiding them.
     purgeExpiredPeople(now);
     const rows = db.prepare("SELECT payload_json FROM people_findings ORDER BY id_hash").all() as { payload_json: string }[];
-    return rows.flatMap(({ payload_json }): PeopleReviewItem[] => {
-      const person: unknown = JSON.parse(payload_json);
-      validatePersonFinding(person);
-      return person.provenance.fetchedAt > now ? [] : [{ person, stale: false, needsReview: true }];
-    });
+    try {
+      return rows.flatMap(({ payload_json }): PeopleReviewItem[] => {
+        const person: unknown = JSON.parse(payload_json);
+        validatePersonFinding(person);
+        return person.provenance.fetchedAt > now ? [] : [{ person, stale: false, needsReview: true }];
+      });
+    } catch {
+      // Native JSON errors may include a payload excerpt. Never let private
+      // content escape into harness/server error logs on a corrupt record.
+      throw new Error("private people review data is invalid");
+    }
   })();
 }
 function removePrivatePerson(id: string, reason: "suppressed" | "deleted"): void {

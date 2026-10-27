@@ -155,3 +155,16 @@ test("collector, durable read ledger and private review store integrate without 
   assert.equal(store.review(tick).filter((item) => item.person.companyId === source.companyId).length, 0);
   assert.doesNotMatch(JSON.stringify(DB.db.prepare("SELECT * FROM people_findings").all()), /Synthetic Integration|integration-published@/);
 });
+
+
+test("corrupt private review payload fails closed without leaking JSON excerpts", () => {
+  DB.db.prepare("INSERT INTO people_findings(id_hash,payload_json,expires_at) VALUES (?,?,?)")
+    .run("synthetic-corrupt", "Sensitive Synthetic Person private-secret@example.test", epoch + 10000);
+  try {
+    assert.throws(() => store.review(epoch), (error) => {
+      assert.equal(error.message, "private people review data is invalid");
+      assert.doesNotMatch(error.message, /Sensitive|private-secret@/);
+      return true;
+    });
+  } finally { DB.db.prepare("DELETE FROM people_findings WHERE id_hash=?").run("synthetic-corrupt"); }
+});
