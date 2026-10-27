@@ -822,3 +822,35 @@ export function saveDiscoveryRun<T extends { id: string }>(run: T): void {
     logEvent("discovery_checkpoint", "discovery checkpoint saved", run.id);
   })();
 }
+
+// Durable read reservations for a SERIAL owner. These counters survive restart;
+// they are not cross-process inflight locks or worker leases.
+db.exec(`CREATE TABLE IF NOT EXISTS discovery_read_days (
+  day TEXT PRIMARY KEY, requests INTEGER NOT NULL CHECK(requests >= 0)
+);
+CREATE TABLE IF NOT EXISTS discovery_read_hosts (
+  host TEXT PRIMARY KEY, last_started_ms INTEGER NOT NULL
+)`);
+/** Return a required wait without consuming budget, or 0 after reserving a read. */
+export function reserveDiscoveryRead(host: string, timestamp: number, dailyLimit: number): number {
+  if (typeof host !== "string" || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(host) || !host.includes("."))
+    throw new Error("invalid discovery read host");
+  if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > 8640000000000000)
+    throw new Error("invalid discovery read timestamp");
+  if (!Number.isSafeInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 500)
+    throw new Error("invalid discovery daily request bound");
+  const day = new Date(timestamp).toISOString().split("T")[0];
+  return db.transaction(() => {
+    const row = db.prepare("SELECT requests FROM discovery_read_days WHERE day=?").get(day) as { requests: number } | undefined;
+    if ((row?.requests ?? 0) >= dailyLimit) throw new Error("daily request budget exhausted");
+    const previous = db.prepare("SELECT last_started_ms FROM discovery_read_hosts WHERE host=?").get(host) as { last_started_ms: number } | undefined;
+    const wait = Math.max(0, (previous?.last_started_ms ?? -Infinity) + 1000 - timestamp);
+    if (wait) return wait;
+    db.prepare(`INSERT INTO discovery_read_days(day,requests) VALUES (?,1)
+      ON CONFLICT(day) DO UPDATE SET requests=requests+1`).run(day);
+    db.prepare(`INSERT INTO discovery_read_hosts(host,last_started_ms) VALUES (?,?)
+      ON CONFLICT(host) DO UPDATE SET last_started_ms=excluded.last_started_ms`).run(host, timestamp);
+    logEvent("discovery_read_reserved", "discovery read reserved");
+    return 0;
+  })();
+}

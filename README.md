@@ -172,3 +172,7 @@ Personal state, discovery run state, SQLite sidecars, drafts and receipts belong
 Existing legacy state is never opened, moved or deleted automatically. Back up legacy data and obtain an explicit migration decision before using a new private location; this change opens a new schema-compatible private database. Operator application/interview contracts have offline synthetic regression coverage. Harness transcripts can retain tool outputs outside the private root; real personal use remains on hold until the operator resolves retention. Do not treat SQLite containment alone as satisfying transcript privacy.
 
 Run offline tests with `npm test` (Node's `--import tsx` loader avoids the tsx CLI IPC socket). No test needs live endpoints, real profiles or credentials.
+
+## Offline discovery loop
+
+The bounded company-discovery library supports synthetic paged leads, manual targets, official-shaped ATS fixtures, source-policy checks, shared in-process limits, private checkpoints, cancellation and explicit stale refresh. It has no installed transport or MCP/CLI loop surface. See [the discovery contract and verification matrix](docs/DISCOVERY.md) for interfaces, test coverage and live-use limitations.

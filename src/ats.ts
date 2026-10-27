@@ -116,6 +116,11 @@ const NORMALIZERS: Record<AtsPlatform, (j: any) => RawJob[] | null> = {
     : null,
 };
 
+// Pure parser shared with the offline discovery adapter. No source reads occur here.
+export function normalizeAtsBoard(platform: AtsPlatform, payload: unknown): RawJob[] | null {
+  return NORMALIZERS[platform](payload);
+}
+
 /**
  * Fetch + normalize one ATS board. Returns the postings (possibly empty for a live but
  * vacant board), or null if the board is unreachable / not that platform (404, network
@@ -128,7 +133,7 @@ export async function fetchBoard(platform: AtsPlatform, slug: string, fetchFn: F
   if (!res.ok) return null;
   let json: unknown;
   try { json = await res.json(); } catch { return null; }
-  return NORMALIZERS[platform](json);
+  return normalizeAtsBoard(platform, json);
 }
 
 export interface ResolveOpts {

@@ -48,9 +48,11 @@ test("invalid IDs and unserializable payloads leave no checkpoint", () => {
 });
 
 test("offline discovery resumes through private SQLite store and returns counts-only receipt", async () => {
-  const { discoverCompanies, memoryReadLedger } = await import("../src/discovery.ts");
+  const { discoverCompanies } = await import("../src/discovery.ts");
+  const { privateReadLedger } = await import("../src/discovery-ledger.ts");
   const { privateDiscoveryStore, discoveryReceipt } = await import("../src/discovery-store.ts");
   const now = 1800000000000;
+  let tick = now;
   const adapter = {
     fixtureOnly: true,
     url: (phase) => `https://careers.example/${phase}`,
@@ -59,7 +61,7 @@ test("offline discovery resumes through private SQLite store and returns counts-
     resolved: (_body, company) => company,
     jobs: () => ({ items: [{ url: "https://careers.example/jobs/synthetic", title: "Synthetic role" }] }),
   };
-  const deps = { adapter, store: privateDiscoveryStore, ledger: memoryReadLedger(), now: () => now, sleep: async () => {},
+  const deps = { adapter, store: privateDiscoveryStore, ledger: privateReadLedger(), now: () => tick, sleep: async (ms) => { tick += ms; },
     policies: [{ host: "careers.example", allowed: true, operations: ["discover", "resolve", "jobs"], policyRef: "https://careers.example/terms", checkedAt: now - 1, expiresAt: now + 86400000 }] };
   const result = await discoverCompanies({ id: "durable-loop", execute: true, companies: [{ name: "Synthetic", domain: "example.invalid" }] }, deps);
   assert.equal(result.run.status, "completed");
