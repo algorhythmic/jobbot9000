@@ -176,3 +176,7 @@ Run offline tests with `npm test` (Node's `--import tsx` loader avoids the tsx C
 ## Offline discovery loop
 
 The bounded company-discovery library supports synthetic paged leads, manual targets, official-shaped ATS fixtures, source-policy checks, shared in-process limits, private checkpoints, cancellation and explicit stale refresh. It has no installed transport or MCP/CLI loop surface. See [the discovery contract and verification matrix](docs/DISCOVERY.md) for interfaces, test coverage and live-use limitations.
+
+## Offline people discovery
+
+Stage (b) collects explicitly published recruiter/hiring-manager evidence into a private review queue using injected synthetic publications. It enforces source/LinkedIn restrictions, published professional channels, 30-day default evidence expiry, and suppression/deletion. No contacting, invitations, mailbox probes or outreach drafts are available. See [the people discovery contract](docs/PEOPLE.md) for the acceptance matrix, private-storage boundary and retention limitations. Real people and live discovery remain on hold.
