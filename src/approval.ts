@@ -150,3 +150,7 @@ export function markApprovalRevoked(record: unknown): ApprovalRecord {
     expiresAt: record.expiresAt, state: "revoked",
   };
 }
+
+// Stage (d) adds externally issued verification; local stage (c) approval requests remain denied.
+export { verifyOdinApproval, loadOdinVerificationConfig, signingBytes, OdinApprovalError } from "./odin-approval.js";
+export type { OdinVerificationConfig } from "./odin-approval.js";

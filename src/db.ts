@@ -973,3 +973,118 @@ export function isPrivatePersonSuppressed(id: string, destination: string): bool
     return !!db.prepare("SELECT 1 FROM people_blocked_channels WHERE channel_hash=?").get(fingerprint);
   });
 }
+
+// Stage d: a private, opaque execution ledger. Begin commits before transport.
+// A single active effect is intentional; cross-company scheduling is stage e.
+import type { ExecutionIntent, ExecutionRecord, ExecutionState } from "./execution-types.js";
+db.exec(`CREATE TABLE IF NOT EXISTS execution_consumptions (
+  approval_id TEXT PRIMARY KEY, nonce TEXT NOT NULL UNIQUE, consumed_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_revocations (
+  approval_id TEXT PRIMARY KEY, revoked_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_intents (
+  execution_id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE,
+  nonce TEXT NOT NULL UNIQUE, principal TEXT NOT NULL, batch_digest TEXT NOT NULL, item_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('intent','succeeded','rejected','unknown')),
+  receipt_id TEXT, updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS execution_one_active
+  ON execution_intents((1)) WHERE state IN ('intent','unknown');
+CREATE TABLE IF NOT EXISTS execution_receipts (
+  id INTEGER PRIMARY KEY, execution_id TEXT NOT NULL REFERENCES execution_intents(execution_id),
+  state TEXT NOT NULL CHECK(state IN ('succeeded','rejected','unknown')),
+  receipt_id TEXT, recorded_at INTEGER NOT NULL
+)`);
+// Upgrading an interrupted local stage-d run cannot invent a deciding principal.
+// Blank legacy values are deliberately rejected by the read validator.
+if (!(db.prepare("PRAGMA table_info(execution_intents)").all() as { name: string }[]).some(column => column.name === "principal"))
+  db.exec("ALTER TABLE execution_intents ADD COLUMN principal TEXT NOT NULL DEFAULT ''");
+function executionOpaque(value: string): void {
+  if (typeof value !== "string" || !/^(?:[a-f0-9]{32,128}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/.test(value))
+    throw new Error("invalid opaque execution identifier");
+}
+function executionApprovalToken(value: string): void {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value))
+    throw new Error("invalid opaque approval identifier");
+}
+function executionTimestamp(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 8640000000000000)
+    throw new Error("invalid execution timestamp");
+}
+function validateExecutionIntent(intent: ExecutionIntent): void {
+  if (typeof intent.principal !== "string" || intent.principal.trim() !== intent.principal || !intent.principal ||
+      intent.principal.length > 256 || /[\x00-\x1f\x7f]/.test(intent.principal))
+    throw new Error("invalid deciding principal");
+  for (const value of [intent.executionId, intent.itemId, intent.idempotencyKey]) executionOpaque(value);
+  executionApprovalToken(intent.approvalId); executionApprovalToken(intent.nonce);
+  if (!/^[a-f0-9]{64}$/.test(intent.batchDigest)) throw new Error("invalid execution digest");
+  executionTimestamp(intent.createdAt);
+}
+export function isExecutionApprovalRevoked(approvalId: string): boolean {
+  executionApprovalToken(approvalId);
+  return !!db.prepare("SELECT 1 FROM execution_revocations WHERE approval_id=?").get(approvalId);
+}
+export function beginPrivateExecution(intent: ExecutionIntent): void {
+  validateExecutionIntent(intent);
+  db.transaction(() => {
+    if (isExecutionApprovalRevoked(intent.approvalId)) throw new Error("execution approval revoked");
+    if (db.prepare("SELECT 1 FROM execution_intents WHERE state IN ('intent','unknown')").get())
+      throw new Error("unresolved execution requires reconciliation");
+    if (db.prepare("SELECT 1 FROM execution_consumptions WHERE approval_id=? OR nonce=?").get(intent.approvalId, intent.nonce))
+      throw new Error("execution approval already consumed");
+    db.prepare("INSERT INTO execution_consumptions(approval_id,nonce,consumed_at) VALUES (?,?,?)")
+      .run(intent.approvalId, intent.nonce, intent.createdAt);
+    db.prepare(`INSERT INTO execution_intents(execution_id,approval_id,nonce,principal,batch_digest,item_id,idempotency_key,created_at,state,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,'intent',?)`).run(intent.executionId, intent.approvalId, intent.nonce, intent.principal,
+      intent.batchDigest, intent.itemId, intent.idempotencyKey, intent.createdAt, intent.createdAt);
+    logEvent("execution_intent", "private execution intent committed", intent.executionId);
+  })();
+}
+export function getPrivateExecution(executionId: string): ExecutionRecord | undefined {
+  executionOpaque(executionId);
+  const row = db.prepare("SELECT * FROM execution_intents WHERE execution_id=?").get(executionId) as {
+    execution_id: string; approval_id: string; nonce: string; principal: string; batch_digest: string; item_id: string;
+    idempotency_key: string; created_at: number; state: ExecutionState; receipt_id: string | null; updated_at: number;
+  } | undefined;
+  if (!row) return undefined;
+  const record: ExecutionRecord = { executionId: row.execution_id, approvalId: row.approval_id, nonce: row.nonce, principal: row.principal,
+    batchDigest: row.batch_digest, itemId: row.item_id, idempotencyKey: row.idempotency_key,
+    createdAt: row.created_at, state: row.state, updatedAt: row.updated_at,
+    ...(row.receipt_id === null ? {} : { receiptId: row.receipt_id }) };
+  validateExecutionIntent(record);
+  executionTimestamp(record.updatedAt);
+  if (!["intent", "succeeded", "rejected", "unknown"].includes(record.state) || record.updatedAt < record.createdAt)
+    throw new Error("invalid private execution state");
+  if (record.receiptId !== undefined) executionOpaque(record.receiptId);
+  return record;
+}
+function writePrivateExecutionResult(executionId: string, state: "succeeded" | "rejected" | "unknown", receiptId: string | undefined, now: number, reconcile: boolean): void {
+  executionOpaque(executionId); executionTimestamp(now);
+  if (!["succeeded", "rejected", "unknown"].includes(state) || (reconcile && state === "unknown")) throw new Error("invalid execution result");
+  if (receiptId !== undefined) executionOpaque(receiptId);
+  if (state !== "unknown" && receiptId === undefined) throw new Error("terminal execution receipt required");
+  db.transaction(() => {
+    const record = getPrivateExecution(executionId);
+    if (!record || !(reconcile ? ["intent", "unknown"] : ["intent"]).includes(record.state))
+      throw new Error("execution state cannot be reopened");
+    if (now < record.updatedAt) throw new Error("execution timestamp regressed");
+    db.prepare("UPDATE execution_intents SET state=?,receipt_id=?,updated_at=? WHERE execution_id=?")
+      .run(state, receiptId ?? null, now, executionId);
+    db.prepare("INSERT INTO execution_receipts(execution_id,state,receipt_id,recorded_at) VALUES (?,?,?,?)")
+      .run(executionId, state, receiptId ?? null, now);
+    logEvent(reconcile ? "execution_reconciled" : "execution_receipt", `private execution ${state}`, executionId);
+  })();
+}
+export const finishPrivateExecution = (executionId: string, state: "succeeded" | "rejected" | "unknown", receiptId: string | undefined, now: number): void =>
+  writePrivateExecutionResult(executionId, state, receiptId, now, false);
+export const reconcilePrivateExecution = (executionId: string, state: "succeeded" | "rejected", receiptId: string, now: number): void =>
+  writePrivateExecutionResult(executionId, state, receiptId, now, true);
+export function revokePrivateExecutionApproval(approvalId: string, now: number): void {
+  executionApprovalToken(approvalId); executionTimestamp(now);
+  db.transaction(() => {
+    db.prepare("INSERT INTO execution_revocations(approval_id,revoked_at) VALUES (?,?) ON CONFLICT(approval_id) DO NOTHING").run(approvalId, now);
+    logEvent("execution_approval_revoked", "private approval revoked", approvalId);
+  })();
+}
