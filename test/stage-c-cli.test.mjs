@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { test, after } from "node:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { prepareDrafts } from "../src/preparation.ts";
 import { createReviewBatch } from "../src/review-queue.ts";
 import { runJobbot, approvalBinding } from "../src/cli.ts";
@@ -21,6 +22,7 @@ function context() {
   return { privateDir, now, isSuppressed: () => false, out: (s) => output.push(s), error: (s) => errors.push(s), output, errors, parent };
 }
 function batch(c) {
+  const now = c.now;
   const items = prepareDrafts([{ profile, evidence: { approved: true, companyId: "synthetic-company", roleId: "synthetic-role", companyName: "Synthetic Co", roleTitle: "Synthetic Role", sourceUrl: "https://careers.example.test/job", description: "Synthetic role", fetchedAt: now - 1000, expiresAt: now + 500000, terms: { allowed: true, reference: "https://careers.example.test/terms", checkedAt: now - 1000, expiresAt: now + 500000 }, roleFit: { band: "exact", desireAlignment: "strong", rationale: "Synthetic rationale" } }, channel: "manual_application", destination: "https://careers.example.test/job", claimIds: ["fixture-claim"], requestedLevel: "mid", requiredFields: ["name", "cover_letter", "salary"] }], c);
   return createReviewBatch(c.privateDir, { batchId: "synthetic-r1", revision: 1, createdAt: now, expiresAt: now + 100000, items, attachments: [{ id: "resume", name: "Synthetic attachment", bytes: Buffer.from("SYNTHETIC ATTACHMENT FULL END") }] }, { ...c, persist: true });
 }
@@ -88,4 +90,22 @@ test("MCP exposes full audited review only, with no approval/send tool", async (
     assert.equal(reply.ok, true); assert.equal(reply.preview, result.preview);
     assert.equal(handlers.has("approve_send"), false); assert.equal(handlers.has("send"), false); assert.equal(handlers.has("execute"), false);
   } finally { DB.db.close(); }
+});
+
+// The distributed entry point must be exercised after `npm run build`: unit
+// invocation alone cannot detect stale or silently terminating CLI bundles.
+test("packaged CLI emits full fresh preview and rejects approval with an explicit error", (t) => {
+  if (process.env.CODEX_SANDBOX || process.env.CODEX_SANDBOX_NETWORK_DISABLED) return t.skip("nested Node spawn is denied by the workspace sandbox; run packaged CLI acceptance outside sandbox");
+  if (!existsSync(resolve("dist/cli.js"))) return t.skip("packaged CLI requires npm run build first");
+  const c = context(); c.now = Date.now();
+  const result = batch(c);
+  const env = { ...process.env, JOBBOT_PRIVATE_DIR: c.privateDir, STATE_DIR: join(c.privateDir, "state") };
+  const invoke = (args) => spawnSync(process.execPath, ["bin/jobbot.mjs", ...args], { encoding: "utf8", env, maxBuffer: 4 * 1024 * 1024, timeout: 15000 });
+  const review = invoke(["review", "synthetic-r1"]);
+  assert.equal(review.error, undefined); assert.equal(review.status, 0);
+  assert.equal(review.stdout, result.preview + "\n"); assert.equal(review.stderr, "");
+  const approval = invoke(["approve-send", "synthetic-r1", "--sha256", result.manifest.payloadSha256]);
+  assert.equal(approval.error, undefined); assert.equal(approval.status, 1); assert.equal(approval.stdout, "");
+  assert.match(approval.stderr, /operator_boundary_unavailable/);
+  assert.equal(existsSync(join(c.privateDir, "review", "synthetic-r1", "approval.json")), false);
 });
