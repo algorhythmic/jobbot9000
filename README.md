@@ -184,3 +184,7 @@ Stage (b) collects explicitly published recruiter/hiring-manager evidence into a
 ## Offline draft preparation and review
 
 Stage (c) compiles verified-floor drafts and immutable private review revisions. `jobbot review <batch-rN>` (or MCP `review_batch`) shows every draft, destination, field and attachment without truncation. `jobbot approve-send <batch-rN> --sha256 <digest>` fails closed: this runtime cannot distinguish an operator-only identity from workers. No transport or executor exists. See [preparation, commands and the approval boundary](docs/PREPARATION.md) for the explicit later private-only resume import command and synthetic verification scope.
+
+## Mock execution with Odin-issued approvals
+
+Stage (d) verifies canonical Ed25519 artifacts from Odin's authenticated operator path and records single-use consumption, intents and receipts privately. Only a mock adapter exists; the executor is not a worker CLI/MCP tool. Run `npm run demo:stage-d -- --send` for the synthetic demonstration, or omit `--send` for zero mock calls. See [Option A, protected verification keys and recovery](docs/EXECUTION.md). Real channels and production key provisioning remain separate operator decisions.
