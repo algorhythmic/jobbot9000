@@ -1,0 +1,14 @@
+{
+  "name": "Synthetic Candidate",
+  "verifiedFloor": "mid",
+  "claims": [
+    { "id": "fixture-claim", "text": "Built a synthetic task scheduler and explained its retry tradeoffs in a fixture interview.", "level": "mid", "verified": true },
+    { "id": "unverified-claim", "text": "Unverified synthetic claim.", "level": "senior", "verified": false }
+  ],
+  "interview": {
+    "status": "complete",
+    "verifiedCeiling": "mid",
+    "summary": "Synthetic interview establishes the scheduler claim at mid level only.",
+    "verifiedClaimIds": ["fixture-claim"]
+  }
+}
