@@ -124,3 +124,48 @@ test("duplicate company/role is denied even if recipe and destination differ", (
   assert.notEqual(one.id, two.id); assert.notEqual(one.destination, two.destination);
   assert.throws(() => persist(root(), { items: [one, two] }), /duplicate/);
 });
+test("admission rejects duplicate contacts or company/role across active independent batches", () => {
+  const dir = root(); persist(dir);
+  assert.throws(() => persist(dir, { batchId: "independent-r1" }), /admission denied/);
+  const otherRecipe = structuredClone(draft().recipe);
+  otherRecipe.evidence.companyId = "synthetic-other-company"; otherRecipe.evidence.roleId = "synthetic-other-role";
+  // Different role key still cannot reuse an active destination.
+  const other = prepareDrafts([otherRecipe], checks)[0];
+  assert.throws(() => persist(dir, { batchId: "other-r1", items: [other] }), /admission denied/);
+  // Different destination still cannot duplicate a company/role key.
+  const sameKeyRecipe = structuredClone(draft().recipe);
+  sameKeyRecipe.evidence.sourceUrl = sameKeyRecipe.destination = "https://careers.example.test/jobs/alternative";
+  assert.throws(() => persist(dir, { batchId: "alternative-r1", items: prepareDrafts([sameKeyRecipe], checks) }), /admission denied/);
+});
+test("admission permits unrelated batches and an explicit revision of the same lineage", () => {
+  const dir = root(); persist(dir);
+  const unrelated = structuredClone(draft().recipe);
+  unrelated.evidence.companyId = "synthetic-unrelated"; unrelated.evidence.roleId = "synthetic-unrelated-role";
+  unrelated.evidence.sourceUrl = unrelated.destination = "https://careers.example.test/jobs/unrelated";
+  const other = persist(dir, { batchId: "unrelated-r1", items: prepareDrafts([unrelated], checks) });
+  assert.equal(other.manifest.batchId, "unrelated-r1");
+  persist(dir, { batchId: "synthetic-r2", revision: 2, previousBatchId: "synthetic-r1" });
+  const third = persist(dir, { batchId: "synthetic-r3", revision: 3, previousBatchId: "synthetic-r2" });
+  assert.equal(third.manifest.previous.batchId, "synthetic-r2");
+});
+test("expired batches do not block fresh preparation, even when old source evidence expired", () => {
+  const dir = root(), oldRecipe = structuredClone(draft().recipe);
+  oldRecipe.evidence.expiresAt = now + 1; oldRecipe.evidence.terms.expiresAt = now + 1;
+  persist(dir, { expiresAt: now + 1, items: prepareDrafts([oldRecipe], checks) });
+  const next = createReviewBatch(dir, input({ batchId: "fresh-r1", createdAt: now + 2 }), { ...checks, now: now + 2, persist: true });
+  assert.equal(next.manifest.batchId, "fresh-r1");
+});
+test("corrupt existing queue metadata and tampered revision ancestry fail closed", () => {
+  for (const corrupt of ["active", "expired", "ancestor"]) {
+    const dir = root(); persist(dir, corrupt === "expired" ? { expiresAt: now + 1 } : {});
+    const path = join(dir, "review", "synthetic-r1", "manifest.json");
+    if (corrupt === "ancestor") {
+      persist(dir, { batchId: "synthetic-r2", revision: 2, previousBatchId: "synthetic-r1" });
+      const changed = JSON.parse(readFileSync(itemPath(dir), "utf8")); changed.body += "tampered"; writeFileSync(itemPath(dir), JSON.stringify(changed));
+      assert.throws(() => persist(dir, { batchId: "synthetic-r3", revision: 3, previousBatchId: "synthetic-r2" }), /admission denied/);
+    } else {
+      const changed = JSON.parse(readFileSync(path, "utf8")); changed.payloadSha256 = "invalid"; writeFileSync(path, JSON.stringify(changed));
+      assert.throws(() => createReviewBatch(dir, input({ batchId: "fresh-r1" }), { ...checks, now: now + 2, persist: true }), /admission denied/);
+    }
+  }
+});

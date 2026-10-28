@@ -11,6 +11,7 @@ import { resolveInterviewRequest, type InterviewRequest, type InterviewError } f
 // All personal state and SQLite sidecars stay in .private. Legacy state is never
 // opened, moved or deleted implicitly; configure an explicit private state root.
 const storage = prepareStorage();
+export const privateStorageRoot = storage.privateDir;
 export const db = new Database(storage.databasePath);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
@@ -962,3 +963,13 @@ function removePrivatePerson(id: string, reason: "suppressed" | "deleted"): void
 }
 export const suppressPrivatePerson = (id: string): void => removePrivatePerson(id, "suppressed");
 export const deletePrivatePerson = (id: string): void => removePrivatePerson(id, "deleted");
+
+// Stage c read-only suppression admission check, reusing stage b tombstones.
+export function isPrivatePersonSuppressed(id: string, destination: string): boolean {
+  if (typeof destination !== "string" || !destination.trim()) throw new Error("suppression destination required");
+  if (id && db.prepare("SELECT 1 FROM people_tombstones WHERE id_hash=?").get(peopleIdentity(id))) return true;
+  return ["email", "professional_url"].some((kind) => {
+    const fingerprint = peopleHash("sha256").update(JSON.stringify(["channel", kind, destination.trim().toLowerCase()])).digest("hex");
+    return !!db.prepare("SELECT 1 FROM people_blocked_channels WHERE channel_hash=?").get(fingerprint);
+  });
+}

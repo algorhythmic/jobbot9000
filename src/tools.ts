@@ -12,6 +12,7 @@ import { z } from "zod";
 import { readFileSync } from "node:fs";
 import { NETWORK_DISABLED } from "./network.js";
 import * as DB from "./db.js";
+import { reviewBatch } from "./review-queue.js";
 import { readJourneyState } from "./state.js";
 import { resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
 import { fetchUserRepos, enrichRepo, type RepoFacts } from "./github.js";
@@ -175,6 +176,17 @@ function openThreads(s: State): string[] {
 }
 
 export function registerTools(server: McpServer): void {
+  // Stage c audited private preview. No approval or executor capability is exposed.
+  server.registerTool("review_batch", {
+    description: "Display a complete, untruncated, integrity-checked private review revision and record a private review audit. Synthetic inputs only until transcript retention is resolved. No approval or send capability.",
+    inputSchema: { batch_id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$/) },
+  }, async ({ batch_id }) => {
+    try {
+      const reviewed = reviewBatch(DB.privateStorageRoot, batch_id, { now: Date.now(), isSuppressed: DB.isPrivatePersonSuppressed });
+      return json({ ok: true, preview: reviewed.preview });
+    } catch { return json({ ok: false, error: "Private review denied by integrity, freshness, honesty or suppression checks." }); }
+  });
+
   // ── orient: the one state door (loop-aware + resume-first) ─────────────────
   server.registerTool("orient", {
     description:

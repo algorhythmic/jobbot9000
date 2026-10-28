@@ -51,7 +51,7 @@ Two rules hold everywhere:
 
 **Two data planes:** **Personal** (profile, desires, resume, competency profile, interviews, plan, applications, journal) is **always local, never shared.** **Catalog** (companies + their live jobs — public market data) is local. Nothing leaves the machine.
 
-## The surface — 15 tools
+## The surface — 16 tools
 
 **Three doors:**
 
@@ -107,7 +107,7 @@ claude --plugin-dir /path/to/jobbot9000
 /plugin install jobbot9000@jobbot9000
 ```
 
-Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 15 tools`.
+Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 16 tools`.
 
 **Requires Node 22.13+** (24 LTS or newer recommended) — that's where Node's built-in SQLite (`node:sqlite`) is available unflagged.
 
@@ -144,7 +144,7 @@ src/
   db.ts                      SQLite schema + accessors — the only code that writes the DB (incl. the journal + history)
   sqlite.ts                  the SQLite driver — node:sqlite (built into Node), so there is no native dep to rebuild
   state.ts                   the loop state machine (state derived from what data exists)
-  tools.ts                   the 15-tool surface
+  tools.ts                   the 16-tool surface
   providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in)
   ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
   github.ts                  keyless GitHub sense — public repos + verification signals (authorship/traction/badges)
@@ -180,3 +180,7 @@ The bounded company-discovery library supports synthetic paged leads, manual tar
 ## Offline people discovery
 
 Stage (b) collects explicitly published recruiter/hiring-manager evidence into a private review queue using injected synthetic publications. It enforces source/LinkedIn restrictions, published professional channels, 30-day default evidence expiry, and suppression/deletion. No contacting, invitations, mailbox probes or outreach drafts are available. See [the people discovery contract](docs/PEOPLE.md) for the acceptance matrix, private-storage boundary and retention limitations. Real people and live discovery remain on hold.
+
+## Offline draft preparation and review
+
+Stage (c) compiles verified-floor drafts and immutable private review revisions. `jobbot review <batch-rN>` (or MCP `review_batch`) shows every draft, destination, field and attachment without truncation. `jobbot approve-send <batch-rN> --sha256 <digest>` fails closed: this runtime cannot distinguish an operator-only identity from workers. No transport or executor exists. See [preparation, commands and the approval boundary](docs/PREPARATION.md) for the explicit later private-only resume import command and synthetic verification scope.
