@@ -18,6 +18,15 @@ function exact(value: unknown, keys: string[]): value is Record<string, unknown>
   return !!value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).sort().join("\0") === keys.sort().join("\0");
 }
+// createPublicKey also accepts private PEM and derives a public key. Refuse that
+// convenience: JobBot configuration must never carry a signing key.
+function publicVerifyKey(pem: unknown) {
+  if (typeof pem !== "string" || pem.length > 4096 ||
+      !/^-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\r?\n?$/.test(pem)) return deny();
+  const key = createPublicKey(pem);
+  if (key.asymmetricKeyType !== "ed25519") return deny();
+  return key;
+}
 /** Canonical UTF-8 message signed by Odin, including issuer and key selector. Never signs. */
 export function signingBytes(envelope: { issuer: string; key_id: string; payload: unknown }): Buffer {
   return Buffer.from(canonicalize({ issuer: envelope.issuer, key_id: envelope.key_id, payload: envelope.payload }), "utf8");
@@ -41,8 +50,7 @@ export function verifyOdinApproval(artifact: unknown, expected: OdinExpectedBind
     if (!digest(expected.batchDigest) || !digest(expected.destinationsDigest)
       || p.batch_digest !== expected.batchDigest || p.destinations_digest !== expected.destinationsDigest
       || p.channel !== expected.channel || p.item_count !== expected.itemCount) return deny();
-    const key = createPublicKey(config.publicKeyPem);
-    if (key.asymmetricKeyType !== "ed25519") return deny();
+    const key = publicVerifyKey(config.publicKeyPem);
     const signature = Buffer.from(artifact.signature, "base64");
     if (signature.toString("base64") !== artifact.signature || !verify(null, signingBytes({ issuer: artifact.issuer, key_id: artifact.key_id, payload: p }), key, signature)) return deny();
     // The deciding principal is an Odin-authenticated assertion covered by the signature,
@@ -72,7 +80,7 @@ export function loadOdinVerificationConfig(path: string): Readonly<OdinVerificat
     }
     const config: unknown = JSON.parse(readFileSync(target, "utf8"));
     if (!exact(config, ["keyId", "publicKeyPem"]) || !identifier(config.keyId) || typeof config.publicKeyPem !== "string") return deny();
-    if (createPublicKey(config.publicKeyPem).asymmetricKeyType !== "ed25519") return deny();
+    publicVerifyKey(config.publicKeyPem);
     return Object.freeze({ keyId: config.keyId, publicKeyPem: config.publicKeyPem });
   } catch { return deny(); }
 }

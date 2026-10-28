@@ -39,7 +39,9 @@ only an operator decision before signing.
 ## Protected public-key configuration
 
 `loadOdinVerificationConfig(path)` reads only a config under a `.private` path:
-`{ keyId, publicKeyPem }`. No key/config belongs in Git. No signing key belongs in
+`{ keyId, publicKeyPem }`, with an Ed25519 SPKI `PUBLIC KEY` PEM only.
+Private-key PEM or concatenated key material is rejected rather than implicitly
+deriving a public key. No key/config belongs in Git. No signing key belongs in
 JobBot at all. Every path component must be free of symlinks and inaccessible to
 worker writes; group/other writable components are rejected. JobBot does not
 change owners, permissions, sandbox rules or services to manufacture this trust.

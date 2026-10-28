@@ -183,7 +183,7 @@ Stage (b) collects explicitly published recruiter/hiring-manager evidence into a
 
 ## Offline draft preparation and review
 
-Stage (c) compiles verified-floor drafts and immutable private review revisions. `jobbot review <batch-rN>` (or MCP `review_batch`) shows every draft, destination, field and attachment without truncation. `jobbot approve-send <batch-rN> --sha256 <digest>` fails closed: this runtime cannot distinguish an operator-only identity from workers. No transport or executor exists. See [preparation, commands and the approval boundary](docs/PREPARATION.md) for the explicit later private-only resume import command and synthetic verification scope.
+Stage (c) compiles verified-floor drafts and immutable private review revisions. `jobbot review <batch-rN>` (or MCP `review_batch`) shows every draft, destination, field and attachment without truncation. `jobbot approve-send <batch-rN> --sha256 <digest>` fails closed: this runtime cannot distinguish an operator-only identity from workers. Stage (c) exposes no transport or executor. See [preparation, commands and the approval boundary](docs/PREPARATION.md) for the explicit later private-only resume import command and synthetic verification scope.
 
 ## Mock execution with Odin-issued approvals
 

@@ -81,3 +81,8 @@ test('worker-writable .private trust anchors and symlinks fail closed', () => {
     assert.throws(() => loadOdinVerificationConfig('/tmp/not-private-key.json'), OdinApprovalError);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('refuses a private signing key disguised as public verification configuration', () => {
+  refused(issue(), expected, { ...config, publicKeyPem: keys.privateKey.export({ type: 'pkcs8', format: 'pem' }) });
+  refused(issue(), expected, { ...config, publicKeyPem: config.publicKeyPem + keys.privateKey.export({ type: 'pkcs8', format: 'pem' }) });
+});
